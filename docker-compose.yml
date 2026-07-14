@@ -1,0 +1,14 @@
+services:
+  codebase-profiler:
+    build: .
+    ports:
+      - "${UI_PORT:-8766}:8766"
+    environment:
+      EXTRACT_UI_DOCKER: "1"
+      DEFAULT_LOCAL_REPOS_DIR: /data/repos
+      DEFAULT_TOKENS_FILE: /app/tokens
+    volumes:
+      - ./tokens:/app/tokens:ro
+      - ./outputs:/app/outputs
+      - ${LOCAL_REPOS_DIR:-./repos}:/data/repos:ro
+    restart: unless-stopped

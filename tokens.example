@@ -1,0 +1,16 @@
+# Copy to `tokens` and fill in real values. Never commit secrets.
+
+github-data-token=ghp_your_github_token_here
+gitlab_token=glpat_your_gitlab_token_here
+openai_key=sk-your_openai_key_here
+
+# Optional — GitHub App auth for extract_org_raw_data.py --github-app
+# Defaults in code: app id 4284468 + data-labs-codebase-analysis.2026-07-12.private-key.pem
+# github_app_id=4284468
+# github_app_pem=data-labs-codebase-analysis.2026-07-12.private-key.pem
+
+# Optional — GitLab OAuth application
+# gitlab_oauth_client_id=your_application_id
+# gitlab_oauth_client_secret=gloas-your_secret
+# gitlab_oauth_redirect_uri=http://localhost:8765/callback
+# gitlab_oauth_scopes=read_api read_repository

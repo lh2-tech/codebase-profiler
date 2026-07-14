@@ -1,0 +1,11 @@
+.git
+.gitignore
+outputs
+repos
+tokens
+.env
+*.pem
+__pycache__
+*.pyc
+.DS_Store
+README.md

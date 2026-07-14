@@ -1,0 +1,9 @@
+tokens
+*.pem
+.env
+__pycache__/
+*.py[cod]
+.Python
+outputs/raw-extracts/*
+!outputs/raw-extracts/.gitkeep
+.DS_Store
