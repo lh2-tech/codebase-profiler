@@ -33,7 +33,9 @@ RUN mkdir -p /app/outputs/raw-extracts /data/repos
 
 ENV EXTRACT_UI_DOCKER=1 \
     DEFAULT_LOCAL_REPOS_DIR=/data/repos \
-    DEFAULT_TOKENS_FILE=/app/tokens
+    DEFAULT_TOKENS_FILE=/app/tokens \
+    HOST_OUTPUT_HINT=./outputs/raw-extracts \
+    PYTHONUNBUFFERED=1
 
 EXPOSE 8766
 

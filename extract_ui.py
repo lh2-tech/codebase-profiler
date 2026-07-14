@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -83,6 +85,79 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
         or "gitlab_token",
         "workers": fields.get("workers", ["4"])[0].strip() or "4",
         "llm_enabled": llm_enabled,
+        "selected_repos": fields.get("selected_repos", [""])[0].strip(),
+    }
+
+
+def parse_repo_selectors(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def is_under_archive(path: Path) -> bool:
+    archive_root = DEFAULT_OUTPUT.resolve()
+    resolved = path.resolve()
+    return resolved == archive_root or archive_root in resolved.parents
+
+
+def compute_progress(log_lines: list[str]) -> dict[str, Any]:
+    total = 0
+    completed = 0
+    failed = 0
+    current = ""
+    for line in log_lines:
+        match = re.search(r"Extracting (\d+) repos", line)
+        if match:
+            total = int(match.group(1))
+        if " OK " in line:
+            completed += 1
+            current = line.split(" OK ", 1)[1].split(":", 1)[0].strip()
+        elif "FAIL " in line:
+            failed += 1
+            current = line.split("FAIL ", 1)[1].split(":", 1)[0].strip()
+    done = completed + failed
+    percent = int((done / total) * 100) if total else 0
+    return {
+        "total": total,
+        "completed": completed,
+        "failed": failed,
+        "done": done,
+        "percent": percent,
+        "current": current,
+    }
+
+
+def open_output_folder(output_dir: Path) -> dict[str, Any]:
+    if is_docker_mode():
+        host_hint = os.environ.get("HOST_OUTPUT_HINT", "./outputs/raw-extracts")
+        return {
+            "opened": False,
+            "path": str(output_dir),
+            "message": (
+                f"In Docker, open {host_hint} on your computer, "
+                "or use the Download buttons below."
+            ),
+        }
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", str(output_dir)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"opened": True, "path": str(output_dir), "message": "Opened output folder."}
+    if sys.platform.startswith("win"):
+        subprocess.Popen(
+            ["explorer", os.path.normpath(str(output_dir))],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return {"opened": True, "path": str(output_dir), "message": "Opened output folder."}
+    if shutil.which("xdg-open"):
+        subprocess.Popen(
+            ["xdg-open", str(output_dir)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return {"opened": True, "path": str(output_dir), "message": "Opened output folder."}
+    return {
+        "opened": False,
+        "path": str(output_dir),
+        "message": f"No desktop file manager found. Open this folder manually: {output_dir}",
     }
 
 
@@ -216,7 +291,7 @@ def run_extraction(command: list[str], env_overrides: dict[str, str] | None = No
             repos_failed=None,
             last_error=None,
         )
-        add_log("Starting extraction…")
+        add_log("Starting analysis…")
         proc = subprocess.Popen(
             command,
             cwd=str(ROOT),
@@ -265,7 +340,8 @@ def page() -> str:
             '<p class="notice"><strong>Docker mode:</strong> use container paths such as '
             '<code>/data/repos</code> for offline clones and <code>/app/tokens</code> for the '
             "token file. Results are written to the mounted <code>./outputs</code> folder on "
-            "your computer. The Open archive folder button opens inside the container only."
+            "your computer. Use Download buttons or open <code>outputs/raw-extracts</code> on "
+            "your computer."
             "</p>"
         )
     return """<!doctype html>
@@ -294,10 +370,16 @@ def page() -> str:
   .actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }
   .actions button { margin-top:0; }
   button.secondary { background:#fff; color:#1d4ed8; border:1px solid #93c5fd; }
+  a.button-link { display:inline-block; border-radius:8px; background:#fff; color:#1d4ed8; border:1px solid #93c5fd; font-weight:700; padding:11px 17px; text-decoration:none; }
+  a.button-link.disabled { pointer-events:none; opacity:.5; }
   .paths { font-size:13px; color:#536078; margin-top:10px; line-height:1.5; }
   .paths code { font-size:12px; word-break:break-all; }
   .form-error { color:#b91c1c; font-weight:600; font-size:14px; margin-top:10px; }
   .run-meta { font-size:13px; color:#536078; margin-top:6px; }
+  .progress-wrap { margin-top:12px; height:10px; background:#e5e7eb; border-radius:999px; overflow:hidden; }
+  #progress-bar { height:100%; width:0%; background:#2563eb; transition:width .4s ease; }
+  #progress-label { font-size:13px; color:#536078; margin-top:6px; }
+  textarea { box-sizing:border-box; width:100%; padding:10px; border:1px solid #bdc9dc; border-radius:8px; font:inherit; background:#fff; min-height:88px; resize:vertical; }
 </style></head><body><main>
 <h1>Repository Evidence Extractor</h1>
 <p class="lead">Creates a metadata archive for later analysis. Source code is analysed locally and is not included in the output zip; commit, pull-request, and issue metadata may be retained.</p>
@@ -317,25 +399,41 @@ __DOCKER_NOTICE__
     <div id="github-fields"><label class="field">GitHub organisation name</label><input name="github_org" placeholder="CustomerOrg"><label class="field">GitHub token key</label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file"></div>
     <div id="gitlab-fields" class="hidden"><label class="field">GitLab group path</label><input name="gitlab_group" placeholder="customer-group or customer-group/subgroup"><label class="field">GitLab token key</label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file"></div>
   </div>
+  <label class="field" id="repo-selection-label">Repositories to include (optional)</label>
+  <textarea name="selected_repos" id="selected-repos" placeholder="Leave blank to include everything discovered in the folder or organisation."></textarea>
+  <p class="notice" id="repo-selection-help">Offline: enter repository folder names, one per line.</p>
   <label class="field">Parallel workers</label><input name="workers" type="number" value="4" min="1" max="20">
   <label class="choice" style="margin-top:18px;display:flex;align-items:center"><input id="llm-enabled" type="checkbox" name="llm_enabled"><strong>Enable LLM analysis</strong><span class="small">Adds codebase description, industry/domain, vibe-code signals, and repository type.</span></label>
   <div id="llm-fields" class="hidden"><label class="field">OpenAI API key</label><input name="openai_key" type="password" autocomplete="off" placeholder="sk-..."><p class="notice"><strong>Data sent to OpenAI:</strong> repository name and aggregate metrics, up to 250 file paths, up to 4 source-code excerpts (maximum 1,500 characters each), and one README excerpt (maximum 4,000 characters). These excerpts and the API key are not stored in the output archive.</p><p id="offline-llm-warning" class="warning hidden">LLM mode requires an internet connection in offline mode and sends the data described above to OpenAI.</p></div>
-  <button id="start">Create evidence archive</button>
+  <button id="start">Run analysis</button>
   <p id="form-error" class="form-error hidden"></p>
-  <p class="notice">The browser interface only listens on this computer. Keep this page open while the extraction runs.</p>
+  <p class="notice">The browser interface only listens on this computer. Keep this page open while the analysis runs.</p>
 </div></form>
-<div class="card"><span id="status" class="status">Ready</span><p id="run-meta" class="run-meta hidden"></p><pre id="log">No extraction has started.</pre></div>
-<div id="results" class="card hidden"><strong>Summary CSV</strong>
+<div class="card"><span id="status" class="status">Ready</span><p id="run-meta" class="run-meta hidden"></p><div id="progress-wrap" class="progress-wrap hidden"><div id="progress-bar"></div></div><p id="progress-label" class="progress-label hidden"></p><pre id="log">No analysis has started.</pre></div>
+<div id="results" class="card hidden"><strong>Results</strong>
 <div class="actions">
-  <button id="open-folder" type="button" class="secondary">Open archive folder</button>
+  <button id="open-folder" type="button" class="secondary">Open output folder</button>
+  <a id="download-summary" class="button-link secondary" href="#">Download summary</a>
+  <a id="download-zip" class="button-link secondary" href="#">Download archive zip</a>
 </div>
 <p id="artifact-paths" class="paths hidden"></p>
 <div class="csv-scroll"><div id="csv-preview" class="notice">Loading summary…</div></div></div>
 <script>
-const FORM_STORAGE_KEY='extract-ui-form-v1';
+const FORM_STORAGE_KEY='extract-ui-form-v2';
 const forms = {offline:document.querySelector('#offline-fields'), hosted:document.querySelector('#hosted-fields')};
-function choose(){ const mode=document.querySelector('input[name=mode]:checked').value; Object.entries(forms).forEach(([k,e])=>e.classList.toggle('hidden', k!==mode)); choosePlatform(); chooseLlm(); }
-function choosePlatform(){ const platform=document.querySelector('#hosted-platform').value; document.querySelector('#github-fields').classList.toggle('hidden', platform!=='github'); document.querySelector('#gitlab-fields').classList.toggle('hidden', platform!=='gitlab'); }
+const repoHelp={
+  offline:'Offline: enter repository folder names, one per line. Leave blank to include every repository in the folder.',
+  github:'GitHub: enter owner/repo values, one per line. Leave blank to process the whole organisation above.',
+  gitlab:'GitLab: enter group/project values, one per line. Leave blank to process the whole group above.'
+};
+function choose(){ const mode=document.querySelector('input[name=mode]:checked').value; Object.entries(forms).forEach(([k,e])=>e.classList.toggle('hidden', k!==mode)); choosePlatform(); chooseLlm(); updateRepoHelp(); }
+function choosePlatform(){ const platform=document.querySelector('#hosted-platform').value; document.querySelector('#github-fields').classList.toggle('hidden', platform!=='github'); document.querySelector('#gitlab-fields').classList.toggle('hidden', platform!=='gitlab'); updateRepoHelp(); }
+function updateRepoHelp(){
+  const mode=document.querySelector('input[name=mode]:checked').value;
+  const help=document.querySelector('#repo-selection-help');
+  if (mode==='offline') help.textContent=repoHelp.offline;
+  else help.textContent=document.querySelector('#hosted-platform').value==='gitlab' ? repoHelp.gitlab : repoHelp.github;
+}
 function chooseLlm(){ const enabled=document.querySelector('#llm-enabled').checked; const offline=document.querySelector('input[name=mode]:checked').value==='offline'; document.querySelector('#llm-fields').classList.toggle('hidden', !enabled); document.querySelector('#offline-llm-warning').classList.toggle('hidden', !(enabled && offline)); }
 function readFormSettings(){
   const form=document.querySelector('#extract-form');
@@ -351,6 +449,7 @@ function readFormSettings(){
     gitlab_token_name:data.get('gitlab_token_name')||'gitlab_token',
     workers:data.get('workers')||'4',
     llm_enabled:!!data.get('llm_enabled'),
+    selected_repos:data.get('selected_repos')||'',
   };
 }
 function restoreFormSettings(settings){
@@ -366,6 +465,7 @@ function restoreFormSettings(settings){
   setValue('gitlab_group', settings.gitlab_group||'');
   setValue('gitlab_token_name', settings.gitlab_token_name||'gitlab_token');
   setValue('workers', settings.workers||'4');
+  setValue('selected_repos', settings.selected_repos||'');
   document.querySelector('#llm-enabled').checked=!!settings.llm_enabled;
   choose();
 }
@@ -406,7 +506,7 @@ async function refresh(){
     persistFormSettings(data.form_settings);
     window.formRestoredFromServer=true;
   }
-  const phaseLabels={idle:'Ready', running:'Extraction running…', completed:'Completed successfully', failed:'Finished with errors'};
+  const phaseLabels={idle:'Ready', running:'Analysis running…', completed:'Completed successfully', failed:'Finished with errors'};
   const label=data.running ? phaseLabels.running : phaseLabels[data.phase] || (data.returncode === 0 ? 'Completed successfully' : data.returncode === null ? 'Ready' : 'Finished with errors');
   const status=document.querySelector('#status'); status.textContent=label; status.className='status '+(data.phase==='completed' || data.returncode===0?'good':data.phase==='running' || data.returncode===null?'':'bad');
   const meta=document.querySelector('#run-meta');
@@ -417,7 +517,19 @@ async function refresh(){
   if (data.repos_failed!=null && data.repos_failed>0) metaParts.push('Repos failed: '+data.repos_failed);
   if (metaParts.length) { meta.textContent=metaParts.join(' · '); meta.classList.remove('hidden'); }
   else { meta.textContent=''; meta.classList.add('hidden'); }
-  document.querySelector('#log').textContent=(data.log||[]).join('\\n') || 'No extraction has started.';
+  const progress=data.progress||{};
+  const progressWrap=document.querySelector('#progress-wrap');
+  const progressBar=document.querySelector('#progress-bar');
+  const progressLabel=document.querySelector('#progress-label');
+  const showProgress=data.running && progress.total>0;
+  progressWrap.classList.toggle('hidden', !showProgress);
+  progressLabel.classList.toggle('hidden', !showProgress);
+  if (showProgress) {
+    progressBar.style.width=(progress.percent||0)+'%';
+    const current=progress.current ? ' · current: '+progress.current : '';
+    progressLabel.textContent=(progress.done||0)+' / '+progress.total+' repositories'+current;
+  }
+  document.querySelector('#log').textContent=(data.log||[]).join('\\n') || 'No analysis has started.';
   document.querySelector('#start').disabled=data.running;
   showFormError(data.last_error||'');
   const results=document.querySelector('#results');
@@ -429,8 +541,21 @@ async function refresh(){
     if (data.xlsx_path) parts.push('<strong>Summary (Excel):</strong> <code>'+data.xlsx_path+'</code>');
     else if (data.summary_path) parts.push('<strong>Summary (CSV):</strong> <code>'+data.summary_path+'</code>');
     if (data.zip_path) parts.push('<strong>Archive zip:</strong> <code>'+data.zip_path+'</code>');
+    if (data.host_output_hint) parts.push('<strong>Host folder:</strong> <code>'+data.host_output_hint+'</code>');
     paths.innerHTML=parts.join('<br>');
     paths.classList.toggle('hidden', parts.length===0);
+    const token='csrf_token=__CSRF_TOKEN__';
+    const summaryLink=document.querySelector('#download-summary');
+    const zipLink=document.querySelector('#download-zip');
+    summaryLink.href='/download/summary?'+token;
+    summaryLink.classList.remove('disabled');
+    if (data.zip_path) {
+      zipLink.href='/download/zip?'+token;
+      zipLink.classList.remove('disabled');
+    } else {
+      zipLink.href='#';
+      zipLink.classList.add('disabled');
+    }
   } else {
     paths.classList.add('hidden');
   }
@@ -446,7 +571,10 @@ async function refresh(){
 }
 document.querySelector('#open-folder').addEventListener('click', async ()=> {
   const response=await fetch('/open-output', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'csrf_token=__CSRF_TOKEN__'});
-  if (!response.ok) alert(await response.text());
+  let payload;
+  try { payload=await response.json(); } catch (_) { payload={message:await response.text()}; }
+  if (!response.ok) { alert(payload.message || 'Unable to open output folder.'); return; }
+  if (!payload.opened) alert(payload.message || ('Folder path: '+payload.path));
 });
 restoreFormSettings(loadStoredFormSettings());
 choose();
@@ -470,8 +598,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def respond_file(self, file_path: Path, download_name: str, content_type: str) -> None:
+        with file_path.open("rb") as handle:
+            payload = handle.read()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        query = parse_qs(urlparse(self.path).query)
         if path == "/status":
             with LOCK:
                 safe_state = {
@@ -479,7 +618,45 @@ class Handler(BaseHTTPRequestHandler):
                     for key, value in STATE.items()
                     if key != "command"
                 }
+                safe_state["progress"] = compute_progress(safe_state.get("log") or [])
+                if is_docker_mode():
+                    safe_state["host_output_hint"] = os.environ.get(
+                        "HOST_OUTPUT_HINT", "./outputs/raw-extracts"
+                    )
             self.respond(HTTPStatus.OK, "application/json", json.dumps(safe_state))
+            return
+        if path == "/download/summary":
+            if not secrets.compare_digest(query.get("csrf_token", [""])[0], CSRF_TOKEN):
+                self.respond(HTTPStatus.FORBIDDEN, "text/plain", "Invalid request token.")
+                return
+            with LOCK:
+                summary_value = STATE.get("xlsx_path") or STATE.get("summary_path")
+            if not summary_value:
+                self.respond(HTTPStatus.NOT_FOUND, "text/plain", "No completed summary is available.")
+                return
+            summary_path = Path(summary_value)
+            if not summary_path.is_file() or not is_under_archive(summary_path):
+                self.respond(HTTPStatus.NOT_FOUND, "text/plain", "Summary file is unavailable.")
+                return
+            if summary_path.suffix.lower() == ".xlsx":
+                self.respond_file(summary_path, "summary.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            else:
+                self.respond_file(summary_path, "summary.csv", "text/csv; charset=utf-8")
+            return
+        if path == "/download/zip":
+            if not secrets.compare_digest(query.get("csrf_token", [""])[0], CSRF_TOKEN):
+                self.respond(HTTPStatus.FORBIDDEN, "text/plain", "Invalid request token.")
+                return
+            with LOCK:
+                zip_value = STATE.get("zip_path")
+            if not zip_value:
+                self.respond(HTTPStatus.NOT_FOUND, "text/plain", "No completed archive zip is available.")
+                return
+            zip_path = Path(zip_value)
+            if not zip_path.is_file() or not is_under_archive(zip_path):
+                self.respond(HTTPStatus.NOT_FOUND, "text/plain", "Archive zip is unavailable.")
+                return
+            self.respond_file(zip_path, zip_path.name, "application/zip")
             return
         if path == "/summary":
             with LOCK:
@@ -520,7 +697,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Invalid form submission.")
             return
-        if length <= 0 or length > 20_000:
+        if length <= 0 or length > 100_000:
             self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Invalid form submission.")
             return
         fields = parse_qs(self.rfile.read(length).decode("utf-8"))
@@ -534,29 +711,20 @@ class Handler(BaseHTTPRequestHandler):
             if not output_value:
                 self.respond(
                     HTTPStatus.NOT_FOUND,
-                    "text/plain",
-                    "No completed output folder is available.",
+                    "application/json",
+                    json.dumps({"opened": False, "message": "No completed output folder is available."}),
                 )
                 return
             output_dir = Path(output_value)
-            archive_root = DEFAULT_OUTPUT.resolve()
-            resolved_output = output_dir.resolve()
-            if not output_dir.is_dir() or (
-                resolved_output != archive_root and archive_root not in resolved_output.parents
-            ):
+            if not output_dir.is_dir() or not is_under_archive(output_dir):
                 self.respond(
                     HTTPStatus.NOT_FOUND,
-                    "text/plain",
-                    "Output folder is unavailable.",
+                    "application/json",
+                    json.dumps({"opened": False, "message": "Output folder is unavailable."}),
                 )
                 return
-            if sys.platform == "darwin":
-                subprocess.Popen(["open", str(output_dir)])
-            elif sys.platform.startswith("win"):
-                subprocess.Popen(["explorer", str(output_dir)])
-            else:
-                subprocess.Popen(["xdg-open", str(output_dir)])
-            self.respond(HTTPStatus.OK, "text/plain", "Opened output folder.")
+            result = open_output_folder(output_dir)
+            self.respond(HTTPStatus.OK, "application/json", json.dumps(result))
             return
         mode = fields.get("mode", ["offline"])[0]
         form_settings = extract_form_settings(fields)
@@ -584,6 +752,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Choose the folder holding local clones.")
                 return
             command.extend(["--offline", "--local-repos-dir", local_dir])
+            for repo_name in parse_repo_selectors(form_settings.get("selected_repos", "")):
+                command.extend(["--local-repo", repo_name])
         elif mode == "hosted":
             tokens_file = fields.get("tokens_file", [""])[0].strip()
             if not tokens_file:
@@ -591,32 +761,53 @@ class Handler(BaseHTTPRequestHandler):
                 return
             command.extend(["--tokens-file", tokens_file])
             platform = fields.get("hosted_platform", ["github"])[0]
+            selected_repos = parse_repo_selectors(form_settings.get("selected_repos", ""))
             if platform == "github":
                 org = fields.get("github_org", [""])[0].strip()
                 token_name = fields.get("github_token_name", [""])[0].strip()
-                if not org or not token_name:
+                if not token_name:
                     self.respond(
                         HTTPStatus.BAD_REQUEST,
                         "text/plain",
-                        "Enter the GitHub organisation and token key.",
+                        "Enter the GitHub token key.",
                     )
                     return
-                command.extend(
-                    ["--github-org", org, "--github-token-name", token_name]
-                )
+                if selected_repos:
+                    for repo_name in selected_repos:
+                        command.extend(["--github-repo", repo_name])
+                elif org:
+                    command.extend(["--github-org", org])
+                else:
+                    self.respond(
+                        HTTPStatus.BAD_REQUEST,
+                        "text/plain",
+                        "Enter a GitHub organisation or list specific repositories.",
+                    )
+                    return
+                command.extend(["--github-token-name", token_name])
             elif platform == "gitlab":
                 group = fields.get("gitlab_group", [""])[0].strip()
                 token_name = fields.get("gitlab_token_name", [""])[0].strip()
-                if not group or not token_name:
+                if not token_name:
                     self.respond(
                         HTTPStatus.BAD_REQUEST,
                         "text/plain",
-                        "Enter the GitLab group and token key.",
+                        "Enter the GitLab token key.",
                     )
                     return
-                command.extend(
-                    ["--gitlab-group", group, "--gitlab-token-name", token_name]
-                )
+                if selected_repos:
+                    for project in selected_repos:
+                        command.extend(["--gitlab-project", project])
+                elif group:
+                    command.extend(["--gitlab-group", group])
+                else:
+                    self.respond(
+                        HTTPStatus.BAD_REQUEST,
+                        "text/plain",
+                        "Enter a GitLab group or list specific projects.",
+                    )
+                    return
+                command.extend(["--gitlab-token-name", token_name])
             else:
                 self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Unknown hosted platform.")
                 return

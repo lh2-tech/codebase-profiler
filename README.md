@@ -28,6 +28,14 @@ docker compose up --build
 
 That is the only command needed after `tokens` is configured.
 
+## UI features
+
+- **Run analysis** — starts the metadata extraction
+- **Progress bar** — shows repository completion while a run is active
+- **Repository selection** — optional one-per-line list to limit which repos/projects are processed
+- **Open output folder** — opens the run folder on Mac, Windows, or Ubuntu (in Docker, use Download buttons or open `./outputs/raw-extracts` on your computer)
+- **Download summary / archive zip** — browser downloads for the completed run
+
 ## Modes
 
 ### Hosted platform (GitHub / GitLab)
@@ -49,6 +57,8 @@ In the UI, always use the **container path**:
 ```text
 /data/repos
 ```
+
+Optionally list specific repository folder names in **Repositories to include**.
 
 Do not enter the host path (`/Users/me/...`) — it will not exist inside the container.
 

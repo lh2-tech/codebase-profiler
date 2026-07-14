@@ -844,6 +844,35 @@ def find_local_repositories(root: Path) -> list[RepoTarget]:
     return sorted(repos, key=lambda repo: repo.full_name.lower())
 
 
+def filter_local_targets(
+    targets: list[RepoTarget], selectors: list[str]
+) -> list[RepoTarget]:
+    """Keep only local repos matching any selector (full path or folder name)."""
+    wanted = [item.strip().lower() for item in selectors if item.strip()]
+    if not wanted:
+        return targets
+
+    def matches(target: RepoTarget) -> bool:
+        full_name = target.full_name.lower()
+        repo_name = full_name.split("/")[-1]
+        for selector in wanted:
+            if full_name == selector:
+                return True
+            if repo_name == selector:
+                return True
+            if full_name.endswith(f"/{selector}"):
+                return True
+        return False
+
+    filtered = [target for target in targets if matches(target)]
+    if not filtered:
+        raise SystemExit(
+            "No local repositories matched the requested selection. "
+            f"Available: {', '.join(target.full_name for target in targets)}"
+        )
+    return filtered
+
+
 # ── per-repo orchestration ──────────────────────────────────────────────────
 
 
@@ -1236,6 +1265,12 @@ def main() -> int:
         help="Directory containing fully cloned Git repositories",
     )
     parser.add_argument(
+        "--local-repo",
+        action="append",
+        default=[],
+        help="Offline mode only: include matching local repo folder names (repeatable)",
+    )
+    parser.add_argument(
         "--offline",
         action="store_true",
         help="Analyze --local-repos-dir only; make no network/API requests",
@@ -1322,6 +1357,8 @@ def main() -> int:
 
     if args.offline:
         targets = find_local_repositories(args.local_repos_dir.resolve())
+        if args.local_repo:
+            targets = filter_local_targets(targets, args.local_repo)
     else:
         targets = build_targets(
             args,
