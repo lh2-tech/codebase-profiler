@@ -844,6 +844,94 @@ def find_local_repositories(root: Path) -> list[RepoTarget]:
     return sorted(repos, key=lambda repo: repo.full_name.lower())
 
 
+def discover_local_repositories(root: Path) -> list[RepoTarget]:
+    """Like ``find_local_repositories`` but returns an empty list when nothing is found."""
+    if not root.is_dir():
+        return []
+    repos: list[RepoTarget] = []
+    for current, dirs, _ in os.walk(root):
+        current_path = Path(current)
+        if (current_path / ".git").exists():
+            relative_path = current_path.relative_to(root)
+            repos.append(
+                RepoTarget(
+                    platform="local",
+                    org=root.name,
+                    full_name=root.name if relative_path == Path(".") else str(relative_path),
+                    meta={},
+                    local_path=current_path,
+                )
+            )
+            dirs[:] = []
+            continue
+        dirs[:] = [
+            directory
+            for directory in dirs
+            if directory not in SKIP_WALK_DIRS and not directory.startswith(".")
+        ]
+    return sorted(repos, key=lambda repo: repo.full_name.lower())
+
+
+def list_github_orgs_for_token(token: str, host: str = "github.com") -> list[dict[str, str]]:
+    api = github_api(token, host)
+    orgs: list[dict[str, str]] = []
+    user_data, _ = http_get_json(f"{api}/user", github_headers(token))
+    if isinstance(user_data, dict) and user_data.get("login"):
+        login = str(user_data["login"])
+        orgs.append(
+            {
+                "id": login,
+                "name": f"{login} (personal account)",
+                "type": "user",
+            }
+        )
+    for org in paginate_github(f"{api}/user/orgs?per_page=100", token):
+        login = str(org.get("login") or "")
+        if login:
+            orgs.append({"id": login, "name": login, "type": "org"})
+    return orgs
+
+
+def list_github_repos_for_org(token: str, org: str, host: str = "github.com") -> list[dict[str, str]]:
+    return [
+        {
+            "id": str(repo["full_name"]),
+            "name": str(repo["full_name"]),
+            "archived": bool(repo.get("archived")),
+        }
+        for repo in list_github_repo_objects(token, org, host)
+    ]
+
+
+def list_gitlab_groups_for_token(token: str, host: str = "gitlab.com") -> list[dict[str, str]]:
+    api = gitlab_api(host)
+    groups = paginate_gitlab(
+        api,
+        "/groups",
+        token,
+        {"membership": "true", "min_access_level": "10"},
+    )
+    results: list[dict[str, str]] = []
+    for group in groups:
+        group_id = str(group.get("full_path") or group.get("path") or "")
+        if group_id:
+            results.append({"id": group_id, "name": group_id, "type": "group"})
+    return sorted(results, key=lambda item: item["name"].lower())
+
+
+def list_gitlab_projects_for_group(
+    token: str, group: str, host: str = "gitlab.com"
+) -> list[dict[str, str]]:
+    return [
+        {
+            "id": str(project["path_with_namespace"]),
+            "name": str(project["path_with_namespace"]),
+            "archived": bool(project.get("archived")),
+        }
+        for project in list_gitlab_project_objects(token, group, host)
+    ]
+
+
 def filter_local_targets(
     targets: list[RepoTarget], selectors: list[str]
 ) -> list[RepoTarget]:

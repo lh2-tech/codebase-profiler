@@ -27,6 +27,16 @@ EXTRACTOR = ROOT / "extract_org_raw_data.py"
 DEFAULT_OUTPUT = ROOT / "outputs" / "raw-extracts"
 STATE_FILE = DEFAULT_OUTPUT / ".ui_state.json"
 LOGO_PATH = ROOT / "LH2-DataLabs.svg"
+CSRF_TOKEN = secrets.token_urlsafe(32)
+
+from extract_org_raw_data import (  # noqa: E402
+    discover_local_repositories,
+    list_github_orgs_for_token,
+    list_github_repos_for_org,
+    list_gitlab_groups_for_token,
+    list_gitlab_projects_for_group,
+    parse_tokens_file,
+)
 
 STATE: dict[str, Any] = {
     "phase": "idle",
@@ -70,8 +80,13 @@ def _empty_state() -> dict[str, Any]:
     }
 
 
+def extract_selected_repos(fields: dict[str, list[str]]) -> list[str]:
+    return [value.strip() for value in fields.get("selected_repos", []) if value.strip()]
+
+
 def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
     llm_enabled = fields.get("llm_enabled", [""])[0] == "on"
+    selected = extract_selected_repos(fields)
     return {
         "mode": fields.get("mode", ["offline"])[0],
         "local_repos_dir": fields.get("local_repos_dir", [""])[0].strip(),
@@ -85,12 +100,30 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
         or "gitlab_token",
         "workers": fields.get("workers", ["4"])[0].strip() or "4",
         "llm_enabled": llm_enabled,
-        "selected_repos": fields.get("selected_repos", [""])[0].strip(),
+        "selected_repos": "\n".join(selected),
     }
 
 
-def parse_repo_selectors(text: str) -> list[str]:
-    return [line.strip() for line in text.splitlines() if line.strip()]
+def read_token_from_fields(fields: dict[str, list[str]], platform: str) -> str:
+    tokens_file = Path(fields.get("tokens_file", ["tokens"])[0].strip() or "tokens")
+    if not tokens_file.is_file():
+        raise ValueError(f"Tokens file not found: {tokens_file}")
+    tokens = parse_tokens_file(tokens_file)
+    if platform == "github":
+        token_name = fields.get("github_token_name", ["data-lh2-github-token"])[0].strip()
+        if token_name not in tokens:
+            raise ValueError(f"Missing {token_name!r} in tokens file")
+        return tokens[token_name]
+    token_name = fields.get("gitlab_token_name", ["gitlab_token"])[0].strip()
+    if token_name not in tokens:
+        raise ValueError(f"Missing {token_name!r} in tokens file")
+    return tokens[token_name]
+
+
+def parse_repo_selectors(text: str | list[str]) -> list[str]:
+    if isinstance(text, list):
+        return [line.strip() for line in text if str(line).strip()]
+    return [line.strip() for line in str(text).splitlines() if line.strip()]
 
 
 def is_under_archive(path: Path) -> bool:
@@ -385,6 +418,12 @@ def page() -> str:
   #progress-bar { height:100%; width:0%; background:#2563eb; transition:width .4s ease; }
   #progress-label { font-size:13px; color:#536078; margin-top:6px; }
   textarea { box-sizing:border-box; width:100%; padding:10px; border:1px solid #bdc9dc; border-radius:8px; font:inherit; background:#fff; min-height:88px; resize:vertical; }
+  .inline-actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:8px 0 12px; }
+  .inline-actions button { margin-top:0; }
+  .repo-picker { max-height:240px; overflow:auto; border:1px solid #dce3ef; border-radius:9px; padding:10px; background:#fafcff; }
+  .repo-option { display:flex; align-items:flex-start; gap:8px; padding:6px 4px; font-size:14px; }
+  .repo-option input { margin-top:3px; }
+  .picker-empty { color:#66758d; font-size:14px; padding:8px 4px; }
 </style></head><body><main>
 <header class="brand">
   <img src="/logo.svg" alt="LH2 AI Labs" class="brand-logo">
@@ -402,16 +441,19 @@ __DOCKER_NOTICE__
   <label class="choice"><input type="radio" name="mode" value="hosted"> <strong>Hosted platform</strong><span class="small">Connect to a GitHub or GitLab organisation with a token file.</span></label>
 </div></div>
 <div class="card">
-  <div id="offline-fields"><label class="field">Folder holding full local clones<span class="req">*</span></label><input name="local_repos_dir" value="__DEFAULT_LOCAL_REPOS_DIR__" placeholder="__LOCAL_PLACEHOLDER__" required><p class="notice"><strong>How to prepare this folder:</strong> use a normal full clone for every repository, for example <code>git clone https://github.com/OWNER/REPO.git</code>. Do not use <code>--depth</code>, because the extractor needs the complete commit history. Put one or more cloned repositories inside this folder, then select the folder above.</p></div>
+  <div id="offline-fields"><label class="field">Folder holding full local clones<span class="req">*</span></label><input name="local_repos_dir" id="local-repos-dir" value="__DEFAULT_LOCAL_REPOS_DIR__" placeholder="__LOCAL_PLACEHOLDER__" required><div class="inline-actions"><button type="button" id="load-local-repos" class="secondary">Load repositories</button></div><p class="notice"><strong>How to prepare this folder:</strong> use a normal full clone for every repository, for example <code>git clone https://github.com/OWNER/REPO.git</code>. Do not use <code>--depth</code>, because the extractor needs the complete commit history.</p></div>
   <div id="hosted-fields" class="hidden">
     <label class="field">Platform</label><select id="hosted-platform" name="hosted_platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option></select>
     <label class="field">Path to token file<span class="req">*</span></label><input name="tokens_file" value="__DEFAULT_TOKENS_FILE__" placeholder="/path/to/tokens" required>
-    <div id="github-fields"><label class="field">GitHub organisation name<span class="req" id="github-org-req">*</span></label><input name="github_org" placeholder="CustomerOrg"><label class="field">GitHub token key<span class="req">*</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file" required></div>
-    <div id="gitlab-fields" class="hidden"><label class="field">GitLab group path<span class="req" id="gitlab-group-req">*</span></label><input name="gitlab_group" placeholder="customer-group or customer-group/subgroup"><label class="field">GitLab token key<span class="req">*</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file" required></div>
+    <div id="github-fields"><label class="field">GitHub token key<span class="req">*</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file" required><label class="field">Organisation<span class="req">*</span></label><div class="inline-actions"><button type="button" id="load-github-orgs" class="secondary">Load organisations</button></div><select name="github_org" id="github-org-select"><option value="">Choose an organisation</option></select></div>
+    <div id="gitlab-fields" class="hidden"><label class="field">GitLab token key<span class="req">*</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file" required><label class="field">Group<span class="req">*</span></label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group</option></select></div>
   </div>
-  <label class="field" id="repo-selection-label">Repositories to include (optional)</label>
-  <textarea name="selected_repos" id="selected-repos" placeholder="Leave blank to include everything discovered in the folder or organisation."></textarea>
-  <p class="notice" id="repo-selection-help">Offline: enter repository folder names, one per line.</p>
+  <div id="repo-picker-wrap" class="hidden">
+    <label class="field" id="repo-selection-label">Repositories to include</label>
+    <div class="inline-actions"><button type="button" id="select-all-repos" class="secondary">Select all</button><button type="button" id="clear-repos" class="secondary">Clear</button></div>
+    <div id="repo-picker" class="repo-picker"><p class="picker-empty">Load repositories to choose which ones to include.</p></div>
+    <p class="notice" id="repo-selection-help">Leave all unchecked to include every repository discovered above.</p>
+  </div>
   <label class="field">Parallel workers</label><input name="workers" type="number" value="4" min="1" max="20">
   <label class="choice" style="margin-top:18px;display:flex;align-items:center"><input id="llm-enabled" type="checkbox" name="llm_enabled"><strong>Enable LLM analysis</strong><span class="small">Adds codebase description, industry/domain, vibe-code signals, and repository type.</span></label>
   <div id="llm-fields" class="hidden"><label class="field">OpenAI API key<span class="req">*</span></label><input name="openai_key" type="password" autocomplete="off" placeholder="sk-..."><p id="offline-llm-warning" class="warning hidden">LLM mode requires an internet connection in offline mode.</p></div>
@@ -429,60 +471,122 @@ __DOCKER_NOTICE__
 <p id="artifact-paths" class="paths hidden"></p>
 <div class="csv-scroll"><div id="csv-preview" class="notice">Loading summary…</div></div></div>
 <script>
-const FORM_STORAGE_KEY='extract-ui-form-v2';
+const FORM_STORAGE_KEY='extract-ui-form-v3';
 const forms = {offline:document.querySelector('#offline-fields'), hosted:document.querySelector('#hosted-fields')};
-const repoHelp={
-  offline:'Offline: enter repository folder names, one per line. Leave blank to include every repository in the folder.',
-  github:'GitHub: enter owner/repo values, one per line. Leave blank to process the whole organisation above.',
-  gitlab:'GitLab: enter group/project values, one per line. Leave blank to process the whole group above.'
-};
-function choose(){ const mode=document.querySelector('input[name=mode]:checked').value; Object.entries(forms).forEach(([k,e])=>e.classList.toggle('hidden', k!==mode)); choosePlatform(); chooseLlm(); updateRepoHelp(); }
-function choosePlatform(){ const platform=document.querySelector('#hosted-platform').value; document.querySelector('#github-fields').classList.toggle('hidden', platform!=='github'); document.querySelector('#gitlab-fields').classList.toggle('hidden', platform!=='gitlab'); updateRepoHelp(); }
-function updateRepoHelp(){
-  const mode=document.querySelector('input[name=mode]:checked').value;
-  const help=document.querySelector('#repo-selection-help');
-  if (mode==='offline') help.textContent=repoHelp.offline;
-  else help.textContent=document.querySelector('#hosted-platform').value==='gitlab' ? repoHelp.gitlab : repoHelp.github;
-  const hasSelected=document.querySelector('#selected-repos').value.trim().length>0;
-  const githubReq=document.querySelector('#github-org-req');
-  const gitlabReq=document.querySelector('#gitlab-group-req');
-  if (githubReq) githubReq.classList.toggle('hidden', hasSelected);
-  if (gitlabReq) gitlabReq.classList.toggle('hidden', hasSelected);
+let savedRepoChecks=new Set();
+function choose(){ const mode=document.querySelector('input[name=mode]:checked').value; Object.entries(forms).forEach(([k,e])=>e.classList.toggle('hidden', k!==mode)); choosePlatform(); chooseLlm(); }
+function choosePlatform(){ const platform=document.querySelector('#hosted-platform').value; document.querySelector('#github-fields').classList.toggle('hidden', platform!=='github'); document.querySelector('#gitlab-fields').classList.toggle('hidden', platform!=='gitlab'); document.querySelector('#repo-picker-wrap').classList.add('hidden'); }
+function chooseLlm(){ const enabled=document.querySelector('#llm-enabled').checked; const offline=document.querySelector('input[name=mode]:checked').value==='offline'; document.querySelector('#llm-fields').classList.toggle('hidden', !enabled); document.querySelector('#offline-llm-warning').classList.toggle('hidden', !(enabled && offline)); }
+function getSelectedRepos(){ return [...document.querySelectorAll('input[name="selected_repos"]:checked')].map(el=>el.value); }
+function rememberRepoChecks(){ savedRepoChecks=new Set(getSelectedRepos()); }
+function renderRepoPicker(items, emptyMessage){
+  const wrap=document.querySelector('#repo-picker-wrap');
+  const picker=document.querySelector('#repo-picker');
+  if (!items.length) {
+    picker.innerHTML='<p class="picker-empty">'+(emptyMessage||'No repositories found.')+'</p>';
+    wrap.classList.remove('hidden');
+    return;
+  }
+  picker.innerHTML='';
+  items.forEach(item=>{
+    const label=document.createElement('label');
+    label.className='repo-option';
+    const box=document.createElement('input');
+    box.type='checkbox';
+    box.name='selected_repos';
+    box.value=item.id;
+    if (savedRepoChecks.has(item.id)) box.checked=true;
+    const text=document.createElement('span');
+    text.textContent=item.archived ? item.name+' (archived)' : item.name;
+    label.appendChild(box); label.appendChild(text); picker.appendChild(label);
+  });
+  wrap.classList.remove('hidden');
 }
-function clearInvalid(){
-  document.querySelectorAll('.invalid').forEach(el=>el.classList.remove('invalid'));
+async function postDiscover(path, extra){
+  const body=new URLSearchParams({csrf_token:'__CSRF_TOKEN__', ...extra});
+  const response=await fetch(path, {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+  const payload=await response.json().catch(async()=>({error:await response.text()}));
+  if (!response.ok) throw new Error(payload.error||'Discovery failed.');
+  return payload;
 }
-function markInvalid(name){
-  const el=document.querySelector('[name="'+name+'"]');
-  if (el) el.classList.add('invalid');
+function fillSelect(select, items, placeholder){
+  select.innerHTML='';
+  const blank=document.createElement('option');
+  blank.value=''; blank.textContent=placeholder; select.appendChild(blank);
+  items.forEach(item=>{ const opt=document.createElement('option'); opt.value=item.id; opt.textContent=item.name; select.appendChild(opt); });
 }
+async function loadLocalRepos(){
+  showFormError('');
+  const localDir=document.querySelector('#local-repos-dir').value.trim();
+  if (!localDir) { showFormError('Choose the folder holding local clones.'); return; }
+  try {
+    const payload=await postDiscover('/discover/local', {local_repos_dir:localDir});
+    rememberRepoChecks();
+    renderRepoPicker(payload.items, 'No Git repositories found in that folder.');
+  } catch (error) { showFormError(error.message); }
+}
+async function loadHostedOrgs(){
+  showFormError('');
+  const platform=document.querySelector('#hosted-platform').value;
+  const extra={
+    hosted_platform:platform,
+    tokens_file:document.querySelector('[name=tokens_file]').value,
+    github_token_name:document.querySelector('[name=github_token_name]').value,
+    gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
+  };
+  try {
+    const payload=await postDiscover('/discover/orgs', extra);
+    if (platform==='github') fillSelect(document.querySelector('#github-org-select'), payload.items, 'Choose an organisation');
+    else fillSelect(document.querySelector('#gitlab-group-select'), payload.items, 'Choose a group');
+    document.querySelector('#repo-picker-wrap').classList.add('hidden');
+  } catch (error) { showFormError(error.message); }
+}
+async function loadHostedRepos(){
+  const platform=document.querySelector('#hosted-platform').value;
+  const extra={
+    hosted_platform:platform,
+    tokens_file:document.querySelector('[name=tokens_file]').value,
+    github_token_name:document.querySelector('[name=github_token_name]').value,
+    gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
+  };
+  if (platform==='github') {
+    extra.github_org=document.querySelector('#github-org-select').value;
+    if (!extra.github_org) return;
+  } else {
+    extra.gitlab_group=document.querySelector('#gitlab-group-select').value;
+    if (!extra.gitlab_group) return;
+  }
+  try {
+    const payload=await postDiscover('/discover/repos', extra);
+    rememberRepoChecks();
+    renderRepoPicker(payload.items, 'No repositories found for this selection.');
+  } catch (error) { showFormError(error.message); }
+}
+function clearInvalid(){ document.querySelectorAll('.invalid').forEach(el=>el.classList.remove('invalid')); }
+function markInvalid(name){ const el=document.querySelector('[name="'+name+'"],#'+name); if (el) el.classList.add('invalid'); }
 function validateForm(){
   clearInvalid();
   const data=readFormSettings();
   const errors=[];
   if (data.mode==='offline') {
-    if (!data.local_repos_dir.trim()) errors.push(['local_repos_dir','Choose the folder holding local clones.']);
+    if (!data.local_repos_dir.trim()) errors.push(['local-repos-dir','Choose the folder holding local clones.']);
   } else {
     if (!data.tokens_file.trim()) errors.push(['tokens_file','Enter the token file path.']);
-    const repos=data.selected_repos.trim().split(/\\n+/).filter(Boolean);
     if (data.hosted_platform==='github') {
       if (!data.github_token_name.trim()) errors.push(['github_token_name','Enter the GitHub token key.']);
-      if (!repos.length && !data.github_org.trim()) errors.push(['github_org','Enter a GitHub organisation or list specific repositories.']);
+      if (!data.github_org.trim()) errors.push(['github-org-select','Choose a GitHub organisation.']);
     } else {
       if (!data.gitlab_token_name.trim()) errors.push(['gitlab_token_name','Enter the GitLab token key.']);
-      if (!repos.length && !data.gitlab_group.trim()) errors.push(['gitlab_group','Enter a GitLab group or list specific projects.']);
+      if (!data.gitlab_group.trim()) errors.push(['gitlab-group-select','Choose a GitLab group.']);
     }
   }
-  if (data.llm_enabled && !document.querySelector('[name=openai_key]').value.trim()) {
-    errors.push(['openai_key','Enter an OpenAI API key to enable LLM analysis.']);
-  }
+  if (data.llm_enabled && !document.querySelector('[name=openai_key]').value.trim()) errors.push(['openai_key','Enter an OpenAI API key to enable LLM analysis.']);
   if (!errors.length) return true;
   showFormError(errors[0][1]);
   errors.forEach(([name])=>markInvalid(name));
-  document.querySelector('[name="'+errors[0][0]+'"]')?.scrollIntoView({behavior:'smooth', block:'center'});
+  document.querySelector('[name="'+errors[0][0]+'"],#'+errors[0][0])?.scrollIntoView({behavior:'smooth', block:'center'});
   return false;
 }
-function chooseLlm(){ const enabled=document.querySelector('#llm-enabled').checked; const offline=document.querySelector('input[name=mode]:checked').value==='offline'; document.querySelector('#llm-fields').classList.toggle('hidden', !enabled); document.querySelector('#offline-llm-warning').classList.toggle('hidden', !(enabled && offline)); }
 function readFormSettings(){
   const form=document.querySelector('#extract-form');
   const data=new FormData(form);
@@ -497,7 +601,7 @@ function readFormSettings(){
     gitlab_token_name:data.get('gitlab_token_name')||'gitlab_token',
     workers:data.get('workers')||'4',
     llm_enabled:!!data.get('llm_enabled'),
-    selected_repos:data.get('selected_repos')||'',
+    selected_repos:getSelectedRepos().join('\\n'),
   };
 }
 function restoreFormSettings(settings){
@@ -513,29 +617,25 @@ function restoreFormSettings(settings){
   setValue('gitlab_group', settings.gitlab_group||'');
   setValue('gitlab_token_name', settings.gitlab_token_name||'gitlab_token');
   setValue('workers', settings.workers||'4');
-  setValue('selected_repos', settings.selected_repos||'');
   document.querySelector('#llm-enabled').checked=!!settings.llm_enabled;
+  savedRepoChecks=new Set((settings.selected_repos||'').split(/\\n+/).filter(Boolean));
   choose();
 }
-function persistFormSettings(settings){
-  try { localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(settings)); } catch (_) {}
-}
-function loadStoredFormSettings(){
-  try {
-    const raw=localStorage.getItem(FORM_STORAGE_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch (_) { return null; }
-}
-function showFormError(message){
-  const el=document.querySelector('#form-error');
-  if (!message) { el.textContent=''; el.classList.add('hidden'); return; }
-  el.textContent=message; el.classList.remove('hidden');
-}
+function persistFormSettings(settings){ try { localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(settings)); } catch (_) {} }
+function loadStoredFormSettings(){ try { const raw=localStorage.getItem(FORM_STORAGE_KEY); return raw ? JSON.parse(raw) : null; } catch (_) { return null; } }
+function showFormError(message){ const el=document.querySelector('#form-error'); if (!message) { el.textContent=''; el.classList.add('hidden'); return; } el.textContent=message; el.classList.remove('hidden'); }
 document.querySelectorAll('input[name=mode]').forEach(e=>e.addEventListener('change',choose));
 document.querySelector('#hosted-platform').addEventListener('change',choosePlatform);
 document.querySelector('#llm-enabled').addEventListener('change',chooseLlm);
-document.querySelector('#extract-form').addEventListener('input', ()=>{ persistFormSettings(readFormSettings()); updateRepoHelp(); clearInvalid(); });
-document.querySelector('#extract-form').addEventListener('change', ()=>{ persistFormSettings(readFormSettings()); updateRepoHelp(); });
+document.querySelector('#load-local-repos').addEventListener('click', loadLocalRepos);
+document.querySelector('#load-github-orgs').addEventListener('click', loadHostedOrgs);
+document.querySelector('#load-gitlab-groups').addEventListener('click', loadHostedOrgs);
+document.querySelector('#github-org-select').addEventListener('change', loadHostedRepos);
+document.querySelector('#gitlab-group-select').addEventListener('change', loadHostedRepos);
+document.querySelector('#select-all-repos').addEventListener('click', ()=>document.querySelectorAll('input[name="selected_repos"]').forEach(el=>el.checked=true));
+document.querySelector('#clear-repos').addEventListener('click', ()=>document.querySelectorAll('input[name="selected_repos"]').forEach(el=>el.checked=false));
+document.querySelector('#extract-form').addEventListener('input', ()=>{ persistFormSettings(readFormSettings()); clearInvalid(); });
+document.querySelector('#extract-form').addEventListener('change', ()=>persistFormSettings(readFormSettings()));
 document.querySelector('#extract-form').addEventListener('submit', async (event)=>{
   event.preventDefault();
   showFormError('');
@@ -752,7 +852,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
-        if path not in {"/start", "/open-output"}:
+        if path not in {"/start", "/open-output", "/discover/local", "/discover/orgs", "/discover/repos"}:
             self.respond(HTTPStatus.NOT_FOUND, "text/plain", "Not found")
             return
         try:
@@ -789,8 +889,102 @@ class Handler(BaseHTTPRequestHandler):
             result = open_output_folder(output_dir)
             self.respond(HTTPStatus.OK, "application/json", json.dumps(result))
             return
+        if path == "/discover/local":
+            local_dir = fields.get("local_repos_dir", [""])[0].strip()
+            if not local_dir:
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "application/json",
+                    json.dumps({"error": "Choose the folder holding local clones."}),
+                )
+                return
+            targets = discover_local_repositories(Path(local_dir).resolve())
+            items = [{"id": target.full_name, "name": target.full_name} for target in targets]
+            self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": items}))
+            return
+        if path == "/discover/orgs":
+            platform = fields.get("hosted_platform", ["github"])[0]
+            try:
+                token = read_token_from_fields(fields, platform)
+            except ValueError as exc:
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "application/json",
+                    json.dumps({"error": str(exc)}),
+                )
+                return
+            try:
+                if platform == "github":
+                    items = list_github_orgs_for_token(token)
+                elif platform == "gitlab":
+                    items = list_gitlab_groups_for_token(token)
+                else:
+                    self.respond(
+                        HTTPStatus.BAD_REQUEST,
+                        "application/json",
+                        json.dumps({"error": "Unknown hosted platform."}),
+                    )
+                    return
+            except Exception as exc:
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "application/json",
+                    json.dumps({"error": str(exc)[:500]}),
+                )
+                return
+            self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": items}))
+            return
+        if path == "/discover/repos":
+            platform = fields.get("hosted_platform", ["github"])[0]
+            try:
+                token = read_token_from_fields(fields, platform)
+            except ValueError as exc:
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "application/json",
+                    json.dumps({"error": str(exc)}),
+                )
+                return
+            try:
+                if platform == "github":
+                    org = fields.get("github_org", [""])[0].strip()
+                    if not org:
+                        self.respond(
+                            HTTPStatus.BAD_REQUEST,
+                            "application/json",
+                            json.dumps({"error": "Choose a GitHub organisation."}),
+                        )
+                        return
+                    items = list_github_repos_for_org(token, org)
+                elif platform == "gitlab":
+                    group = fields.get("gitlab_group", [""])[0].strip()
+                    if not group:
+                        self.respond(
+                            HTTPStatus.BAD_REQUEST,
+                            "application/json",
+                            json.dumps({"error": "Choose a GitLab group."}),
+                        )
+                        return
+                    items = list_gitlab_projects_for_group(token, group)
+                else:
+                    self.respond(
+                        HTTPStatus.BAD_REQUEST,
+                        "application/json",
+                        json.dumps({"error": "Unknown hosted platform."}),
+                    )
+                    return
+            except Exception as exc:
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "application/json",
+                    json.dumps({"error": str(exc)[:500]}),
+                )
+                return
+            self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": items}))
+            return
         mode = fields.get("mode", ["offline"])[0]
         form_settings = extract_form_settings(fields)
+        selected_repos = extract_selected_repos(fields)
         workers = fields.get("workers", ["4"])[0].strip()
         try:
             workers_number = int(workers)
@@ -815,7 +1009,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Choose the folder holding local clones.")
                 return
             command.extend(["--offline", "--local-repos-dir", local_dir])
-            for repo_name in parse_repo_selectors(form_settings.get("selected_repos", "")):
+            for repo_name in selected_repos:
                 command.extend(["--local-repo", repo_name])
         elif mode == "hosted":
             tokens_file = fields.get("tokens_file", [""])[0].strip()
@@ -824,7 +1018,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             command.extend(["--tokens-file", tokens_file])
             platform = fields.get("hosted_platform", ["github"])[0]
-            selected_repos = parse_repo_selectors(form_settings.get("selected_repos", ""))
+            selected_repos = extract_selected_repos(fields)
             if platform == "github":
                 org = fields.get("github_org", [""])[0].strip()
                 token_name = fields.get("github_token_name", [""])[0].strip()
