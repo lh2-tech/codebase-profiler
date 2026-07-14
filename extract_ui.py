@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parent
 EXTRACTOR = ROOT / "extract_org_raw_data.py"
 DEFAULT_OUTPUT = ROOT / "outputs" / "raw-extracts"
 STATE_FILE = DEFAULT_OUTPUT / ".ui_state.json"
-CSRF_TOKEN = secrets.token_urlsafe(32)
+LOGO_PATH = ROOT / "LH2-DataLabs.svg"
 
 STATE: dict[str, Any] = {
     "phase": "idle",
@@ -347,10 +347,15 @@ def page() -> str:
     return """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Repository Evidence Extractor</title>
+<link rel="icon" href="/logo.svg" type="image/svg+xml">
 <style>
   :root { color-scheme: light; font-family: Inter, system-ui, sans-serif; color:#172033; background:#f4f7fb; }
   body { margin:0; } main { max-width:900px; margin:0 auto; padding:34px 22px 54px; }
+  .brand { display:flex; align-items:center; gap:18px; margin-bottom:8px; }
+  .brand-logo { height:48px; width:auto; flex-shrink:0; }
   h1 { margin:0; font-size:28px; } .lead { color:#536078; margin:8px 0 28px; }
+  .req { color:#b91c1c; margin-left:3px; }
+  input.invalid, select.invalid, textarea.invalid { border-color:#b91c1c; box-shadow:0 0 0 2px #fecaca; }
   .card { background:#fff; border:1px solid #dce3ef; border-radius:14px; padding:22px; margin:16px 0; box-shadow:0 2px 10px #1820330a; }
   .choices { display:grid; grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); gap:10px; }
   label.choice { border:1px solid #dce3ef; border-radius:10px; padding:13px; display:block; cursor:pointer; }
@@ -381,8 +386,13 @@ def page() -> str:
   #progress-label { font-size:13px; color:#536078; margin-top:6px; }
   textarea { box-sizing:border-box; width:100%; padding:10px; border:1px solid #bdc9dc; border-radius:8px; font:inherit; background:#fff; min-height:88px; resize:vertical; }
 </style></head><body><main>
-<h1>Repository Evidence Extractor</h1>
-<p class="lead">Creates a metadata archive for later analysis. Source code is analysed locally and is not included in the output zip; commit, pull-request, and issue metadata may be retained.</p>
+<header class="brand">
+  <img src="/logo.svg" alt="LH2 AI Labs" class="brand-logo">
+  <div>
+    <h1>Repository Evidence Extractor</h1>
+    <p class="lead">Creates a metadata archive for later analysis. Source code is analysed locally and is not included in the output zip; commit, pull-request, and issue metadata may be retained.</p>
+  </div>
+</header>
 __DOCKER_NOTICE__
 <form id="extract-form" method="post" action="/start">
 <input type="hidden" name="csrf_token" value="__CSRF_TOKEN__">
@@ -392,20 +402,20 @@ __DOCKER_NOTICE__
   <label class="choice"><input type="radio" name="mode" value="hosted"> <strong>Hosted platform</strong><span class="small">Connect to a GitHub or GitLab organisation with a token file.</span></label>
 </div></div>
 <div class="card">
-  <div id="offline-fields"><label class="field">Folder holding full local clones</label><input name="local_repos_dir" value="__DEFAULT_LOCAL_REPOS_DIR__" placeholder="__LOCAL_PLACEHOLDER__"><p class="notice"><strong>How to prepare this folder:</strong> use a normal full clone for every repository, for example <code>git clone https://github.com/OWNER/REPO.git</code>. Do not use <code>--depth</code>, because the extractor needs the complete commit history. Put one or more cloned repositories inside this folder, then select the folder above.</p></div>
+  <div id="offline-fields"><label class="field">Folder holding full local clones<span class="req">*</span></label><input name="local_repos_dir" value="__DEFAULT_LOCAL_REPOS_DIR__" placeholder="__LOCAL_PLACEHOLDER__" required><p class="notice"><strong>How to prepare this folder:</strong> use a normal full clone for every repository, for example <code>git clone https://github.com/OWNER/REPO.git</code>. Do not use <code>--depth</code>, because the extractor needs the complete commit history. Put one or more cloned repositories inside this folder, then select the folder above.</p></div>
   <div id="hosted-fields" class="hidden">
     <label class="field">Platform</label><select id="hosted-platform" name="hosted_platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option></select>
-    <label class="field">Path to token file</label><input name="tokens_file" value="__DEFAULT_TOKENS_FILE__" placeholder="/path/to/tokens">
-    <div id="github-fields"><label class="field">GitHub organisation name</label><input name="github_org" placeholder="CustomerOrg"><label class="field">GitHub token key</label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file"></div>
-    <div id="gitlab-fields" class="hidden"><label class="field">GitLab group path</label><input name="gitlab_group" placeholder="customer-group or customer-group/subgroup"><label class="field">GitLab token key</label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file"></div>
+    <label class="field">Path to token file<span class="req">*</span></label><input name="tokens_file" value="__DEFAULT_TOKENS_FILE__" placeholder="/path/to/tokens" required>
+    <div id="github-fields"><label class="field">GitHub organisation name<span class="req" id="github-org-req">*</span></label><input name="github_org" placeholder="CustomerOrg"><label class="field">GitHub token key<span class="req">*</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file" required></div>
+    <div id="gitlab-fields" class="hidden"><label class="field">GitLab group path<span class="req" id="gitlab-group-req">*</span></label><input name="gitlab_group" placeholder="customer-group or customer-group/subgroup"><label class="field">GitLab token key<span class="req">*</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file" required></div>
   </div>
   <label class="field" id="repo-selection-label">Repositories to include (optional)</label>
   <textarea name="selected_repos" id="selected-repos" placeholder="Leave blank to include everything discovered in the folder or organisation."></textarea>
   <p class="notice" id="repo-selection-help">Offline: enter repository folder names, one per line.</p>
   <label class="field">Parallel workers</label><input name="workers" type="number" value="4" min="1" max="20">
   <label class="choice" style="margin-top:18px;display:flex;align-items:center"><input id="llm-enabled" type="checkbox" name="llm_enabled"><strong>Enable LLM analysis</strong><span class="small">Adds codebase description, industry/domain, vibe-code signals, and repository type.</span></label>
-  <div id="llm-fields" class="hidden"><label class="field">OpenAI API key</label><input name="openai_key" type="password" autocomplete="off" placeholder="sk-..."><p class="notice"><strong>Data sent to OpenAI:</strong> repository name and aggregate metrics, up to 250 file paths, up to 4 source-code excerpts (maximum 1,500 characters each), and one README excerpt (maximum 4,000 characters). These excerpts and the API key are not stored in the output archive.</p><p id="offline-llm-warning" class="warning hidden">LLM mode requires an internet connection in offline mode and sends the data described above to OpenAI.</p></div>
-  <button id="start">Run analysis</button>
+  <div id="llm-fields" class="hidden"><label class="field">OpenAI API key<span class="req">*</span></label><input name="openai_key" type="password" autocomplete="off" placeholder="sk-..."><p id="offline-llm-warning" class="warning hidden">LLM mode requires an internet connection in offline mode.</p></div>
+  <button id="start">Create output</button>
   <p id="form-error" class="form-error hidden"></p>
   <p class="notice">The browser interface only listens on this computer. Keep this page open while the analysis runs.</p>
 </div></form>
@@ -433,6 +443,44 @@ function updateRepoHelp(){
   const help=document.querySelector('#repo-selection-help');
   if (mode==='offline') help.textContent=repoHelp.offline;
   else help.textContent=document.querySelector('#hosted-platform').value==='gitlab' ? repoHelp.gitlab : repoHelp.github;
+  const hasSelected=document.querySelector('#selected-repos').value.trim().length>0;
+  const githubReq=document.querySelector('#github-org-req');
+  const gitlabReq=document.querySelector('#gitlab-group-req');
+  if (githubReq) githubReq.classList.toggle('hidden', hasSelected);
+  if (gitlabReq) gitlabReq.classList.toggle('hidden', hasSelected);
+}
+function clearInvalid(){
+  document.querySelectorAll('.invalid').forEach(el=>el.classList.remove('invalid'));
+}
+function markInvalid(name){
+  const el=document.querySelector('[name="'+name+'"]');
+  if (el) el.classList.add('invalid');
+}
+function validateForm(){
+  clearInvalid();
+  const data=readFormSettings();
+  const errors=[];
+  if (data.mode==='offline') {
+    if (!data.local_repos_dir.trim()) errors.push(['local_repos_dir','Choose the folder holding local clones.']);
+  } else {
+    if (!data.tokens_file.trim()) errors.push(['tokens_file','Enter the token file path.']);
+    const repos=data.selected_repos.trim().split(/\\n+/).filter(Boolean);
+    if (data.hosted_platform==='github') {
+      if (!data.github_token_name.trim()) errors.push(['github_token_name','Enter the GitHub token key.']);
+      if (!repos.length && !data.github_org.trim()) errors.push(['github_org','Enter a GitHub organisation or list specific repositories.']);
+    } else {
+      if (!data.gitlab_token_name.trim()) errors.push(['gitlab_token_name','Enter the GitLab token key.']);
+      if (!repos.length && !data.gitlab_group.trim()) errors.push(['gitlab_group','Enter a GitLab group or list specific projects.']);
+    }
+  }
+  if (data.llm_enabled && !document.querySelector('[name=openai_key]').value.trim()) {
+    errors.push(['openai_key','Enter an OpenAI API key to enable LLM analysis.']);
+  }
+  if (!errors.length) return true;
+  showFormError(errors[0][1]);
+  errors.forEach(([name])=>markInvalid(name));
+  document.querySelector('[name="'+errors[0][0]+'"]')?.scrollIntoView({behavior:'smooth', block:'center'});
+  return false;
 }
 function chooseLlm(){ const enabled=document.querySelector('#llm-enabled').checked; const offline=document.querySelector('input[name=mode]:checked').value==='offline'; document.querySelector('#llm-fields').classList.toggle('hidden', !enabled); document.querySelector('#offline-llm-warning').classList.toggle('hidden', !(enabled && offline)); }
 function readFormSettings(){
@@ -486,16 +534,17 @@ function showFormError(message){
 document.querySelectorAll('input[name=mode]').forEach(e=>e.addEventListener('change',choose));
 document.querySelector('#hosted-platform').addEventListener('change',choosePlatform);
 document.querySelector('#llm-enabled').addEventListener('change',chooseLlm);
-document.querySelector('#extract-form').addEventListener('input', ()=>persistFormSettings(readFormSettings()));
-document.querySelector('#extract-form').addEventListener('change', ()=>persistFormSettings(readFormSettings()));
+document.querySelector('#extract-form').addEventListener('input', ()=>{ persistFormSettings(readFormSettings()); updateRepoHelp(); clearInvalid(); });
+document.querySelector('#extract-form').addEventListener('change', ()=>{ persistFormSettings(readFormSettings()); updateRepoHelp(); });
 document.querySelector('#extract-form').addEventListener('submit', async (event)=>{
   event.preventDefault();
   showFormError('');
+  if (!validateForm()) return;
   const form=event.target;
   const body=new URLSearchParams(new FormData(form));
   const response=await fetch('/start', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
   const text=await response.text();
-  if (!response.ok) { showFormError(text || 'Unable to start extraction.'); return; }
+  if (!response.ok) { showFormError(text || 'Unable to start analysis.'); return; }
   persistFormSettings(readFormSettings());
   window.loadedSummary=false;
 });
@@ -598,12 +647,20 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def respond_file(self, file_path: Path, download_name: str, content_type: str) -> None:
+    def respond_file(
+        self,
+        file_path: Path,
+        download_name: str,
+        content_type: str,
+        *,
+        attachment: bool = True,
+    ) -> None:
         with file_path.open("rb") as handle:
             payload = handle.read()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+        disposition = "attachment" if attachment else "inline"
+        self.send_header("Content-Disposition", f'{disposition}; filename="{download_name}"')
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -611,6 +668,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         query = parse_qs(urlparse(self.path).query)
+        if path == "/logo.svg":
+            if not LOGO_PATH.is_file():
+                self.respond(HTTPStatus.NOT_FOUND, "text/plain", "Logo unavailable.")
+                return
+            self.respond_file(LOGO_PATH, "LH2-DataLabs.svg", "image/svg+xml", attachment=False)
+            return
         if path == "/status":
             with LOCK:
                 safe_state = {
