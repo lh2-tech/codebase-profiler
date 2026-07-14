@@ -424,6 +424,8 @@ def page() -> str:
   .repo-option { display:flex; align-items:flex-start; gap:8px; padding:6px 4px; font-size:14px; }
   .repo-option input { margin-top:3px; }
   .picker-empty { color:#66758d; font-size:14px; padding:8px 4px; }
+  .picker-loading { color:#2563eb; font-size:14px; padding:8px 4px; font-weight:600; }
+  button.is-loading { opacity:.8; cursor:wait; }
 </style></head><body><main>
 <header class="brand">
   <img src="/logo.svg" alt="LH2 AI Labs" class="brand-logo">
@@ -479,9 +481,28 @@ function choosePlatform(){ const platform=document.querySelector('#hosted-platfo
 function chooseLlm(){ const enabled=document.querySelector('#llm-enabled').checked; const offline=document.querySelector('input[name=mode]:checked').value==='offline'; document.querySelector('#llm-fields').classList.toggle('hidden', !enabled); document.querySelector('#offline-llm-warning').classList.toggle('hidden', !(enabled && offline)); }
 function getSelectedRepos(){ return [...document.querySelectorAll('input[name="selected_repos"]:checked')].map(el=>el.value); }
 function rememberRepoChecks(){ savedRepoChecks=new Set(getSelectedRepos()); }
+function setButtonLoading(button, loading, idleText){
+  if (!button) return;
+  if (!button.dataset.idleText) button.dataset.idleText=idleText||button.textContent;
+  button.disabled=loading;
+  button.textContent=loading ? 'Loading…' : button.dataset.idleText;
+  button.classList.toggle('is-loading', loading);
+}
+function setRepoPickerControlsEnabled(enabled){
+  document.querySelector('#select-all-repos').disabled=!enabled;
+  document.querySelector('#clear-repos').disabled=!enabled;
+}
+function showRepoPickerLoading(message){
+  const wrap=document.querySelector('#repo-picker-wrap');
+  const picker=document.querySelector('#repo-picker');
+  picker.innerHTML='<p class="picker-loading">'+(message||'Loading repositories…')+'</p>';
+  wrap.classList.remove('hidden');
+  setRepoPickerControlsEnabled(false);
+}
 function renderRepoPicker(items, emptyMessage){
   const wrap=document.querySelector('#repo-picker-wrap');
   const picker=document.querySelector('#repo-picker');
+  setRepoPickerControlsEnabled(true);
   if (!items.length) {
     picker.innerHTML='<p class="picker-empty">'+(emptyMessage||'No repositories found.')+'</p>';
     wrap.classList.remove('hidden');
@@ -517,29 +538,41 @@ function fillSelect(select, items, placeholder){
 }
 async function loadLocalRepos(){
   showFormError('');
+  const button=document.querySelector('#load-local-repos');
   const localDir=document.querySelector('#local-repos-dir').value.trim();
   if (!localDir) { showFormError('Choose the folder holding local clones.'); return; }
+  setButtonLoading(button, true, 'Load repositories');
+  showRepoPickerLoading('Searching local folders…');
   try {
     const payload=await postDiscover('/discover/local', {local_repos_dir:localDir});
     rememberRepoChecks();
     renderRepoPicker(payload.items, 'No Git repositories found in that folder.');
-  } catch (error) { showFormError(error.message); }
+  } catch (error) {
+    document.querySelector('#repo-picker-wrap').classList.add('hidden');
+    showFormError(error.message);
+  } finally {
+    setButtonLoading(button, false);
+  }
 }
 async function loadHostedOrgs(){
   showFormError('');
   const platform=document.querySelector('#hosted-platform').value;
+  const button=platform==='github' ? document.querySelector('#load-github-orgs') : document.querySelector('#load-gitlab-groups');
+  const idleText=platform==='github' ? 'Load organisations' : 'Load groups';
   const extra={
     hosted_platform:platform,
     tokens_file:document.querySelector('[name=tokens_file]').value,
     github_token_name:document.querySelector('[name=github_token_name]').value,
     gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
   };
+  setButtonLoading(button, true, idleText);
   try {
     const payload=await postDiscover('/discover/orgs', extra);
     if (platform==='github') fillSelect(document.querySelector('#github-org-select'), payload.items, 'Choose an organisation');
     else fillSelect(document.querySelector('#gitlab-group-select'), payload.items, 'Choose a group');
     document.querySelector('#repo-picker-wrap').classList.add('hidden');
   } catch (error) { showFormError(error.message); }
+  finally { setButtonLoading(button, false); }
 }
 async function loadHostedRepos(){
   const platform=document.querySelector('#hosted-platform').value;
@@ -556,11 +589,15 @@ async function loadHostedRepos(){
     extra.gitlab_group=document.querySelector('#gitlab-group-select').value;
     if (!extra.gitlab_group) return;
   }
+  showRepoPickerLoading('Loading repositories…');
   try {
     const payload=await postDiscover('/discover/repos', extra);
     rememberRepoChecks();
     renderRepoPicker(payload.items, 'No repositories found for this selection.');
-  } catch (error) { showFormError(error.message); }
+  } catch (error) {
+    document.querySelector('#repo-picker-wrap').classList.add('hidden');
+    showFormError(error.message);
+  }
 }
 function clearInvalid(){ document.querySelectorAll('.invalid').forEach(el=>el.classList.remove('invalid')); }
 function markInvalid(name){ const el=document.querySelector('[name="'+name+'"],#'+name); if (el) el.classList.add('invalid'); }
