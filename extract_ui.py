@@ -448,7 +448,7 @@ __DOCKER_NOTICE__
     <label class="field">Platform</label><select id="hosted-platform" name="hosted_platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option></select>
     <label class="field">Path to token file<span class="req">*</span></label><input name="tokens_file" value="__DEFAULT_TOKENS_FILE__" placeholder="/path/to/tokens" required>
     <div id="github-fields"><label class="field">GitHub token key<span class="req">*</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file" required><label class="field">Organisation<span class="req">*</span></label><div class="inline-actions"><button type="button" id="load-github-orgs" class="secondary">Load organisations</button></div><select name="github_org" id="github-org-select"><option value="">Choose an organisation</option></select></div>
-    <div id="gitlab-fields" class="hidden"><label class="field">GitLab token key<span class="req">*</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file" required><label class="field">Group<span class="req">*</span></label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group</option></select></div>
+    <div id="gitlab-fields" class="hidden"><label class="field">GitLab token key<span class="req">*</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file" required><label class="field">Group<span class="req">*</span></label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group</option></select><p class="notice">GitLab runs are always scoped to one group. Choose a group first, then optionally pick projects from that group below.</p></div>
   </div>
   <div id="repo-picker-wrap" class="hidden">
     <label class="field" id="repo-selection-label">Repositories to include</label>
@@ -476,8 +476,21 @@ __DOCKER_NOTICE__
 const FORM_STORAGE_KEY='extract-ui-form-v3';
 const forms = {offline:document.querySelector('#offline-fields'), hosted:document.querySelector('#hosted-fields')};
 let savedRepoChecks=new Set();
-function choose(){ const mode=document.querySelector('input[name=mode]:checked').value; Object.entries(forms).forEach(([k,e])=>e.classList.toggle('hidden', k!==mode)); choosePlatform(); chooseLlm(); }
-function choosePlatform(){ const platform=document.querySelector('#hosted-platform').value; document.querySelector('#github-fields').classList.toggle('hidden', platform!=='github'); document.querySelector('#gitlab-fields').classList.toggle('hidden', platform!=='gitlab'); document.querySelector('#repo-picker-wrap').classList.add('hidden'); }
+function updateRepoPickerCopy(){
+  const platform=document.querySelector('#hosted-platform').value;
+  const mode=document.querySelector('input[name=mode]:checked').value;
+  const label=document.querySelector('#repo-selection-label');
+  const help=document.querySelector('#repo-selection-help');
+  if (mode==='hosted' && platform==='gitlab') {
+    label.textContent='Projects to include';
+    help.textContent='Leave all unchecked to include every project in the selected group.';
+  } else {
+    label.textContent='Repositories to include';
+    help.textContent='Leave all unchecked to include every repository discovered above.';
+  }
+}
+function choose(){ const mode=document.querySelector('input[name=mode]:checked').value; Object.entries(forms).forEach(([k,e])=>e.classList.toggle('hidden', k!==mode)); choosePlatform(); chooseLlm(); updateRepoPickerCopy(); }
+function choosePlatform(){ const platform=document.querySelector('#hosted-platform').value; document.querySelector('#github-fields').classList.toggle('hidden', platform!=='github'); document.querySelector('#gitlab-fields').classList.toggle('hidden', platform!=='gitlab'); document.querySelector('#repo-picker-wrap').classList.add('hidden'); updateRepoPickerCopy(); }
 function chooseLlm(){ const enabled=document.querySelector('#llm-enabled').checked; const offline=document.querySelector('input[name=mode]:checked').value==='offline'; document.querySelector('#llm-fields').classList.toggle('hidden', !enabled); document.querySelector('#offline-llm-warning').classList.toggle('hidden', !(enabled && offline)); }
 function getSelectedRepos(){ return [...document.querySelectorAll('input[name="selected_repos"]:checked')].map(el=>el.value); }
 function rememberRepoChecks(){ savedRepoChecks=new Set(getSelectedRepos()); }
@@ -593,7 +606,7 @@ async function loadHostedRepos(){
   try {
     const payload=await postDiscover('/discover/repos', extra);
     rememberRepoChecks();
-    renderRepoPicker(payload.items, 'No repositories found for this selection.');
+    renderRepoPicker(payload.items, platform==='gitlab' ? 'No projects found in this group.' : 'No repositories found for this selection.');
   } catch (error) {
     document.querySelector('#repo-picker-wrap').classList.add('hidden');
     showFormError(error.message);
@@ -1089,18 +1102,16 @@ class Handler(BaseHTTPRequestHandler):
                         "Enter the GitLab token key.",
                     )
                     return
-                if selected_repos:
-                    for project in selected_repos:
-                        command.extend(["--gitlab-project", project])
-                elif group:
-                    command.extend(["--gitlab-group", group])
-                else:
+                if not group:
                     self.respond(
                         HTTPStatus.BAD_REQUEST,
                         "text/plain",
-                        "Enter a GitLab group or list specific projects.",
+                        "Choose a GitLab group.",
                     )
                     return
+                command.extend(["--gitlab-group", group])
+                for project in selected_repos:
+                    command.extend(["--gitlab-repo", project])
                 command.extend(["--gitlab-token-name", token_name])
             else:
                 self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Unknown hosted platform.")

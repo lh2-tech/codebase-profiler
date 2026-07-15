@@ -300,18 +300,6 @@ def list_gitlab_project_objects(token: str, group: str, host: str) -> list[dict[
     return projects
 
 
-def fetch_gitlab_project(token: str, path: str, host: str) -> dict[str, Any]:
-    api = gitlab_api(host)
-    encoded = urllib.parse.quote(path, safe="")
-    data, _ = http_get_json(
-        f"{api}/projects/{encoded}",
-        {"PRIVATE-TOKEN": token, "User-Agent": "extract-org-raw-data"},
-    )
-    if not isinstance(data, dict):
-        raise RuntimeError(f"GitLab project not found: {path}")
-    return data
-
-
 # ── API raw extracts ────────────────────────────────────────────────────────
 
 
@@ -1185,10 +1173,11 @@ def build_targets(
     for group in args.gitlab_group or []:
         if gitlab_token_name not in tokens:
             raise SystemExit(f"Missing {gitlab_token_name!r} in tokens file")
+        group_targets: list[RepoTarget] = []
         for meta in list_gitlab_project_objects(
             tokens[gitlab_token_name], group, args.gitlab_host
         ):
-            targets.append(
+            group_targets.append(
                 RepoTarget(
                     platform="gitlab",
                     org=group,
@@ -1196,25 +1185,13 @@ def build_targets(
                     meta=meta,
                 )
             )
-
-    for path in args.gitlab_project or []:
-        if gitlab_token_name not in tokens:
-            raise SystemExit(f"Missing {gitlab_token_name!r} in tokens file")
-        meta = fetch_gitlab_project(
-            tokens[gitlab_token_name], path.strip("/"), args.gitlab_host
-        )
-        targets.append(
-            RepoTarget(
-                platform="gitlab",
-                org=meta["path_with_namespace"].split("/", 1)[0],
-                full_name=meta["path_with_namespace"],
-                meta=meta,
-            )
-        )
+        if args.gitlab_repo:
+            group_targets = filter_local_targets(group_targets, args.gitlab_repo)
+        targets.extend(group_targets)
 
     if not targets:
         raise SystemExit(
-            "Provide --github-org / --github-repo / --gitlab-group / --gitlab-project"
+            "Provide --github-org / --github-repo / --gitlab-group"
         )
     return targets
 
@@ -1383,7 +1360,12 @@ def main() -> int:
     parser.add_argument("--github-org", action="append", default=[])
     parser.add_argument("--github-repo", action="append", default=[])
     parser.add_argument("--gitlab-group", action="append", default=[])
-    parser.add_argument("--gitlab-project", action="append", default=[])
+    parser.add_argument(
+        "--gitlab-repo",
+        action="append",
+        default=[],
+        help="With --gitlab-group: include only matching project names or full paths (repeatable)",
+    )
     args = parser.parse_args()
 
     if args.ui:
@@ -1398,9 +1380,11 @@ def main() -> int:
         args.github_org
         or args.github_repo
         or args.gitlab_group
-        or args.gitlab_project
+        or args.gitlab_repo
     ):
         raise SystemExit("--offline cannot be combined with GitHub or GitLab targets")
+    if args.gitlab_repo and not args.gitlab_group:
+        raise SystemExit("--gitlab-repo requires --gitlab-group")
     if args.llm and not os.environ.get("OPENAI_API_KEY", "").strip():
         raise SystemExit(
             "--llm requires OPENAI_API_KEY in the environment. "
@@ -1464,8 +1448,6 @@ def main() -> int:
         label = args.gitlab_group[0]
     elif args.github_repo:
         label = args.github_repo[0].replace("/", "_")
-    elif args.gitlab_project:
-        label = args.gitlab_project[0].replace("/", "_")
     else:
         label = "repos"
 

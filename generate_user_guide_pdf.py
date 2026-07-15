@@ -239,8 +239,8 @@ def build_pdf() -> None:
     pdf.numbered(4, "Token key: enter the exact name from your tokens file.")
     pdf.numbered(5, "Click Load organisations or Load groups and wait for Loading to finish.")
     pdf.numbered(6, "Choose an organisation or group from the dropdown.")
-    pdf.numbered(7, "Wait for the repository list to appear.")
-    pdf.numbered(8, "Optional: tick specific repositories. Leave all unchecked to include the full org.")
+    pdf.numbered(7, "Wait for the repository or project list to appear.")
+    pdf.numbered(8, "Optional: tick specific repositories or projects. Leave all unchecked to include the full org or group.")
     pdf.numbered(9, "Click Create output and keep the browser tab open until Completed successfully.")
 
     pdf.sub_title("Workflow B - Already cloned here")
@@ -284,7 +284,7 @@ def build_pdf() -> None:
     for item in [
         "I created the tokens file from tokens.example",
         "I entered /app/tokens and the correct token key in the website",
-        "I loaded organisations/groups and selected one",
+        "I loaded organisations/groups, chose one, and optionally picked projects from that group",
     ]:
         pdf.bullet(f"[ ] {item}")
     pdf.sub_title("Workflow B only (offline)")
