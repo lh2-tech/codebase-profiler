@@ -26,6 +26,8 @@ docker compose up --build
 
 4. Open [http://localhost:8766](http://localhost:8766)
 
+A printable step-by-step guide for non-technical users is in [USER_GUIDE.pdf](USER_GUIDE.pdf).
+
 That is the only command needed after `tokens` is configured.
 
 ## UI features
