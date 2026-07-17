@@ -34,7 +34,10 @@ That is the only command needed after `tokens` is configured.
 
 - **Run analysis** — starts the metadata extraction
 - **Progress bar** — shows repository completion while a run is active
-- **Repository selection** — optional one-per-line list to limit which repos/projects are processed
+- **Organisation / group discovery** — load orgs/groups the token belongs to
+- **Accessible GitHub repositories** — load every repo the token can access (owner, collaborator, and org member), including direct invites outside org membership
+- **Manual repository list** — paste `owner/repo` lines when discovery still misses a target
+- **Repository selection** — optional picker to limit which repos/projects are processed
 - **Open output folder** — opens the run folder on Mac, Windows, or Ubuntu (in Docker, use Download buttons or open `./outputs/raw-extracts` on your computer)
 - **Download summary / archive zip** — browser downloads for the completed run
 
@@ -45,6 +48,14 @@ That is the only command needed after `tokens` is configured.
 - Token file path in the UI: `/app/tokens`
 - Uses the keys in your mounted `tokens` file
 - Repositories are cloned inside the container, analysed, then removed before the zip is written
+- GitHub PAT needs the `repo` scope to see private collaborator repositories
+- CLI equivalent for direct-access repos:
+
+```bash
+python extract_org_raw_data.py --github-accessible --tokens-file tokens --github-token-name data-lh2-github-token
+# or specific repos:
+python extract_org_raw_data.py --github-repo owner/repo-one --github-repo owner/repo-two --tokens-file tokens
+```
 
 ### Already cloned here (offline)
 

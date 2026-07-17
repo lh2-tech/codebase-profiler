@@ -2,7 +2,7 @@
 
 FROM python:3.11-slim-bookworm
 
-ARG TARGETARCH
+ARG TARGETARCH=amd64
 ARG SCC_VERSION=3.7.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -26,7 +26,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY extract_org_raw_data.py extract_ui.py count_merged_prs.py github_app_auth.py LH2-DataLabs.svg ./
+COPY extract_org_raw_data.py extract_ui.py count_merged_prs.py github_app_auth.py clone_all_repos.py discovered_targets.json LH2-DataLabs.svg ./
 COPY tokens.example .
 
 RUN mkdir -p /app/outputs/raw-extracts /data/repos

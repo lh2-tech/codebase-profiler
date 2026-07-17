@@ -31,6 +31,7 @@ CSRF_TOKEN = secrets.token_urlsafe(32)
 
 from extract_org_raw_data import (  # noqa: E402
     discover_local_repositories,
+    list_github_accessible_repos,
     list_github_orgs_for_token,
     list_github_repos_for_org,
     list_gitlab_groups_for_token,
@@ -84,9 +85,27 @@ def extract_selected_repos(fields: dict[str, list[str]]) -> list[str]:
     return [value.strip() for value in fields.get("selected_repos", []) if value.strip()]
 
 
+def merge_repo_selectors(*groups: list[str]) -> list[str]:
+    """Merge repo selectors preserving order and dropping duplicates."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            key = item.strip()
+            if not key:
+                continue
+            lowered = key.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            merged.append(key)
+    return merged
+
+
 def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
     llm_enabled = fields.get("llm_enabled", [""])[0] == "on"
     selected = extract_selected_repos(fields)
+    manual = parse_repo_selectors(fields.get("manual_repos", [""])[0])
     return {
         "mode": fields.get("mode", ["offline"])[0],
         "local_repos_dir": fields.get("local_repos_dir", [""])[0].strip(),
@@ -101,6 +120,8 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
         "workers": fields.get("workers", ["4"])[0].strip() or "4",
         "llm_enabled": llm_enabled,
         "selected_repos": "\n".join(selected),
+        "manual_repos": "\n".join(manual),
+        "github_accessible": fields.get("github_accessible", [""])[0] == "on",
     }
 
 
@@ -447,14 +468,19 @@ __DOCKER_NOTICE__
   <div id="hosted-fields" class="hidden">
     <label class="field">Platform</label><select id="hosted-platform" name="hosted_platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option></select>
     <label class="field">Path to token file<span class="req">*</span></label><input name="tokens_file" value="__DEFAULT_TOKENS_FILE__" placeholder="/path/to/tokens" required>
-    <div id="github-fields"><label class="field">GitHub token key<span class="req">*</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file" required><label class="field">Organisation<span class="req">*</span></label><div class="inline-actions"><button type="button" id="load-github-orgs" class="secondary">Load organisations</button></div><select name="github_org" id="github-org-select"><option value="">Choose an organisation</option></select></div>
+    <div id="github-fields"><label class="field">GitHub token key<span class="req">*</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file" required><label class="field">Organisation</label><div class="inline-actions"><button type="button" id="load-github-orgs" class="secondary">Load organisations</button><button type="button" id="load-github-accessible" class="secondary">Load accessible repositories</button></div><select name="github_org" id="github-org-select"><option value="">Choose an organisation (optional if using accessible repos or manual list)</option></select><p class="notice">Organisation listing only shows orgs you belong to. Use <strong>Load accessible repositories</strong> for direct collaborator access, or paste <code>owner/repo</code> names below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="github-accessible" type="checkbox" name="github_accessible"><strong>Analyse every accessible repository</strong><span class="small">Runs against all repos this token can access (owner, collaborator, and org member).</span></label></div>
     <div id="gitlab-fields" class="hidden"><label class="field">GitLab token key<span class="req">*</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file" required><label class="field">Group<span class="req">*</span></label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group</option></select><p class="notice">GitLab runs are always scoped to one group. Choose a group first, then optionally pick projects from that group below.</p></div>
+  </div>
+  <div id="manual-repos-wrap" class="hidden">
+    <label class="field" id="manual-repos-label">Manual repository list</label>
+    <textarea name="manual_repos" id="manual-repos" placeholder="owner/repo-one&#10;owner/repo-two"></textarea>
+    <p class="notice" id="manual-repos-help">One <code>owner/repo</code> per line. Use this for repos granted by direct invite that do not appear in the organisation picker.</p>
   </div>
   <div id="repo-picker-wrap" class="hidden">
     <label class="field" id="repo-selection-label">Repositories to include</label>
     <div class="inline-actions"><button type="button" id="select-all-repos" class="secondary">Select all</button><button type="button" id="clear-repos" class="secondary">Clear</button></div>
     <div id="repo-picker" class="repo-picker"><p class="picker-empty">Load repositories to choose which ones to include.</p></div>
-    <p class="notice" id="repo-selection-help">Leave all unchecked to include every repository discovered above.</p>
+    <p class="notice" id="repo-selection-help">Leave all unchecked to include every repository discovered above (organisation mode). For accessible-repo loads, select the repos you want or use Select all.</p>
   </div>
   <label class="field">Parallel workers</label><input name="workers" type="number" value="4" min="1" max="20">
   <label class="choice" style="margin-top:18px;display:flex;align-items:center"><input id="llm-enabled" type="checkbox" name="llm_enabled"><strong>Enable LLM analysis</strong><span class="small">Adds codebase description, industry/domain, vibe-code signals, and repository type.</span></label>
@@ -473,7 +499,7 @@ __DOCKER_NOTICE__
 <p id="artifact-paths" class="paths hidden"></p>
 <div class="csv-scroll"><div id="csv-preview" class="notice">Loading summary…</div></div></div>
 <script>
-const FORM_STORAGE_KEY='extract-ui-form-v3';
+const FORM_STORAGE_KEY='extract-ui-form-v4';
 const forms = {offline:document.querySelector('#offline-fields'), hosted:document.querySelector('#hosted-fields')};
 let savedRepoChecks=new Set();
 function updateRepoPickerCopy(){
@@ -481,18 +507,37 @@ function updateRepoPickerCopy(){
   const mode=document.querySelector('input[name=mode]:checked').value;
   const label=document.querySelector('#repo-selection-label');
   const help=document.querySelector('#repo-selection-help');
+  const manualLabel=document.querySelector('#manual-repos-label');
+  const manualHelp=document.querySelector('#manual-repos-help');
   if (mode==='hosted' && platform==='gitlab') {
     label.textContent='Projects to include';
     help.textContent='Leave all unchecked to include every project in the selected group.';
+    if (manualLabel) manualLabel.textContent='Manual project list';
+    if (manualHelp) manualHelp.textContent='Optional. One group/project path per line.';
   } else {
     label.textContent='Repositories to include';
-    help.textContent='Leave all unchecked to include every repository discovered above.';
+    help.textContent='Organisation mode: leave all unchecked to include every repository in the org. Accessible-repo mode: select the repos you want, or use Select all.';
+    if (manualLabel) manualLabel.textContent='Manual repository list';
+    if (manualHelp) manualHelp.textContent='One owner/repo per line. Use this for repos granted by direct invite that do not appear in the organisation picker.';
   }
 }
 function choose(){ const mode=document.querySelector('input[name=mode]:checked').value; Object.entries(forms).forEach(([k,e])=>e.classList.toggle('hidden', k!==mode)); choosePlatform(); chooseLlm(); updateRepoPickerCopy(); }
-function choosePlatform(){ const platform=document.querySelector('#hosted-platform').value; document.querySelector('#github-fields').classList.toggle('hidden', platform!=='github'); document.querySelector('#gitlab-fields').classList.toggle('hidden', platform!=='gitlab'); document.querySelector('#repo-picker-wrap').classList.add('hidden'); updateRepoPickerCopy(); }
+function choosePlatform(){
+  const mode=document.querySelector('input[name=mode]:checked').value;
+  const platform=document.querySelector('#hosted-platform').value;
+  document.querySelector('#github-fields').classList.toggle('hidden', platform!=='github');
+  document.querySelector('#gitlab-fields').classList.toggle('hidden', platform!=='gitlab');
+  document.querySelector('#manual-repos-wrap').classList.toggle('hidden', mode!=='hosted');
+  if (mode!=='hosted') document.querySelector('#repo-picker-wrap').classList.add('hidden');
+  updateRepoPickerCopy();
+}
 function chooseLlm(){ const enabled=document.querySelector('#llm-enabled').checked; const offline=document.querySelector('input[name=mode]:checked').value==='offline'; document.querySelector('#llm-fields').classList.toggle('hidden', !enabled); document.querySelector('#offline-llm-warning').classList.toggle('hidden', !(enabled && offline)); }
 function getSelectedRepos(){ return [...document.querySelectorAll('input[name="selected_repos"]:checked')].map(el=>el.value); }
+function getManualRepos(){
+  const el=document.querySelector('#manual-repos');
+  if (!el) return [];
+  return el.value.split(/\\n+/).map(s=>s.trim()).filter(Boolean);
+}
 function rememberRepoChecks(){ savedRepoChecks=new Set(getSelectedRepos()); }
 function setButtonLoading(button, loading, idleText){
   if (!button) return;
@@ -588,6 +633,7 @@ async function loadHostedOrgs(){
   finally { setButtonLoading(button, false); }
 }
 async function loadHostedRepos(){
+  showFormError('');
   const platform=document.querySelector('#hosted-platform').value;
   const extra={
     hosted_platform:platform,
@@ -612,6 +658,30 @@ async function loadHostedRepos(){
     showFormError(error.message);
   }
 }
+async function loadAccessibleGithubRepos(){
+  showFormError('');
+  const button=document.querySelector('#load-github-accessible');
+  const extra={
+    hosted_platform:'github',
+    tokens_file:document.querySelector('[name=tokens_file]').value,
+    github_token_name:document.querySelector('[name=github_token_name]').value,
+  };
+  setButtonLoading(button, true, 'Load accessible repositories');
+  showRepoPickerLoading('Loading every repository this token can access…');
+  try {
+    const payload=await postDiscover('/discover/accessible-repos', extra);
+    rememberRepoChecks();
+    renderRepoPicker(
+      payload.items,
+      'No accessible repositories found for this token (owner, collaborator, or org member).'
+    );
+  } catch (error) {
+    document.querySelector('#repo-picker-wrap').classList.add('hidden');
+    showFormError(error.message);
+  } finally {
+    setButtonLoading(button, false);
+  }
+}
 function clearInvalid(){ document.querySelectorAll('.invalid').forEach(el=>el.classList.remove('invalid')); }
 function markInvalid(name){ const el=document.querySelector('[name="'+name+'"],#'+name); if (el) el.classList.add('invalid'); }
 function validateForm(){
@@ -624,7 +694,13 @@ function validateForm(){
     if (!data.tokens_file.trim()) errors.push(['tokens_file','Enter the token file path.']);
     if (data.hosted_platform==='github') {
       if (!data.github_token_name.trim()) errors.push(['github_token_name','Enter the GitHub token key.']);
-      if (!data.github_org.trim()) errors.push(['github-org-select','Choose a GitHub organisation.']);
+      const hasOrg=!!data.github_org.trim();
+      const hasSelected=getSelectedRepos().length>0;
+      const hasManual=getManualRepos().length>0;
+      const hasAccessible=!!data.github_accessible;
+      if (!hasOrg && !hasSelected && !hasManual && !hasAccessible) {
+        errors.push(['github-org-select','Choose an organisation, load/select accessible repos, paste a manual list, or enable “Analyse every accessible repository”.']);
+      }
     } else {
       if (!data.gitlab_token_name.trim()) errors.push(['gitlab_token_name','Enter the GitLab token key.']);
       if (!data.gitlab_group.trim()) errors.push(['gitlab-group-select','Choose a GitLab group.']);
@@ -651,7 +727,9 @@ function readFormSettings(){
     gitlab_token_name:data.get('gitlab_token_name')||'gitlab_token',
     workers:data.get('workers')||'4',
     llm_enabled:!!data.get('llm_enabled'),
+    github_accessible:!!data.get('github_accessible'),
     selected_repos:getSelectedRepos().join('\\n'),
+    manual_repos:getManualRepos().join('\\n'),
   };
 }
 function restoreFormSettings(settings){
@@ -667,7 +745,10 @@ function restoreFormSettings(settings){
   setValue('gitlab_group', settings.gitlab_group||'');
   setValue('gitlab_token_name', settings.gitlab_token_name||'gitlab_token');
   setValue('workers', settings.workers||'4');
+  setValue('manual_repos', settings.manual_repos||'');
   document.querySelector('#llm-enabled').checked=!!settings.llm_enabled;
+  const accessible=document.querySelector('#github-accessible');
+  if (accessible) accessible.checked=!!settings.github_accessible;
   savedRepoChecks=new Set((settings.selected_repos||'').split(/\\n+/).filter(Boolean));
   choose();
 }
@@ -679,6 +760,7 @@ document.querySelector('#hosted-platform').addEventListener('change',choosePlatf
 document.querySelector('#llm-enabled').addEventListener('change',chooseLlm);
 document.querySelector('#load-local-repos').addEventListener('click', loadLocalRepos);
 document.querySelector('#load-github-orgs').addEventListener('click', loadHostedOrgs);
+document.querySelector('#load-github-accessible').addEventListener('click', loadAccessibleGithubRepos);
 document.querySelector('#load-gitlab-groups').addEventListener('click', loadHostedOrgs);
 document.querySelector('#github-org-select').addEventListener('change', loadHostedRepos);
 document.querySelector('#gitlab-group-select').addEventListener('change', loadHostedRepos);
@@ -902,7 +984,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
-        if path not in {"/start", "/open-output", "/discover/local", "/discover/orgs", "/discover/repos"}:
+        if path not in {
+            "/start",
+            "/open-output",
+            "/discover/local",
+            "/discover/orgs",
+            "/discover/repos",
+            "/discover/accessible-repos",
+        }:
             self.respond(HTTPStatus.NOT_FOUND, "text/plain", "Not found")
             return
         try:
@@ -1032,9 +1121,40 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": items}))
             return
+        if path == "/discover/accessible-repos":
+            platform = fields.get("hosted_platform", ["github"])[0]
+            if platform != "github":
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "application/json",
+                    json.dumps({"error": "Accessible repository discovery is only available for GitHub."}),
+                )
+                return
+            try:
+                token = read_token_from_fields(fields, platform)
+            except ValueError as exc:
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "application/json",
+                    json.dumps({"error": str(exc)}),
+                )
+                return
+            try:
+                items = list_github_accessible_repos(token)
+            except Exception as exc:
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "application/json",
+                    json.dumps({"error": str(exc)[:500]}),
+                )
+                return
+            self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": items}))
+            return
         mode = fields.get("mode", ["offline"])[0]
         form_settings = extract_form_settings(fields)
         selected_repos = extract_selected_repos(fields)
+        manual_repos = parse_repo_selectors(fields.get("manual_repos", [""])[0])
+        selected_repos = merge_repo_selectors(selected_repos, manual_repos)
         workers = fields.get("workers", ["4"])[0].strip()
         try:
             workers_number = int(workers)
@@ -1068,10 +1188,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             command.extend(["--tokens-file", tokens_file])
             platform = fields.get("hosted_platform", ["github"])[0]
-            selected_repos = extract_selected_repos(fields)
             if platform == "github":
                 org = fields.get("github_org", [""])[0].strip()
                 token_name = fields.get("github_token_name", [""])[0].strip()
+                github_accessible = fields.get("github_accessible", [""])[0] == "on"
                 if not token_name:
                     self.respond(
                         HTTPStatus.BAD_REQUEST,
@@ -1082,13 +1202,16 @@ class Handler(BaseHTTPRequestHandler):
                 if selected_repos:
                     for repo_name in selected_repos:
                         command.extend(["--github-repo", repo_name])
+                elif github_accessible:
+                    command.append("--github-accessible")
                 elif org:
                     command.extend(["--github-org", org])
                 else:
                     self.respond(
                         HTTPStatus.BAD_REQUEST,
                         "text/plain",
-                        "Enter a GitHub organisation or list specific repositories.",
+                        "Choose a GitHub organisation, select/paste repositories, "
+                        "or enable “Analyse every accessible repository”.",
                     )
                     return
                 command.extend(["--github-token-name", token_name])
