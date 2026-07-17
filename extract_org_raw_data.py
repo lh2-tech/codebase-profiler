@@ -150,6 +150,7 @@ query MergedPRs($owner: String!, $name: String!, $cursor: String, $pageSize: Int
 
 SUMMARY_FIELDS = [
     "org",
+    "project_name",
     "repo",
     "merged_prs",
     "languages_breakdown",
@@ -167,7 +168,13 @@ SUMMARY_FIELDS = [
     "human_authors",
     "bot_authors",
     "bot_commit_ratio",
+    "total_files",
     "has_tests",
+    "has_test_runner",
+    "has_ci_cd",
+    "test_source_loc_pct",
+    "has_library_code",
+    "company_period",
     "codebase_description",
     "industry_domain",
     "vibe_code_signals",
@@ -177,12 +184,102 @@ SUMMARY_FIELDS = [
 ]
 
 TEST_DIR_HINTS = ("test", "tests", "spec", "specs", "__tests__")
-SKIP_WALK_DIRS = {".git", "node_modules", "vendor", "dist", "build", ".venv", "venv"}
+SKIP_WALK_DIRS = {
+    ".git",
+    "node_modules",
+    "vendor",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    "bower_components",
+    "__pycache__",
+    ".tox",
+    "Pods",
+    "Carthage",
+    ".gradle",
+    "target",
+    "bin",
+    "obj",
+    "packages",
+}
+LOCAL_PLATFORM_ROOTS = frozenset({"github", "gitlab", "local"})
 LLM_SEMAPHORE = threading.BoundedSemaphore(3)
 LLM_SOURCE_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb", ".php",
     ".cs", ".swift", ".kt", ".scala", ".vue", ".svelte",
 }
+CODE_LOC_EXTENSIONS = LLM_SOURCE_EXTENSIONS | {
+    ".c", ".cc", ".cpp", ".h", ".hpp", ".m", ".mm", ".cshtml", ".aspx",
+    ".jsp", ".vue", ".svelte", ".dart", ".groovy", ".kts", ".fs", ".fsx",
+}
+CI_FILE_NAMES = frozenset(
+    {
+        ".gitlab-ci.yml",
+        ".travis.yml",
+        ".drone.yml",
+        ".woodpecker.yml",
+        "jenkinsfile",
+        "azure-pipelines.yml",
+        "azure-pipelines.yaml",
+        "bitbucket-pipelines.yml",
+        "cloudbuild.yaml",
+        "cloudbuild.yml",
+        "buildkite.yml",
+        "codebuild.yml",
+    }
+)
+CI_DIR_HINTS = (
+    (".github", "workflows"),
+    (".circleci",),
+    (".buildkite",),
+    (".woodpecker",),
+)
+TEST_RUNNER_FILE_NAMES = frozenset(
+    {
+        "jest.config.js",
+        "jest.config.cjs",
+        "jest.config.mjs",
+        "jest.config.ts",
+        "vitest.config.js",
+        "vitest.config.ts",
+        "vitest.config.mjs",
+        "karma.conf.js",
+        "karma.conf.ts",
+        "mocha.opts",
+        ".mocharc.js",
+        ".mocharc.cjs",
+        ".mocharc.json",
+        ".mocharc.yml",
+        "ava.config.js",
+        "ava.config.cjs",
+        "pytest.ini",
+        "phpunit.xml",
+        "phpunit.xml.dist",
+        "tox.ini",
+        ".rspec",
+        "nose2.cfg",
+        "conftest.py",
+    }
+)
+TEST_RUNNER_PACKAGE_PATTERNS = [
+    re.compile(p, re.I)
+    for p in [
+        r"\bjest\b",
+        r"\bvitest\b",
+        r"\bmocha\b",
+        r"\bava\b",
+        r"\bpytest\b",
+        r"\bphpunit\b",
+        r"\bnunit\b",
+        r"\bxunit\b",
+        r"\bmstest\b",
+        r"Microsoft\.NET\.Test\.Sdk",
+        r"Microsoft\.VisualStudio\.Test",
+        r"go test",
+    ]
+]
+LIBRARY_DIR_NAMES = frozenset({"lib", "libs", "library", "libraries"})
 
 
 @dataclass(frozen=True)
@@ -269,7 +366,12 @@ def list_github_repo_objects(token: str, org: str, host: str) -> list[dict[str, 
     api = github_api(token, host)
     repos: list[dict[str, Any]] = []
     for kind in (f"orgs/{org}/repos", f"users/{org}/repos"):
-        batch = paginate_github(f"{api}/{kind}?per_page=100&type=all", token)
+        try:
+            batch = paginate_github(f"{api}/{kind}?per_page=100&type=all", token)
+        except RuntimeError as exc:
+            if "HTTP 404" not in str(exc):
+                raise
+            continue
         if batch:
             repos = batch
             break
@@ -695,6 +797,213 @@ def detect_tests(repo: Path) -> bool:
     return False
 
 
+def _path_is_test(relative: str) -> bool:
+    lowered = relative.lower().replace("\\", "/")
+    parts = lowered.split("/")
+    if any(part in TEST_DIR_HINTS for part in parts):
+        return True
+    name = parts[-1] if parts else lowered
+    return (
+        name.startswith("test_")
+        or name.endswith("_test.py")
+        or name.endswith("_test.go")
+        or name.endswith("_test.rb")
+        or name.endswith(".spec.ts")
+        or name.endswith(".spec.tsx")
+        or name.endswith(".spec.js")
+        or name.endswith(".spec.jsx")
+        or name.endswith(".test.ts")
+        or name.endswith(".test.tsx")
+        or name.endswith(".test.js")
+        or name.endswith(".test.jsx")
+        or name.endswith("tests.cs")
+        or name.endswith("test.cs")
+        or name.endswith("test.java")
+    )
+
+
+def count_total_files(repo: Path) -> int:
+    """Count files excluding .git and common dependency/build module directories."""
+    total = 0
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [directory for directory in dirs if directory not in SKIP_WALK_DIRS]
+        total += len(files)
+    return total
+
+
+def detect_ci_cd(repo: Path) -> bool:
+    """True when common CI/CD config files or workflow directories are present."""
+    for dir_parts in CI_DIR_HINTS:
+        if (repo.joinpath(*dir_parts)).is_dir():
+            return True
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [directory for directory in dirs if directory not in SKIP_WALK_DIRS]
+        for filename in files:
+            if filename.lower() in CI_FILE_NAMES:
+                return True
+            if filename.lower().startswith("jenkinsfile"):
+                return True
+    return False
+
+
+def _text_has_test_runner_marker(text: str) -> bool:
+    return any(pattern.search(text) for pattern in TEST_RUNNER_PACKAGE_PATTERNS)
+
+
+def detect_test_runner(repo: Path) -> bool:
+    """True when test-runner config or project SDK references are present."""
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [directory for directory in dirs if directory not in SKIP_WALK_DIRS]
+        for filename in files:
+            path = Path(root) / filename
+            name = filename.lower()
+            if name in TEST_RUNNER_FILE_NAMES:
+                return True
+            if name.endswith(".csproj"):
+                if _text_has_test_runner_marker(_read_text_sample(path, 20_000)):
+                    return True
+            if name in {
+                "package.json",
+                "composer.json",
+                "pyproject.toml",
+                "pom.xml",
+                "setup.cfg",
+            }:
+                if _text_has_test_runner_marker(_read_text_sample(path, 40_000)):
+                    return True
+            if name in {"build.gradle", "build.gradle.kts"}:
+                sample = _read_text_sample(path, 40_000).lower()
+                if "junit" in sample or "testimplementation" in sample or "usebjunit" in sample:
+                    return True
+    return False
+
+
+def _count_file_lines(path: Path) -> int:
+    try:
+        with path.open("rb") as fh:
+            return sum(1 for _ in fh)
+    except OSError:
+        return 0
+
+
+def test_source_loc_pct(repo: Path) -> float | str:
+    """Static test:source LOC ratio as a percentage (not executed coverage)."""
+    test_loc = 0
+    source_loc = 0
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [directory for directory in dirs if directory not in SKIP_WALK_DIRS]
+        for filename in files:
+            path = Path(root) / filename
+            if path.suffix.lower() not in CODE_LOC_EXTENSIONS:
+                continue
+            relative = path.relative_to(repo).as_posix()
+            lines = _count_file_lines(path)
+            if _path_is_test(relative):
+                test_loc += lines
+            else:
+                source_loc += lines
+    if source_loc <= 0:
+        return ""
+    return round(100.0 * test_loc / source_loc, 1)
+
+
+def detect_library_code(repo: Path) -> bool:
+    """True when the tree contains library-style directories or publishable package manifests."""
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [directory for directory in dirs if directory not in SKIP_WALK_DIRS]
+        if Path(root).name.lower() in LIBRARY_DIR_NAMES:
+            return True
+        for filename in files:
+            path = Path(root) / filename
+            name = filename.lower()
+            if name.endswith(".csproj"):
+                sample = _read_text_sample(path, 20_000)
+                lowered = sample.lower()
+                if "<outputtype>library</outputtype>" in lowered:
+                    return True
+                if (
+                    "microsoft.net.sdk" in lowered
+                    and "<outputtype>exe</outputtype>" not in lowered
+                    and "<outputtype>winexe</outputtype>" not in lowered
+                ):
+                    return True
+            if name == "package.json":
+                sample = _read_text_sample(path, 40_000)
+                try:
+                    data = json.loads(sample)
+                except json.JSONDecodeError:
+                    data = {}
+                if isinstance(data, dict) and (
+                    data.get("main") or data.get("exports") or data.get("module")
+                ):
+                    return True
+            if name == "setup.py":
+                sample = _read_text_sample(path, 40_000).lower()
+                if "setup(" in sample and (
+                    "find_packages" in sample or "packages=" in sample or "py_modules" in sample
+                ):
+                    return True
+            if name == "pyproject.toml":
+                sample = _read_text_sample(path, 40_000).lower()
+                if "[project]" in sample or "[tool.poetry]" in sample or "packages =" in sample:
+                    return True
+            if name.endswith(".gemspec"):
+                return True
+    return False
+
+
+def _commit_year(value: Any) -> int | None:
+    text = str(value or "").strip()
+    if len(text) < 4 or not text[:4].isdigit():
+        return None
+    year = int(text[:4])
+    if 1970 <= year <= 2100:
+        return year
+    return None
+
+
+def format_company_period(first_year: int | None, last_year: int | None) -> str:
+    if first_year is None and last_year is None:
+        return ""
+    if first_year is None:
+        return str(last_year)
+    if last_year is None or first_year == last_year:
+        return str(first_year)
+    return f"{first_year}–{last_year}"
+
+
+def apply_company_periods(rows: list[dict[str, Any]]) -> None:
+    """Set company_period from earliest/latest commit years across repos in the same org."""
+    bounds: dict[str, list[int | None]] = {}
+    for row in rows:
+        org = str(row.get("org") or "")
+        first_year = _commit_year(row.get("first_commit"))
+        last_year = _commit_year(row.get("last_commit_date"))
+        current = bounds.setdefault(org, [None, None])
+        if first_year is not None and (current[0] is None or first_year < current[0]):
+            current[0] = first_year
+        if last_year is not None and (current[1] is None or last_year > current[1]):
+            current[1] = last_year
+    for row in rows:
+        org = str(row.get("org") or "")
+        first_year, last_year = bounds.get(org, [None, None])
+        row["company_period"] = format_company_period(first_year, last_year)
+
+
+def local_org_and_full_name(root: Path, repo_path: Path) -> tuple[str, str]:
+    """Derive org/group and full_name from local clone layout when possible."""
+    relative = repo_path.relative_to(root)
+    parts = relative.parts
+    if not parts or parts == (".",):
+        return root.name, root.name
+    if len(parts) >= 3 and parts[0] in LOCAL_PLATFORM_ROOTS:
+        org = parts[1]
+        return org, "/".join(parts[1:])
+    if len(parts) >= 2:
+        return parts[0], str(relative).replace("\\", "/")
+    return root.name, parts[0]
+
+
 def _read_text_sample(path: Path, limit: int) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="replace")[:limit]
@@ -810,12 +1119,12 @@ def find_local_repositories(root: Path) -> list[RepoTarget]:
     for current, dirs, _ in os.walk(root):
         current_path = Path(current)
         if (current_path / ".git").exists():
-            relative_path = current_path.relative_to(root)
+            org, full_name = local_org_and_full_name(root, current_path)
             repos.append(
                 RepoTarget(
                     platform="local",
-                    org=root.name,
-                    full_name=root.name if relative_path == Path(".") else str(relative_path),
+                    org=org,
+                    full_name=full_name,
                     meta={},
                     local_path=current_path,
                 )
@@ -840,12 +1149,12 @@ def discover_local_repositories(root: Path) -> list[RepoTarget]:
     for current, dirs, _ in os.walk(root):
         current_path = Path(current)
         if (current_path / ".git").exists():
-            relative_path = current_path.relative_to(root)
+            org, full_name = local_org_and_full_name(root, current_path)
             repos.append(
                 RepoTarget(
                     platform="local",
-                    org=root.name,
-                    full_name=root.name if relative_path == Path(".") else str(relative_path),
+                    org=org,
+                    full_name=full_name,
                     meta={},
                     local_path=current_path,
                 )
@@ -888,6 +1197,41 @@ def list_github_repos_for_org(token: str, org: str, host: str = "github.com") ->
             "archived": bool(repo.get("archived")),
         }
         for repo in list_github_repo_objects(token, org, host)
+    ]
+
+
+def list_github_accessible_repo_objects(
+    token: str,
+    host: str = "github.com",
+    *,
+    affiliation: str = "owner,collaborator,organization_member",
+) -> list[dict[str, Any]]:
+    """Repos the token can access, including direct collaborator grants."""
+    api = github_api(token, host)
+    encoded = urllib.parse.quote(affiliation, safe=",")
+    url = (
+        f"{api}/user/repos?per_page=100&affiliation={encoded}"
+        "&visibility=all&sort=full_name"
+    )
+    repos = paginate_github(url, token)
+    if not repos:
+        raise RuntimeError(
+            "No GitHub repositories found for this token "
+            "(owner, collaborator, or organization member)."
+        )
+    return [repo for repo in repos if isinstance(repo, dict) and repo.get("full_name")]
+
+
+def list_github_accessible_repos(
+    token: str, host: str = "github.com"
+) -> list[dict[str, str]]:
+    return [
+        {
+            "id": str(repo["full_name"]),
+            "name": str(repo["full_name"]),
+            "archived": bool(repo.get("archived")),
+        }
+        for repo in list_github_accessible_repo_objects(token, host)
     ]
 
 
@@ -957,10 +1301,15 @@ def empty_summary_row(org: str, repo: str) -> dict[str, Any]:
     row.update(
         {
             "org": org,
+            "project_name": org,
             "repo": repo,
             "merged_prs": 0,
             "loc": 0,
+            "total_files": 0,
             "has_tests": False,
+            "has_test_runner": False,
+            "has_ci_cd": False,
+            "has_library_code": False,
             "error": "",
         }
     )
@@ -1089,7 +1438,13 @@ def process_repo(
                 git_stats["human_authors"] + git_stats["bot_authors"]
             )
 
+        row["project_name"] = org
+        row["total_files"] = count_total_files(clone_path)
         row["has_tests"] = detect_tests(clone_path)
+        row["has_test_runner"] = detect_test_runner(clone_path)
+        row["has_ci_cd"] = detect_ci_cd(clone_path)
+        row["test_source_loc_pct"] = test_source_loc_pct(clone_path)
+        row["has_library_code"] = detect_library_code(clone_path)
         if llm_config is not None:
             try:
                 row.update(run_llm_analysis(clone_path, row, llm_config))
@@ -1158,6 +1513,19 @@ def build_targets(
                 )
             )
 
+    if getattr(args, "github_accessible", False):
+        gh_token = resolve_github_token(tokens, github_token_name, github_token_fn)
+        for meta in list_github_accessible_repo_objects(gh_token, args.github_host):
+            full_name = str(meta["full_name"])
+            targets.append(
+                RepoTarget(
+                    platform="github",
+                    org=full_name.split("/", 1)[0],
+                    full_name=full_name,
+                    meta=meta,
+                )
+            )
+
     for full_name in args.github_repo or []:
         gh_token = resolve_github_token(tokens, github_token_name, github_token_fn)
         meta = fetch_github_repo(gh_token, full_name.strip("/"), args.github_host)
@@ -1191,9 +1559,18 @@ def build_targets(
 
     if not targets:
         raise SystemExit(
-            "Provide --github-org / --github-repo / --gitlab-group"
+            "Provide --github-org / --github-repo / --github-accessible / --gitlab-group"
         )
-    return targets
+    # De-duplicate by platform + full_name while preserving order.
+    seen: set[tuple[str, str]] = set()
+    unique: list[RepoTarget] = []
+    for target in targets:
+        key = (target.platform, target.full_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(target)
+    return unique
 
 
 def resolve_app_settings(
@@ -1359,6 +1736,14 @@ def main() -> int:
     parser.add_argument("--ui-port", type=int, default=8766)
     parser.add_argument("--github-org", action="append", default=[])
     parser.add_argument("--github-repo", action="append", default=[])
+    parser.add_argument(
+        "--github-accessible",
+        action="store_true",
+        help=(
+            "Include every GitHub repository the token can access "
+            "(owner, collaborator, and organization member affiliations)"
+        ),
+    )
     parser.add_argument("--gitlab-group", action="append", default=[])
     parser.add_argument(
         "--gitlab-repo",
@@ -1379,6 +1764,7 @@ def main() -> int:
     if args.offline and (
         args.github_org
         or args.github_repo
+        or args.github_accessible
         or args.gitlab_group
         or args.gitlab_repo
     ):
@@ -1508,6 +1894,7 @@ def main() -> int:
             rows.append(fut.result())
 
     rows.sort(key=lambda r: (str(r.get("org")), str(r.get("repo"))))
+    apply_company_periods(rows)
     summary_path = run_dir / "summary.csv"
     with summary_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=SUMMARY_FIELDS)
@@ -1563,6 +1950,24 @@ def main() -> int:
             "size_kb": (
                 "Checked-out working-tree size excluding .git and common "
                 "build/dependency directories."
+            ),
+            "project_name": "Same as org/group name.",
+            "total_files": (
+                "File count excluding .git and common dependency/build directories."
+            ),
+            "has_ci_cd": "Presence of common CI/CD config files or workflow directories.",
+            "has_test_runner": (
+                "Presence of test-runner config files or test SDK references."
+            ),
+            "test_source_loc_pct": (
+                "Static test:source line ratio percentage; not executed coverage."
+            ),
+            "has_library_code": (
+                "Library folders or publishable package/class-library manifests."
+            ),
+            "company_period": (
+                "Earliest first_commit year through latest last_commit year "
+                "across all repos in the same org/group."
             ),
         }
     write_json(run_dir / "manifest.json", manifest)
