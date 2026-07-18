@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
 import subprocess
 import sys
 import threading
+import traceback
 import webbrowser
+import zipfile
 from csv import reader
 from datetime import datetime, timezone
 from html import escape
@@ -25,9 +28,12 @@ from urllib.parse import parse_qs, urlparse
 ROOT = Path(__file__).resolve().parent
 EXTRACTOR = ROOT / "extract_org_raw_data.py"
 DEFAULT_OUTPUT = ROOT / "outputs" / "raw-extracts"
+SUPPORT_LOG_DIR = DEFAULT_OUTPUT / "support-logs"
+UI_LOG_PATH = SUPPORT_LOG_DIR / "ui.log"
 STATE_FILE = DEFAULT_OUTPUT / ".ui_state.json"
 LOGO_PATH = ROOT / "LH2-DataLabs.svg"
 CSRF_TOKEN = secrets.token_urlsafe(32)
+UI_LOG_LOCK = threading.Lock()
 
 from extract_org_raw_data import (  # noqa: E402
     discover_local_repositories,
@@ -59,6 +65,115 @@ STATE: dict[str, Any] = {
     "last_error": None,
 }
 LOCK = threading.Lock()
+
+
+def ui_log(message: str, *, exc: BaseException | None = None) -> None:
+    """Append a support-safe line to the persistent UI log file."""
+    SUPPORT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = [f"{stamp} {message.rstrip()}"]
+    if exc is not None:
+        lines.append("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).rstrip())
+    payload = "\n".join(lines) + "\n"
+    with UI_LOG_LOCK:
+        with UI_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(payload)
+
+
+def log_ui_startup() -> None:
+    ui_log("=== UI server start ===")
+    ui_log(f"python={sys.version.replace(chr(10), ' ')}")
+    ui_log(f"platform={platform.platform()}")
+    ui_log(f"cwd={Path.cwd()}")
+    ui_log(f"root={ROOT}")
+    ui_log(f"output_dir={DEFAULT_OUTPUT.resolve()}")
+    ui_log(f"ui_log={UI_LOG_PATH.resolve()}")
+    ui_log(f"docker_mode={is_docker_mode()}")
+    ui_log(f"EXTRACT_UI_DOCKER={os.environ.get('EXTRACT_UI_DOCKER', '')!r}")
+    ui_log(f"LOCAL_REPOS_DIR env={os.environ.get('LOCAL_REPOS_DIR', '')!r}")
+    ui_log("=== End UI startup ===")
+
+
+def redact_command_for_logs(command: list[str]) -> list[str]:
+    """Keep command shape for support logs without leaking secret values."""
+    redacted: list[str] = []
+    hide_next = False
+    secret_flags = {"--openai-api-key", "--token", "--password"}
+    for part in command:
+        if hide_next:
+            redacted.append("***")
+            hide_next = False
+            continue
+        if part in secret_flags:
+            redacted.append(part)
+            hide_next = True
+            continue
+        redacted.append(part)
+    return redacted
+
+
+def safe_form_settings_for_logs(settings: dict[str, Any] | None) -> dict[str, Any]:
+    if not settings:
+        return {}
+    blocked = {"openai_key", "password", "api_key", "token", "secret"}
+    return {
+        key: value
+        for key, value in settings.items()
+        if key.lower() not in blocked
+    }
+
+
+def build_support_bundle() -> Path:
+    """Create a zip of UI + latest run logs for support (no tokens/API keys)."""
+    SUPPORT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    bundle_path = SUPPORT_LOG_DIR / f"support-logs-{stamp}.zip"
+
+    with LOCK:
+        state_snapshot = {
+            key: value
+            for key, value in STATE.items()
+            if key not in {"command"}
+        }
+        state_snapshot["form_settings"] = safe_form_settings_for_logs(
+            STATE.get("form_settings") if isinstance(STATE.get("form_settings"), dict) else None
+        )
+        run_dir_value = STATE.get("run_dir")
+        log_tail = list(STATE.get("log") or [])[-300:]
+
+    with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        readme = (
+            "Codebase Profiler support bundle\n"
+            "================================\n"
+            "Send this zip when asking for help.\n"
+            "It does not include your tokens file or API keys.\n\n"
+            f"Created: {stamp}\n"
+            f"UI log: {UI_LOG_PATH}\n"
+        )
+        archive.writestr("README.txt", readme)
+        archive.writestr(
+            "ui-state.json",
+            json.dumps(state_snapshot, indent=2, ensure_ascii=False),
+        )
+        archive.writestr("ui-console-tail.log", "\n".join(log_tail) + ("\n" if log_tail else ""))
+        if UI_LOG_PATH.is_file():
+            archive.write(UI_LOG_PATH, arcname="ui.log")
+
+        run_dir = Path(run_dir_value) if run_dir_value else None
+        if run_dir and run_dir.is_dir() and is_under_archive(run_dir):
+            for relative in (
+                "logs/extract.log",
+                "logs/failures.json",
+                "logs/SUPPORT.txt",
+                "manifest.json",
+                "repos.json",
+                "summary.csv",
+            ):
+                candidate = run_dir / relative
+                if candidate.is_file():
+                    archive.write(candidate, arcname=f"run/{relative}")
+    ui_log(f"Created support bundle: {bundle_path}")
+    return bundle_path
 
 
 def _empty_state() -> dict[str, Any]:
@@ -361,6 +476,11 @@ def run_extraction(command: list[str], env_overrides: dict[str, str] | None = No
             last_error=None,
         )
         add_log("Starting analysis…")
+        ui_log(f"Starting extraction command={redact_command_for_logs(command)}")
+        add_log(
+            f"Support logs: {UI_LOG_PATH} "
+            "(use Download support logs if this run fails)"
+        )
         proc = subprocess.Popen(
             command,
             cwd=str(ROOT),
@@ -378,14 +498,34 @@ def run_extraction(command: list[str], env_overrides: dict[str, str] | None = No
             log_lines = list(STATE["log"])
         finalize_run_state(log_lines, returncode)
         add_log(f"Finished with exit code {returncode}.")
+        with LOCK:
+            run_dir = STATE.get("run_dir")
+            repos_failed = STATE.get("repos_failed")
+        ui_log(
+            f"Extraction finished exit_code={returncode} "
+            f"run_dir={run_dir!r} repos_failed={repos_failed!r}"
+        )
+        if returncode != 0:
+            add_log(
+                "Run failed. Click “Download support logs” and send that zip "
+                f"(or send {UI_LOG_PATH} and the run’s logs/extract.log)."
+            )
+            set_state(
+                last_error=(
+                    "Analysis failed. Download support logs and send them for help."
+                )
+            )
     except Exception as exc:
+        ui_log("Unable to start extraction", exc=exc)
         set_state(
             phase="failed",
             running=False,
             returncode=1,
             finished_at=datetime.now(timezone.utc).isoformat(),
+            last_error=f"Unable to start extraction: {exc}",
         )
         add_log(f"Unable to start extraction: {exc}")
+        add_log(f"Support log written to {UI_LOG_PATH}")
 
 
 def is_docker_mode() -> bool:
@@ -502,14 +642,20 @@ __DOCKER_NOTICE__
   <div id="llm-fields" class="hidden"><label class="field">OpenAI API key<span class="req">*</span></label><input name="openai_key" type="password" autocomplete="off" placeholder="sk-..."><p id="offline-llm-warning" class="warning hidden">LLM mode requires an internet connection in offline mode.</p></div>
   <button id="start">Create output</button>
   <p id="form-error" class="form-error hidden"></p>
-  <p class="notice">The browser interface only listens on this computer. Keep this page open while the analysis runs.</p>
+  <p class="notice">The browser interface only listens on this computer. Keep this page open while the analysis runs. If something fails, use <strong>Download support logs</strong> and send that zip (it does not include tokens or API keys).</p>
 </div></form>
-<div class="card"><span id="status" class="status">Ready</span><p id="run-meta" class="run-meta hidden"></p><div id="progress-wrap" class="progress-wrap hidden"><div id="progress-bar"></div></div><p id="progress-label" class="progress-label hidden"></p><pre id="log">No analysis has started.</pre></div>
+<div class="card"><span id="status" class="status">Ready</span><p id="run-meta" class="run-meta hidden"></p><div id="progress-wrap" class="progress-wrap hidden"><div id="progress-bar"></div></div><p id="progress-label" class="progress-label hidden"></p><pre id="log">No analysis has started.</pre>
+<div class="actions" style="margin-top:12px">
+  <a id="download-support-logs" class="button-link secondary disabled" href="#">Download support logs</a>
+</div>
+<p class="notice">Support logs are written under <code>outputs/raw-extracts/support-logs/</code> and each run’s <code>logs/</code> folder.</p>
+</div>
 <div id="results" class="card hidden"><strong>Results</strong>
 <div class="actions">
   <button id="open-folder" type="button" class="secondary">Open output folder</button>
   <a id="download-summary" class="button-link secondary" href="#">Download summary</a>
   <a id="download-zip" class="button-link secondary" href="#">Download archive zip</a>
+  <a id="download-support-logs-results" class="button-link secondary" href="#">Download support logs</a>
 </div>
 <p id="artifact-paths" class="paths hidden"></p>
 <div class="csv-scroll"><div id="csv-preview" class="notice">Loading summary…</div></div></div>
@@ -870,11 +1016,25 @@ async function refresh(){
   document.querySelector('#log').textContent=(data.log||[]).join('\\n') || 'No analysis has started.';
   document.querySelector('#start').disabled=data.running;
   showFormError(data.last_error||'');
+  const token='csrf_token=__CSRF_TOKEN__';
+  const supportEnabled=data.phase==='failed' || data.phase==='completed' || !!(data.log&&data.log.length);
+  ['#download-support-logs','#download-support-logs-results'].forEach(selector=>{
+    const link=document.querySelector(selector);
+    if (!link) return;
+    if (supportEnabled) {
+      link.href='/download/support-logs?'+token;
+      link.classList.remove('disabled');
+    } else {
+      link.href='#';
+      link.classList.add('disabled');
+    }
+  });
   const results=document.querySelector('#results');
-  const showResults=data.phase==='completed' && data.summary_path;
-  results.classList.toggle('hidden', !showResults);
+  const showCompleted=data.phase==='completed' && data.summary_path;
+  const showFailed=data.phase==='failed';
+  results.classList.toggle('hidden', !(showCompleted || showFailed));
   const paths=document.querySelector('#artifact-paths');
-  if (showResults) {
+  if (showCompleted) {
     const parts=[];
     if (data.xlsx_path) parts.push('<strong>Summary (Excel):</strong> <code>'+data.xlsx_path+'</code>');
     else if (data.summary_path) parts.push('<strong>Summary (CSV):</strong> <code>'+data.summary_path+'</code>');
@@ -882,7 +1042,6 @@ async function refresh(){
     if (data.host_output_hint) parts.push('<strong>Host folder:</strong> <code>'+data.host_output_hint+'</code>');
     paths.innerHTML=parts.join('<br>');
     paths.classList.toggle('hidden', parts.length===0);
-    const token='csrf_token=__CSRF_TOKEN__';
     const summaryLink=document.querySelector('#download-summary');
     const zipLink=document.querySelector('#download-zip');
     summaryLink.href='/download/summary?'+token;
@@ -894,6 +1053,9 @@ async function refresh(){
       zipLink.href='#';
       zipLink.classList.add('disabled');
     }
+  } else if (data.phase==='failed') {
+    paths.innerHTML='<strong>Run failed.</strong> Download support logs and send that zip for help.' + (data.run_dir ? '<br><strong>Run folder:</strong> <code>'+data.run_dir+'</code>' : '');
+    paths.classList.remove('hidden');
   } else {
     paths.classList.add('hidden');
   }
@@ -995,6 +1157,29 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.respond_file(summary_path, "summary.csv", "text/csv; charset=utf-8")
             return
+        if path == "/download/support-logs":
+            if not secrets.compare_digest(query.get("csrf_token", [""])[0], CSRF_TOKEN):
+                self.respond(HTTPStatus.FORBIDDEN, "text/plain", "Invalid request token.")
+                return
+            try:
+                bundle_path = build_support_bundle()
+            except Exception as exc:
+                ui_log("Failed to build support bundle", exc=exc)
+                self.respond(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "text/plain",
+                    f"Unable to build support logs: {exc}",
+                )
+                return
+            if not bundle_path.is_file():
+                self.respond(HTTPStatus.NOT_FOUND, "text/plain", "Support logs unavailable.")
+                return
+            self.respond_file(
+                bundle_path,
+                bundle_path.name,
+                "application/zip",
+            )
+            return
         if path == "/download/zip":
             if not secrets.compare_digest(query.get("csrf_token", [""])[0], CSRF_TOKEN):
                 self.respond(HTTPStatus.FORBIDDEN, "text/plain", "Invalid request token.")
@@ -1094,8 +1279,21 @@ class Handler(BaseHTTPRequestHandler):
                     json.dumps({"error": "Choose the folder holding local clones."}),
                 )
                 return
-            targets = discover_local_repositories(Path(local_dir).resolve())
-            items = [{"id": target.full_name, "name": target.full_name} for target in targets]
+            try:
+                targets = discover_local_repositories(Path(local_dir).resolve())
+                items = [
+                    {"id": target.full_name, "name": target.full_name}
+                    for target in targets
+                ]
+                ui_log(f"Discover local ok path={local_dir!r} count={len(items)}")
+            except Exception as exc:
+                ui_log(f"Discover local failed path={local_dir!r}", exc=exc)
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "application/json",
+                    json.dumps({"error": str(exc)[:500]}),
+                )
+                return
             self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": items}))
             return
         if path == "/discover/orgs":
@@ -1103,6 +1301,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 token = read_token_from_fields(fields, platform)
             except ValueError as exc:
+                ui_log(f"Discover orgs token error platform={platform}", exc=exc)
                 self.respond(
                     HTTPStatus.BAD_REQUEST,
                     "application/json",
@@ -1126,7 +1325,16 @@ class Handler(BaseHTTPRequestHandler):
                         json.dumps({"error": "Unknown hosted platform."}),
                     )
                     return
+                ui_log(
+                    f"Discover orgs/groups ok platform={platform} "
+                    f"host={fields.get('gitlab_host', [''])[0]!r} count={len(items)}"
+                )
             except Exception as exc:
+                ui_log(
+                    f"Discover orgs/groups failed platform={platform} "
+                    f"host={fields.get('gitlab_host', [''])[0]!r}",
+                    exc=exc,
+                )
                 self.respond(
                     HTTPStatus.BAD_REQUEST,
                     "application/json",
@@ -1140,6 +1348,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 token = read_token_from_fields(fields, platform)
             except ValueError as exc:
+                ui_log(f"Discover repos token error platform={platform}", exc=exc)
                 self.respond(
                     HTTPStatus.BAD_REQUEST,
                     "application/json",
@@ -1179,7 +1388,11 @@ class Handler(BaseHTTPRequestHandler):
                         json.dumps({"error": "Unknown hosted platform."}),
                     )
                     return
+                ui_log(
+                    f"Discover repos/projects ok platform={platform} count={len(items)}"
+                )
             except Exception as exc:
+                ui_log(f"Discover repos/projects failed platform={platform}", exc=exc)
                 self.respond(
                     HTTPStatus.BAD_REQUEST,
                     "application/json",
@@ -1193,6 +1406,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 token = read_token_from_fields(fields, platform)
             except ValueError as exc:
+                ui_log(
+                    f"Discover accessible token error platform={platform}",
+                    exc=exc,
+                )
                 self.respond(
                     HTTPStatus.BAD_REQUEST,
                     "application/json",
@@ -1216,7 +1433,15 @@ class Handler(BaseHTTPRequestHandler):
                         json.dumps({"error": "Unknown hosted platform."}),
                     )
                     return
+                ui_log(
+                    f"Discover accessible ok platform={platform} count={len(items)}"
+                )
             except Exception as exc:
+                ui_log(
+                    f"Discover accessible failed platform={platform} "
+                    f"host={fields.get('gitlab_host', [''])[0]!r}",
+                    exc=exc,
+                )
                 self.respond(
                     HTTPStatus.BAD_REQUEST,
                     "application/json",
@@ -1351,6 +1576,11 @@ class Handler(BaseHTTPRequestHandler):
             if STATE["running"]:
                 self.respond(HTTPStatus.CONFLICT, "text/plain", "An extraction is already running.")
                 return
+        ui_log(
+            "Queued extraction "
+            f"settings={json.dumps(safe_form_settings_for_logs(form_settings), ensure_ascii=False)} "
+            f"command={redact_command_for_logs(command)}"
+        )
         set_state(phase="running", running=True, form_settings=form_settings, last_error=None)
         threading.Thread(
             target=run_extraction,
@@ -1375,19 +1605,23 @@ def serve(host: str = "127.0.0.1", port: int = 8766) -> None:
     if host not in allowed_hosts:
         raise ValueError("The UI may only bind to localhost for credential safety.")
     load_persisted_state()
+    log_ui_startup()
     server = LocalHTTPServer((host, port), Handler)
     if host == "0.0.0.0":
         url = f"http://localhost:{port}"
     else:
         url = f"http://{host}:{port}"
     print(f"Repository Evidence Extractor UI: {url}")
+    print(f"Support log file: {UI_LOG_PATH}")
     if docker_mode:
         print("Docker mode: open the URL above in your browser on this computer.")
+        print("On the host, support logs are under ./outputs/raw-extracts/support-logs/")
     elif host in {"127.0.0.1", "localhost"}:
         webbrowser.open(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
+        ui_log("UI stopped (KeyboardInterrupt)")
         print("\nUI stopped.")
     finally:
         server.server_close()

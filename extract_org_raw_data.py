@@ -315,7 +315,9 @@ def safe_name(name: str) -> str:
 def setup_logger(log_path: Path) -> logging.Logger:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("raw_extract")
-    logger.setLevel(logging.INFO)
+    level_name = os.environ.get("EXTRACT_LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logger.setLevel(level)
     logger.handlers.clear()
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     fh = logging.FileHandler(log_path, encoding="utf-8")
@@ -325,6 +327,52 @@ def setup_logger(log_path: Path) -> logging.Logger:
     logger.addHandler(fh)
     logger.addHandler(sh)
     return logger
+
+
+def _tool_version(command: list[str]) -> str:
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        text = (proc.stdout or proc.stderr or "").strip().splitlines()
+        return text[0] if text else f"exit={proc.returncode}"
+    except Exception as exc:
+        return f"unavailable ({exc})"
+
+
+def log_runtime_diagnostics(log: logging.Logger, args: argparse.Namespace) -> None:
+    """Write environment details useful for support (never includes secrets)."""
+    log.info("=== Runtime diagnostics ===")
+    log.info("python=%s", sys.version.replace("\n", " "))
+    log.info("platform=%s", sys.platform)
+    log.info("cwd=%s", Path.cwd())
+    log.info("extractor=%s", Path(__file__).resolve())
+    log.info("git=%s", _tool_version(["git", "--version"]))
+    log.info("scc=%s", _tool_version(["scc", "--version"]))
+    log.info("workers=%s", args.workers)
+    log.info("offline=%s", bool(args.offline))
+    log.info("llm=%s", bool(args.llm))
+    if args.offline:
+        log.info("local_repos_dir=%s", args.local_repos_dir)
+    else:
+        log.info("github_host=%s", args.github_host)
+        log.info("gitlab_host=%s", args.gitlab_host)
+        log.info("github_token_name=%s", args.github_token_name)
+        log.info("gitlab_token_name=%s", args.gitlab_token_name)
+        log.info("github_org=%s", args.github_org or [])
+        log.info("github_accessible=%s", bool(args.github_accessible))
+        log.info("gitlab_group=%s", args.gitlab_group or [])
+        log.info("gitlab_accessible=%s", bool(args.gitlab_accessible))
+        log.info(
+            "github_repo_count=%s gitlab_repo_count=%s",
+            len(args.github_repo or []),
+            len(args.gitlab_repo or []),
+        )
+    log.info("output_dir=%s", args.output_dir)
+    log.info("=== End diagnostics ===")
 
 
 def write_json(path: Path, data: Any) -> None:
@@ -1515,7 +1563,7 @@ def process_repo(
         )
     except Exception as exc:
         row["error"] = str(exc)[:500]
-        log.error("FAIL %s: %s", target.full_name, row["error"])
+        log.exception("FAIL %s: %s", target.full_name, row["error"])
         if target.platform != "local":
             shutil.rmtree(clone_path, ignore_errors=True)
 
@@ -1950,6 +1998,7 @@ def main() -> int:
 
     log = setup_logger(logs_dir / "extract.log")
     log.info("Extracting %s repos → %s", len(targets), run_dir)
+    log_runtime_diagnostics(log, args)
     if args.offline:
         log.info("Mode: offline local-clone analysis; no network requests will be made")
     elif args.github_app:
@@ -1967,6 +2016,11 @@ def main() -> int:
         log.info("GitLab token key=%s workers=%s", args.gitlab_token_name, args.workers)
     else:
         log.info("Workers=%s", args.workers)
+    log.info(
+        "Support: if this run fails, send %s and %s",
+        logs_dir / "extract.log",
+        logs_dir / "failures.json",
+    )
 
     write_json(
         run_dir / "repos.json",
@@ -1996,7 +2050,11 @@ def main() -> int:
             for t in targets
         }
         for fut in as_completed(futures):
-            rows.append(fut.result())
+            try:
+                rows.append(fut.result())
+            except Exception:
+                log.exception("Worker crashed while collecting a repository result")
+                raise
 
     rows.sort(key=lambda r: (str(r.get("org")), str(r.get("repo"))))
     apply_company_periods(rows)
@@ -2006,6 +2064,38 @@ def main() -> int:
         writer.writeheader()
         writer.writerows(rows)
 
+    failures = [
+        {
+            "org": row.get("org"),
+            "repo": row.get("repo"),
+            "error": row.get("error"),
+        }
+        for row in rows
+        if row.get("error")
+    ]
+    write_json(logs_dir / "failures.json", failures)
+    if failures:
+        log.error("Repository failures: %s of %s", len(failures), len(rows))
+        for failure in failures[:50]:
+            log.error(
+                "Failed repo %s/%s: %s",
+                failure.get("org"),
+                failure.get("repo"),
+                failure.get("error"),
+            )
+        if len(failures) > 50:
+            log.error("…and %s more failures (see failures.json)", len(failures) - 50)
+
+    support_note = (
+        "If you need help debugging this run, send these files to support:\n"
+        f"- {logs_dir / 'extract.log'}\n"
+        f"- {logs_dir / 'failures.json'}\n"
+        f"- {run_dir / 'manifest.json'}\n"
+        "Do not send your tokens file or API keys.\n"
+    )
+    (logs_dir / "SUPPORT.txt").write_text(support_note, encoding="utf-8")
+    log.info("Wrote support note: %s", logs_dir / "SUPPORT.txt")
+
     shutil.rmtree(clones_dir, ignore_errors=True)
 
     manifest = {
@@ -2014,6 +2104,11 @@ def main() -> int:
         "ok": sum(1 for r in rows if not r.get("error")),
         "failed": sum(1 for r in rows if r.get("error")),
         "summary_csv": str(summary_path),
+        "support_logs": {
+            "extract_log": str(logs_dir / "extract.log"),
+            "failures_json": str(logs_dir / "failures.json"),
+            "support_txt": str(logs_dir / "SUPPORT.txt"),
+        },
         "github_auth": (
             {
                 "mode": "github_app",
