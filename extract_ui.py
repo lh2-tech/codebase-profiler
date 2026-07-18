@@ -102,6 +102,18 @@ def merge_repo_selectors(*groups: list[str]) -> list[str]:
     return merged
 
 
+def normalize_gitlab_host(raw: str) -> str:
+    """Return a GitLab base URL, or empty string to use the public gitlab.com default."""
+    value = (raw or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if not (value.startswith("http://") or value.startswith("https://")):
+        raise ValueError(
+            "GitLab host must be a full URL, for example https://gitlab.example.com"
+        )
+    return value
+
+
 def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
     llm_enabled = fields.get("llm_enabled", [""])[0] == "on"
     selected = extract_selected_repos(fields)
@@ -114,6 +126,7 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
         "github_org": fields.get("github_org", [""])[0].strip(),
         "github_token_name": fields.get("github_token_name", ["data-lh2-github-token"])[0].strip()
         or "data-lh2-github-token",
+        "gitlab_host": fields.get("gitlab_host", [""])[0].strip(),
         "gitlab_group": fields.get("gitlab_group", [""])[0].strip(),
         "gitlab_token_name": fields.get("gitlab_token_name", ["gitlab_token"])[0].strip()
         or "gitlab_token",
@@ -469,7 +482,7 @@ __DOCKER_NOTICE__
     <label class="field">Platform</label><select id="hosted-platform" name="hosted_platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option></select>
     <label class="field">Path to token file<span class="req">*</span></label><input name="tokens_file" value="__DEFAULT_TOKENS_FILE__" placeholder="/path/to/tokens" required>
     <div id="github-fields"><label class="field">GitHub token key<span class="req">*</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file" required><label class="field">Organisation</label><div class="inline-actions"><button type="button" id="load-github-orgs" class="secondary">Load organisations</button><button type="button" id="load-github-accessible" class="secondary">Load accessible repositories</button></div><select name="github_org" id="github-org-select"><option value="">Choose an organisation (optional if using accessible repos or manual list)</option></select><p class="notice">Organisation listing only shows orgs you belong to. Use <strong>Load accessible repositories</strong> for direct collaborator access, or paste <code>owner/repo</code> names below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="github-accessible" type="checkbox" name="github_accessible"><strong>Analyse every accessible repository</strong><span class="small">Runs against all repos this token can access (owner, collaborator, and org member).</span></label></div>
-    <div id="gitlab-fields" class="hidden"><label class="field">GitLab token key<span class="req">*</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file" required><label class="field">Group<span class="req">*</span></label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group</option></select><p class="notice">GitLab runs are always scoped to one group. Choose a group first, then optionally pick projects from that group below.</p></div>
+    <div id="gitlab-fields" class="hidden"><label class="field">GitLab token key<span class="req">*</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file" required><label class="field">GitLab host / base URL</label><input name="gitlab_host" id="gitlab-host" value="" placeholder="https://gitlab.com"><p class="notice">Optional. Use a full URL for self-hosted GitLab (for example <code>https://gitlab.example.com</code>). Leave blank for gitlab.com.</p><label class="field">Group<span class="req">*</span></label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group</option></select><p class="notice">GitLab runs are always scoped to one group. Choose a group first, then optionally pick projects from that group below.</p></div>
   </div>
   <div id="manual-repos-wrap" class="hidden">
     <label class="field" id="manual-repos-label">Manual repository list</label>
@@ -499,7 +512,7 @@ __DOCKER_NOTICE__
 <p id="artifact-paths" class="paths hidden"></p>
 <div class="csv-scroll"><div id="csv-preview" class="notice">Loading summary…</div></div></div>
 <script>
-const FORM_STORAGE_KEY='extract-ui-form-v4';
+const FORM_STORAGE_KEY='extract-ui-form-v5';
 const forms = {offline:document.querySelector('#offline-fields'), hosted:document.querySelector('#hosted-fields')};
 let savedRepoChecks=new Set();
 function updateRepoPickerCopy(){
@@ -622,6 +635,7 @@ async function loadHostedOrgs(){
     tokens_file:document.querySelector('[name=tokens_file]').value,
     github_token_name:document.querySelector('[name=github_token_name]').value,
     gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
+    gitlab_host:document.querySelector('[name=gitlab_host]')?.value||'',
   };
   setButtonLoading(button, true, idleText);
   try {
@@ -640,6 +654,7 @@ async function loadHostedRepos(){
     tokens_file:document.querySelector('[name=tokens_file]').value,
     github_token_name:document.querySelector('[name=github_token_name]').value,
     gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
+    gitlab_host:document.querySelector('[name=gitlab_host]')?.value||'',
   };
   if (platform==='github') {
     extra.github_org=document.querySelector('#github-org-select').value;
@@ -703,6 +718,9 @@ function validateForm(){
       }
     } else {
       if (!data.gitlab_token_name.trim()) errors.push(['gitlab_token_name','Enter the GitLab token key.']);
+      if (data.gitlab_host.trim() && !/^https?:\/\//i.test(data.gitlab_host.trim())) {
+        errors.push(['gitlab-host','GitLab host must be a full URL, for example https://gitlab.example.com']);
+      }
       if (!data.gitlab_group.trim()) errors.push(['gitlab-group-select','Choose a GitLab group.']);
     }
   }
@@ -723,6 +741,7 @@ function readFormSettings(){
     tokens_file:data.get('tokens_file')||'tokens',
     github_org:data.get('github_org')||'',
     github_token_name:data.get('github_token_name')||'data-lh2-github-token',
+    gitlab_host:data.get('gitlab_host')||'',
     gitlab_group:data.get('gitlab_group')||'',
     gitlab_token_name:data.get('gitlab_token_name')||'gitlab_token',
     workers:data.get('workers')||'4',
@@ -742,6 +761,7 @@ function restoreFormSettings(settings){
   setValue('tokens_file', settings.tokens_file||'tokens');
   setValue('github_org', settings.github_org||'');
   setValue('github_token_name', settings.github_token_name||'data-lh2-github-token');
+  setValue('gitlab_host', settings.gitlab_host||'');
   setValue('gitlab_group', settings.gitlab_group||'');
   setValue('gitlab_token_name', settings.gitlab_token_name||'gitlab_token');
   setValue('workers', settings.workers||'4');
@@ -1056,7 +1076,12 @@ class Handler(BaseHTTPRequestHandler):
                 if platform == "github":
                     items = list_github_orgs_for_token(token)
                 elif platform == "gitlab":
-                    items = list_gitlab_groups_for_token(token)
+                    gitlab_host = normalize_gitlab_host(
+                        fields.get("gitlab_host", [""])[0]
+                    )
+                    items = list_gitlab_groups_for_token(
+                        token, host=gitlab_host or "gitlab.com"
+                    )
                 else:
                     self.respond(
                         HTTPStatus.BAD_REQUEST,
@@ -1104,7 +1129,12 @@ class Handler(BaseHTTPRequestHandler):
                             json.dumps({"error": "Choose a GitLab group."}),
                         )
                         return
-                    items = list_gitlab_projects_for_group(token, group)
+                    gitlab_host = normalize_gitlab_host(
+                        fields.get("gitlab_host", [""])[0]
+                    )
+                    items = list_gitlab_projects_for_group(
+                        token, group, host=gitlab_host or "gitlab.com"
+                    )
                 else:
                     self.respond(
                         HTTPStatus.BAD_REQUEST,
@@ -1218,6 +1248,13 @@ class Handler(BaseHTTPRequestHandler):
             elif platform == "gitlab":
                 group = fields.get("gitlab_group", [""])[0].strip()
                 token_name = fields.get("gitlab_token_name", [""])[0].strip()
+                try:
+                    gitlab_host = normalize_gitlab_host(
+                        fields.get("gitlab_host", [""])[0]
+                    )
+                except ValueError as exc:
+                    self.respond(HTTPStatus.BAD_REQUEST, "text/plain", str(exc))
+                    return
                 if not token_name:
                     self.respond(
                         HTTPStatus.BAD_REQUEST,
@@ -1236,6 +1273,8 @@ class Handler(BaseHTTPRequestHandler):
                 for project in selected_repos:
                     command.extend(["--gitlab-repo", project])
                 command.extend(["--gitlab-token-name", token_name])
+                if gitlab_host:
+                    command.extend(["--gitlab-host", gitlab_host])
             else:
                 self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Unknown hosted platform.")
                 return
