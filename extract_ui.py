@@ -34,6 +34,7 @@ from extract_org_raw_data import (  # noqa: E402
     list_github_accessible_repos,
     list_github_orgs_for_token,
     list_github_repos_for_org,
+    list_gitlab_accessible_projects,
     list_gitlab_groups_for_token,
     list_gitlab_projects_for_group,
     parse_tokens_file,
@@ -135,6 +136,7 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
         "selected_repos": "\n".join(selected),
         "manual_repos": "\n".join(manual),
         "github_accessible": fields.get("github_accessible", [""])[0] == "on",
+        "gitlab_accessible": fields.get("gitlab_accessible", [""])[0] == "on",
     }
 
 
@@ -482,7 +484,7 @@ __DOCKER_NOTICE__
     <label class="field">Platform</label><select id="hosted-platform" name="hosted_platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option></select>
     <label class="field">Path to token file<span class="req">*</span></label><input name="tokens_file" value="__DEFAULT_TOKENS_FILE__" placeholder="/path/to/tokens" required>
     <div id="github-fields"><label class="field">GitHub token key<span class="req">*</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file" required><label class="field">Organisation</label><div class="inline-actions"><button type="button" id="load-github-orgs" class="secondary">Load organisations</button><button type="button" id="load-github-accessible" class="secondary">Load accessible repositories</button></div><select name="github_org" id="github-org-select"><option value="">Choose an organisation (optional if using accessible repos or manual list)</option></select><p class="notice">Organisation listing only shows orgs you belong to. Use <strong>Load accessible repositories</strong> for direct collaborator access, or paste <code>owner/repo</code> names below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="github-accessible" type="checkbox" name="github_accessible"><strong>Analyse every accessible repository</strong><span class="small">Runs against all repos this token can access (owner, collaborator, and org member).</span></label></div>
-    <div id="gitlab-fields" class="hidden"><label class="field">GitLab token key<span class="req">*</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file" required><label class="field">GitLab host / base URL</label><input name="gitlab_host" id="gitlab-host" value="" placeholder="https://gitlab.com"><p class="notice">Optional. Use a full URL for self-hosted GitLab (for example <code>https://gitlab.example.com</code>). Leave blank for gitlab.com.</p><label class="field">Group<span class="req">*</span></label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group</option></select><p class="notice">GitLab runs are always scoped to one group. Choose a group first, then optionally pick projects from that group below.</p></div>
+    <div id="gitlab-fields" class="hidden"><label class="field">GitLab token key<span class="req">*</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file" required><label class="field">GitLab host / base URL</label><input name="gitlab_host" id="gitlab-host" value="" placeholder="https://gitlab.com"><p class="notice">Optional. Use a full URL for self-hosted GitLab (for example <code>https://gitlab.example.com</code>). Leave blank for gitlab.com.</p><label class="field">Group</label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button><button type="button" id="load-gitlab-accessible" class="secondary">Load all projects</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group (optional if using all projects or manual list)</option></select><p class="notice">Group listing shows groups you belong to. Use <strong>Load all projects</strong> for every project this token can access via membership, or paste <code>group/project</code> paths below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="gitlab-accessible" type="checkbox" name="gitlab_accessible"><strong>Analyse every accessible project</strong><span class="small">Runs against all GitLab projects this token can access (membership).</span></label></div>
   </div>
   <div id="manual-repos-wrap" class="hidden">
     <label class="field" id="manual-repos-label">Manual repository list</label>
@@ -512,7 +514,7 @@ __DOCKER_NOTICE__
 <p id="artifact-paths" class="paths hidden"></p>
 <div class="csv-scroll"><div id="csv-preview" class="notice">Loading summary…</div></div></div>
 <script>
-const FORM_STORAGE_KEY='extract-ui-form-v5';
+const FORM_STORAGE_KEY='extract-ui-form-v6';
 const forms = {offline:document.querySelector('#offline-fields'), hosted:document.querySelector('#hosted-fields')};
 let savedRepoChecks=new Set();
 function updateRepoPickerCopy(){
@@ -524,9 +526,9 @@ function updateRepoPickerCopy(){
   const manualHelp=document.querySelector('#manual-repos-help');
   if (mode==='hosted' && platform==='gitlab') {
     label.textContent='Projects to include';
-    help.textContent='Leave all unchecked to include every project in the selected group.';
+    help.textContent='Group mode: leave all unchecked to include every project in the selected group. All-projects mode: select the projects you want, or use Select all.';
     if (manualLabel) manualLabel.textContent='Manual project list';
-    if (manualHelp) manualHelp.textContent='Optional. One group/project path per line.';
+    if (manualHelp) manualHelp.textContent='One group/project path per line. Use this when a project is missing from group discovery.';
   } else {
     label.textContent='Repositories to include';
     help.textContent='Organisation mode: leave all unchecked to include every repository in the org. Accessible-repo mode: select the repos you want, or use Select all.';
@@ -697,6 +699,31 @@ async function loadAccessibleGithubRepos(){
     setButtonLoading(button, false);
   }
 }
+async function loadAccessibleGitlabProjects(){
+  showFormError('');
+  const button=document.querySelector('#load-gitlab-accessible');
+  const extra={
+    hosted_platform:'gitlab',
+    tokens_file:document.querySelector('[name=tokens_file]').value,
+    gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
+    gitlab_host:document.querySelector('[name=gitlab_host]')?.value||'',
+  };
+  setButtonLoading(button, true, 'Load all projects');
+  showRepoPickerLoading('Loading every GitLab project this token can access…');
+  try {
+    const payload=await postDiscover('/discover/accessible-repos', extra);
+    rememberRepoChecks();
+    renderRepoPicker(
+      payload.items,
+      'No accessible GitLab projects found for this token (membership).'
+    );
+  } catch (error) {
+    document.querySelector('#repo-picker-wrap').classList.add('hidden');
+    showFormError(error.message);
+  } finally {
+    setButtonLoading(button, false);
+  }
+}
 function clearInvalid(){ document.querySelectorAll('.invalid').forEach(el=>el.classList.remove('invalid')); }
 function markInvalid(name){ const el=document.querySelector('[name="'+name+'"],#'+name); if (el) el.classList.add('invalid'); }
 function validateForm(){
@@ -721,7 +748,13 @@ function validateForm(){
       if (data.gitlab_host.trim() && !/^https?:\/\//i.test(data.gitlab_host.trim())) {
         errors.push(['gitlab-host','GitLab host must be a full URL, for example https://gitlab.example.com']);
       }
-      if (!data.gitlab_group.trim()) errors.push(['gitlab-group-select','Choose a GitLab group.']);
+      const hasGroup=!!data.gitlab_group.trim();
+      const hasSelected=getSelectedRepos().length>0;
+      const hasManual=getManualRepos().length>0;
+      const hasAccessible=!!data.gitlab_accessible;
+      if (!hasGroup && !hasSelected && !hasManual && !hasAccessible) {
+        errors.push(['gitlab-group-select','Choose a group, load/select all projects, paste a manual list, or enable “Analyse every accessible project”.']);
+      }
     }
   }
   if (data.llm_enabled && !document.querySelector('[name=openai_key]').value.trim()) errors.push(['openai_key','Enter an OpenAI API key to enable LLM analysis.']);
@@ -747,6 +780,7 @@ function readFormSettings(){
     workers:data.get('workers')||'4',
     llm_enabled:!!data.get('llm_enabled'),
     github_accessible:!!data.get('github_accessible'),
+    gitlab_accessible:!!data.get('gitlab_accessible'),
     selected_repos:getSelectedRepos().join('\\n'),
     manual_repos:getManualRepos().join('\\n'),
   };
@@ -769,6 +803,8 @@ function restoreFormSettings(settings){
   document.querySelector('#llm-enabled').checked=!!settings.llm_enabled;
   const accessible=document.querySelector('#github-accessible');
   if (accessible) accessible.checked=!!settings.github_accessible;
+  const gitlabAccessible=document.querySelector('#gitlab-accessible');
+  if (gitlabAccessible) gitlabAccessible.checked=!!settings.gitlab_accessible;
   savedRepoChecks=new Set((settings.selected_repos||'').split(/\\n+/).filter(Boolean));
   choose();
 }
@@ -782,6 +818,7 @@ document.querySelector('#load-local-repos').addEventListener('click', loadLocalR
 document.querySelector('#load-github-orgs').addEventListener('click', loadHostedOrgs);
 document.querySelector('#load-github-accessible').addEventListener('click', loadAccessibleGithubRepos);
 document.querySelector('#load-gitlab-groups').addEventListener('click', loadHostedOrgs);
+document.querySelector('#load-gitlab-accessible').addEventListener('click', loadAccessibleGitlabProjects);
 document.querySelector('#github-org-select').addEventListener('change', loadHostedRepos);
 document.querySelector('#gitlab-group-select').addEventListener('change', loadHostedRepos);
 document.querySelector('#select-all-repos').addEventListener('click', ()=>document.querySelectorAll('input[name="selected_repos"]').forEach(el=>el.checked=true));
@@ -1153,13 +1190,6 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/discover/accessible-repos":
             platform = fields.get("hosted_platform", ["github"])[0]
-            if platform != "github":
-                self.respond(
-                    HTTPStatus.BAD_REQUEST,
-                    "application/json",
-                    json.dumps({"error": "Accessible repository discovery is only available for GitHub."}),
-                )
-                return
             try:
                 token = read_token_from_fields(fields, platform)
             except ValueError as exc:
@@ -1170,7 +1200,22 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             try:
-                items = list_github_accessible_repos(token)
+                if platform == "github":
+                    items = list_github_accessible_repos(token)
+                elif platform == "gitlab":
+                    gitlab_host = normalize_gitlab_host(
+                        fields.get("gitlab_host", [""])[0]
+                    )
+                    items = list_gitlab_accessible_projects(
+                        token, host=gitlab_host or "gitlab.com"
+                    )
+                else:
+                    self.respond(
+                        HTTPStatus.BAD_REQUEST,
+                        "application/json",
+                        json.dumps({"error": "Unknown hosted platform."}),
+                    )
+                    return
             except Exception as exc:
                 self.respond(
                     HTTPStatus.BAD_REQUEST,
@@ -1248,6 +1293,7 @@ class Handler(BaseHTTPRequestHandler):
             elif platform == "gitlab":
                 group = fields.get("gitlab_group", [""])[0].strip()
                 token_name = fields.get("gitlab_token_name", [""])[0].strip()
+                gitlab_accessible = fields.get("gitlab_accessible", [""])[0] == "on"
                 try:
                     gitlab_host = normalize_gitlab_host(
                         fields.get("gitlab_host", [""])[0]
@@ -1262,16 +1308,21 @@ class Handler(BaseHTTPRequestHandler):
                         "Enter the GitLab token key.",
                     )
                     return
-                if not group:
+                if selected_repos:
+                    for project in selected_repos:
+                        command.extend(["--gitlab-repo", project])
+                elif gitlab_accessible:
+                    command.append("--gitlab-accessible")
+                elif group:
+                    command.extend(["--gitlab-group", group])
+                else:
                     self.respond(
                         HTTPStatus.BAD_REQUEST,
                         "text/plain",
-                        "Choose a GitLab group.",
+                        "Choose a GitLab group, select/paste projects, "
+                        "or enable “Analyse every accessible project”.",
                     )
                     return
-                command.extend(["--gitlab-group", group])
-                for project in selected_repos:
-                    command.extend(["--gitlab-repo", project])
                 command.extend(["--gitlab-token-name", token_name])
                 if gitlab_host:
                     command.extend(["--gitlab-host", gitlab_host])

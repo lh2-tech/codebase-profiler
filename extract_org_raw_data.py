@@ -402,6 +402,46 @@ def list_gitlab_project_objects(token: str, group: str, host: str) -> list[dict[
     return projects
 
 
+def list_gitlab_accessible_project_objects(
+    token: str, host: str = "gitlab.com"
+) -> list[dict[str, Any]]:
+    """Projects the token can access via membership (any group or personal namespace)."""
+    api = gitlab_api(host)
+    projects = paginate_gitlab(
+        api,
+        "/projects",
+        token,
+        {
+            "membership": "true",
+            "archived": "true",
+            "order_by": "path",
+            "sort": "asc",
+        },
+    )
+    results = [
+        project
+        for project in projects
+        if isinstance(project, dict) and project.get("path_with_namespace")
+    ]
+    if not results:
+        raise RuntimeError(
+            "No GitLab projects found for this token (membership access)."
+        )
+    return results
+
+
+def fetch_gitlab_project(token: str, path_with_namespace: str, host: str) -> dict[str, Any]:
+    api = gitlab_api(host)
+    encoded = urllib.parse.quote(path_with_namespace.strip("/"), safe="")
+    data, _ = http_get_json(
+        f"{api}/projects/{encoded}",
+        {"PRIVATE-TOKEN": token, "User-Agent": "extract-org-raw-data"},
+    )
+    if not isinstance(data, dict) or not data.get("path_with_namespace"):
+        raise RuntimeError(f"GitLab project not found: {path_with_namespace}")
+    return data
+
+
 # ── API raw extracts ────────────────────────────────────────────────────────
 
 
@@ -1264,6 +1304,19 @@ def list_gitlab_projects_for_group(
     ]
 
 
+def list_gitlab_accessible_projects(
+    token: str, host: str = "gitlab.com"
+) -> list[dict[str, str]]:
+    return [
+        {
+            "id": str(project["path_with_namespace"]),
+            "name": str(project["path_with_namespace"]),
+            "archived": bool(project.get("archived")),
+        }
+        for project in list_gitlab_accessible_project_objects(token, host)
+    ]
+
+
 def filter_local_targets(
     targets: list[RepoTarget], selectors: list[str]
 ) -> list[RepoTarget]:
@@ -1557,9 +1610,45 @@ def build_targets(
             group_targets = filter_local_targets(group_targets, args.gitlab_repo)
         targets.extend(group_targets)
 
+    if getattr(args, "gitlab_accessible", False):
+        if gitlab_token_name not in tokens:
+            raise SystemExit(f"Missing {gitlab_token_name!r} in tokens file")
+        for meta in list_gitlab_accessible_project_objects(
+            tokens[gitlab_token_name], args.gitlab_host
+        ):
+            full_name = str(meta["path_with_namespace"])
+            targets.append(
+                RepoTarget(
+                    platform="gitlab",
+                    org=full_name.split("/", 1)[0],
+                    full_name=full_name,
+                    meta=meta,
+                )
+            )
+
+    if args.gitlab_repo and not args.gitlab_group:
+        if gitlab_token_name not in tokens:
+            raise SystemExit(f"Missing {gitlab_token_name!r} in tokens file")
+        for path_with_namespace in args.gitlab_repo:
+            meta = fetch_gitlab_project(
+                tokens[gitlab_token_name],
+                path_with_namespace.strip("/"),
+                args.gitlab_host,
+            )
+            full_name = str(meta["path_with_namespace"])
+            targets.append(
+                RepoTarget(
+                    platform="gitlab",
+                    org=full_name.split("/", 1)[0],
+                    full_name=full_name,
+                    meta=meta,
+                )
+            )
+
     if not targets:
         raise SystemExit(
-            "Provide --github-org / --github-repo / --github-accessible / --gitlab-group"
+            "Provide --github-org / --github-repo / --github-accessible / "
+            "--gitlab-group / --gitlab-repo / --gitlab-accessible"
         )
     # De-duplicate by platform + full_name while preserving order.
     seen: set[tuple[str, str]] = set()
@@ -1749,7 +1838,18 @@ def main() -> int:
         "--gitlab-repo",
         action="append",
         default=[],
-        help="With --gitlab-group: include only matching project names or full paths (repeatable)",
+        help=(
+            "GitLab project path (group/project). Alone: analyse these projects. "
+            "With --gitlab-group: include only matching names or paths (repeatable)"
+        ),
+    )
+    parser.add_argument(
+        "--gitlab-accessible",
+        action="store_true",
+        help=(
+            "Include every GitLab project the token can access via membership "
+            "(any group or personal namespace)"
+        ),
     )
     args = parser.parse_args()
 
@@ -1767,10 +1867,9 @@ def main() -> int:
         or args.github_accessible
         or args.gitlab_group
         or args.gitlab_repo
+        or args.gitlab_accessible
     ):
         raise SystemExit("--offline cannot be combined with GitHub or GitLab targets")
-    if args.gitlab_repo and not args.gitlab_group:
-        raise SystemExit("--gitlab-repo requires --gitlab-group")
     if args.llm and not os.environ.get("OPENAI_API_KEY", "").strip():
         raise SystemExit(
             "--llm requires OPENAI_API_KEY in the environment. "
@@ -1832,8 +1931,14 @@ def main() -> int:
         label = args.github_org[0]
     elif args.gitlab_group:
         label = args.gitlab_group[0]
+    elif args.github_accessible:
+        label = "github-accessible"
+    elif args.gitlab_accessible:
+        label = "gitlab-accessible"
     elif args.github_repo:
         label = args.github_repo[0].replace("/", "_")
+    elif args.gitlab_repo:
+        label = args.gitlab_repo[0].replace("/", "_")
     else:
         label = "repos"
 
