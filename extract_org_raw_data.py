@@ -298,6 +298,14 @@ class RepoTarget:
 
 
 def parse_tokens_file(path: Path) -> dict[str, str]:
+    if path.is_dir():
+        raise ValueError(
+            f"Tokens path is a directory, expected a file: {path}. "
+            "If Docker created this after a missing bind mount, remove the "
+            "directory on the host and copy tokens.example to tokens."
+        )
+    if not path.is_file():
+        raise ValueError(f"Tokens file not found: {path}")
     tokens: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -1925,10 +1933,23 @@ def main() -> int:
         )
 
     tokens: dict[str, str] = {}
-    if args.tokens_file.exists():
-        tokens = parse_tokens_file(args.tokens_file)
-    elif not args.list_installations and not args.github_app and not args.offline:
-        raise SystemExit(f"Tokens file not found: {args.tokens_file}")
+    # Offline mode analyses local clones only and never uses API tokens.
+    # Skip loading so a Docker bind-mount directory at the default path
+    # (created when the host tokens file was missing) cannot abort the run.
+    if not args.offline:
+        if args.tokens_file.is_file():
+            try:
+                tokens = parse_tokens_file(args.tokens_file)
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+        elif args.tokens_file.is_dir():
+            raise SystemExit(
+                f"Tokens path is a directory, expected a file: {args.tokens_file}. "
+                "If Docker created this after a missing bind mount, remove the "
+                "directory on the host and copy tokens.example to tokens."
+            )
+        elif not args.list_installations and not args.github_app:
+            raise SystemExit(f"Tokens file not found: {args.tokens_file}")
 
     if args.list_installations:
         return cmd_list_installations(args, tokens)
