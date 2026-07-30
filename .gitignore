@@ -4,6 +4,29 @@ tokens
 __pycache__/
 *.py[cod]
 .Python
+.venv/
+.DS_Store
+
+# Run outputs and local clones (never publish customer data)
 outputs/raw-extracts/*
 !outputs/raw-extracts/.gitkeep
-.DS_Store
+outputs/batch-run-logs/
+outputs/kit-loc-composition/
+outputs/llm-loc-composition/
+outputs/support-logs/
+repos/github/
+repos/local/
+repos/**/*
+!repos/.gitkeep
+
+# Internal batch / ops helpers and customer target lists
+discovered_targets.json
+*-targets.json
+clone_then_offline.sh
+resume_clone_then_offline.sh
+run_all_orgs.sh
+run_all_orgs_parallel.sh
+run_offline_after_clone.sh
+watchdog_clone_pipeline.sh
+analyze_loc_composition_kits.py
+analyze_loc_composition_llm.py

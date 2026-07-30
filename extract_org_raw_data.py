@@ -17,8 +17,8 @@ Usage:
       --github-org CustomerOrg --workers 10
 
   # Legacy PAT mode
-  python extract_org_raw_data.py --github-org Aurelium-Inc-LH2 --tokens-file tokens \\
-      --github-token-name data-lh2-github-token --workers 10
+  python extract_org_raw_data.py --github-org CustomerOrg --tokens-file tokens \\
+      --github-token-name github-data-token --workers 10
   python extract_org_raw_data.py --gitlab-group my-group --tokens-file tokens --workers 8
 
   # Resume an interrupted run (skips repos already in summary.csv)
