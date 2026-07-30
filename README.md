@@ -33,22 +33,25 @@ That is the only command needed after `tokens` is configured.
 ## UI features
 
 - **Run analysis** — starts the metadata extraction
-- **Progress bar** — shows repository completion while a run is active
+- **Progress bar** — shows repository completion while a run is active, including failure classes (timeout, rate_limit, network, …)
 - **Organisation / group discovery** — load orgs/groups the token belongs to
 - **Accessible GitHub repositories** — load every repo the token can access (owner, collaborator, and org member), including direct invites outside org membership
 - **Manual repository list** — paste `owner/repo` lines when discovery still misses a target
 - **Repository selection** — optional picker to limit which repos/projects are processed
-- **Open output folder** — opens the run folder on Mac, Windows, or Ubuntu (in Docker, use Download buttons or open `./outputs/raw-extracts` on your computer)
-- **Download summary / archive zip** — browser downloads for the completed run
+- **Resume previous run** — continue an interrupted job from `job.json` / `summary.csv` without redoing completed repos
+- **Retry failed repositories** — re-attempt timeout / network / rate-limit failures only
+- **Partial summary / archive download** — download `summary.csv` or a partial archive zip while a run is still in progress
+- **Download summary / archive zip** — browser downloads for the completed (or partial) run
 
 ## Modes
 
 ### Hosted platform (GitHub / GitLab)
 
-- Token file path in the UI: `/app/tokens`
-- Uses the keys in your mounted `tokens` file
+- Put credentials in the host `tokens` file (mounted into the container automatically)
+- In the UI, choose the token key name (for example `github-data-token`) — no path entry needed
 - Repositories are cloned inside the container, analysed, then removed before the zip is written
 - GitHub PAT needs the `repo` scope to see private collaborator repositories
+- Large orgs: prefer selecting a subset of repos, or use clone-then-offline (`clone_all_repos.py` + offline mode) if the platform run hits API rate limits
 - CLI equivalent for direct-access repos:
 
 ```bash
@@ -57,23 +60,31 @@ python extract_org_raw_data.py --github-accessible --tokens-file tokens --github
 python extract_org_raw_data.py --github-repo owner/repo-one --github-repo owner/repo-two --tokens-file tokens
 ```
 
+### Resume / retry (CLI)
+
+Progress is written after every repository to `summary.csv` and `job.json` inside the run folder.
+
+```bash
+# Continue pending repos from an interrupted run
+python extract_org_raw_data.py --resume outputs/raw-extracts/raw-extract-ORG-STAMP --tokens-file tokens
+
+# Retry only timeout / network / rate-limit failures
+python extract_org_raw_data.py --resume outputs/raw-extracts/raw-extract-ORG-STAMP --tokens-file tokens --retry-failed
+
+# Shorter clone timeout (default 300s) and fewer retries
+python extract_org_raw_data.py --github-org MyOrg --tokens-file tokens \
+  --clone-timeout 180 --clone-retries 1 --workers 4
+```
+
 ### Already cloned here (offline)
 
-Local repositories live **outside** the Docker image. Mount them with `LOCAL_REPOS_DIR` in `.env`:
+Local repositories live **outside** the Docker image. Put full clones in `./repos`, or set `LOCAL_REPOS_DIR` in `.env`:
 
 ```env
 LOCAL_REPOS_DIR=/Users/me/customer-repos
 ```
 
-In the UI, always use the **container path**:
-
-```text
-/data/repos
-```
-
-Optionally list specific repository folder names in **Repositories to include**.
-
-Do not enter the host path (`/Users/me/...`) — it will not exist inside the container.
+The UI uses the mounted folder automatically — no path entry needed. Optionally list specific repositories with **Load repositories** / **Repositories to include**.
 
 ## Outputs
 

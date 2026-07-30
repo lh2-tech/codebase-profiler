@@ -20,6 +20,12 @@ Usage:
   python extract_org_raw_data.py --github-org Aurelium-Inc-LH2 --tokens-file tokens \\
       --github-token-name data-lh2-github-token --workers 10
   python extract_org_raw_data.py --gitlab-group my-group --tokens-file tokens --workers 8
+
+  # Resume an interrupted run (skips repos already in summary.csv)
+  python extract_org_raw_data.py --resume outputs/raw-extracts/raw-extract-ORG-STAMP
+
+  # Retry only failed/retryable repos from a previous run
+  python extract_org_raw_data.py --resume outputs/raw-extracts/raw-extract-ORG-STAMP --retry-failed
 """
 
 from __future__ import annotations
@@ -34,11 +40,12 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import webbrowser
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -65,6 +72,9 @@ CODING = Path(__file__).resolve().parent
 DEFAULT_GITHUB_TOKEN_NAME = "github-data-token"
 DEFAULT_GITLAB_TOKEN_NAME = "gitlab_token"
 GITHUB_APP_TOKEN_KEY = "__github_app_installation_token__"
+DEFAULT_CLONE_TIMEOUT_SECONDS = 300
+DEFAULT_CLONE_RETRIES = 2
+RETRYABLE_ERROR_CLASSES = frozenset({"timeout", "rate_limit", "network"})
 
 BOT_NAME_PATTERNS = [
     re.compile(r, re.I)
@@ -174,6 +184,8 @@ SUMMARY_FIELDS = [
     "has_ci_cd",
     "test_source_loc_pct",
     "has_library_code",
+    "open_source_loc_pct",
+    "library_modules_loc_pct",
     "company_period",
     "codebase_description",
     "industry_domain",
@@ -181,6 +193,7 @@ SUMMARY_FIELDS = [
     "repo_type",
     "llm_analysis_error",
     "error",
+    "error_class",
 ]
 
 TEST_DIR_HINTS = ("test", "tests", "spec", "specs", "__tests__")
@@ -280,6 +293,111 @@ TEST_RUNNER_PACKAGE_PATTERNS = [
     ]
 ]
 LIBRARY_DIR_NAMES = frozenset({"lib", "libs", "library", "libraries"})
+# Library/framework/module path segments for LOC % (compiled sheets).
+LIBRARY_MODULE_DIR_NAMES = frozenset(
+    {
+        "node_modules",
+        "bower_components",
+        ".venv",
+        "venv",
+        "site-packages",
+        "lib",
+        "libs",
+        "library",
+        "libraries",
+        "modules",
+        "framework",
+        "frameworks",
+        "packages",
+    }
+)
+# Strong open-source signals (not bare folder-name heuristics).
+LICENSE_FILE_NAMES = frozenset(
+    {
+        "license",
+        "license.md",
+        "license.txt",
+        "license.rst",
+        "copying",
+        "copying.md",
+        "copying.txt",
+        "licence",
+        "licence.md",
+        "licence.txt",
+    }
+)
+OSS_LICENSE_MARKERS = (
+    re.compile(r"\bMIT\b"),
+    re.compile(r"\bApache(?:\s+License)?(?:\s*,?\s*version\s*)?2(\.0)?\b", re.I),
+    re.compile(r"\bBSD[- ][23][- ]Clause\b", re.I),
+    re.compile(r"\bBSD\b"),
+    re.compile(r"\bISC\b"),
+    re.compile(r"\bMPL(?:-|\s+)2(\.0)?\b", re.I),
+    re.compile(r"\bGNU\s+(Lesser\s+|Affero\s+)?General\s+Public\s+License\b", re.I),
+    re.compile(r"\b(?:LGPL|AGPL|GPL)-?[23](?:\.0)?\b", re.I),
+    re.compile(r"\bUnlicense\b", re.I),
+    re.compile(r"\bCC0\b", re.I),
+    re.compile(r"\bBoost\s+Software\s+License\b", re.I),
+    re.compile(r"\bArtistic\s+License\b", re.I),
+    re.compile(r"\bZlib\b", re.I),
+    re.compile(r"\bEclipse\s+Public\s+License\b", re.I),
+    re.compile(r"\bMozilla\s+Public\s+License\b", re.I),
+)
+PROPRIETARY_LICENSE_MARKERS = (
+    re.compile(r"\ball\s+rights\s+reserved\b", re.I),
+    re.compile(r"\bproprietary\b", re.I),
+    re.compile(r"\bconfidential\b", re.I),
+    re.compile(r"\bnot\s+licensed\s+for\b", re.I),
+)
+SPDX_LINE_RE = re.compile(
+    r"SPDX-License-Identifier\s*:\s*([^\n*;]+)",
+    re.I,
+)
+OSS_SPDX_IDS = frozenset(
+    {
+        "mit",
+        "apache-2.0",
+        "bsd-2-clause",
+        "bsd-3-clause",
+        "isc",
+        "mpl-2.0",
+        "gpl-2.0",
+        "gpl-3.0",
+        "gpl-2.0-only",
+        "gpl-2.0-or-later",
+        "gpl-3.0-only",
+        "gpl-3.0-or-later",
+        "lgpl-2.1",
+        "lgpl-3.0",
+        "agpl-3.0",
+        "unlicense",
+        "cc0-1.0",
+        "bsl-1.0",
+        "zlib",
+        "epl-2.0",
+        "0bsd",
+        "openssl",
+    }
+)
+# (dependency dir name, required sibling/root marker files) — marker proves PM install.
+LOCKFILE_BACKED_DEP_DIRS: tuple[tuple[str, frozenset[str]], ...] = (
+    ("vendor", frozenset({"composer.lock", "composer.json", "go.mod", "go.sum"})),
+    (
+        "node_modules",
+        frozenset(
+            {
+                "package-lock.json",
+                "yarn.lock",
+                "pnpm-lock.yaml",
+                "npm-shrinkwrap.json",
+                "package.json",
+            }
+        ),
+    ),
+    ("pods", frozenset({"podfile.lock", "podfile"})),
+    ("bower_components", frozenset({"bower.json"})),
+)
+CARTHAGE_MARKERS = frozenset({"cartfile.resolved", "cartfile"})
 
 
 @dataclass(frozen=True)
@@ -361,6 +479,9 @@ def log_runtime_diagnostics(log: logging.Logger, args: argparse.Namespace) -> No
     log.info("git=%s", _tool_version(["git", "--version"]))
     log.info("scc=%s", _tool_version(["scc", "--version"]))
     log.info("workers=%s", args.workers)
+    log.info("clone_timeout=%s", getattr(args, "clone_timeout", DEFAULT_CLONE_TIMEOUT_SECONDS))
+    log.info("clone_retries=%s", getattr(args, "clone_retries", DEFAULT_CLONE_RETRIES))
+    log.info("resume=%s", getattr(args, "resume", None))
     log.info("offline=%s", bool(args.offline))
     log.info("llm=%s", bool(args.llm))
     if args.offline:
@@ -386,6 +507,236 @@ def log_runtime_diagnostics(log: logging.Logger, args: argparse.Namespace) -> No
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def classify_error(exc: BaseException) -> str:
+    """Map an exception to a stable error class for skip/retry decisions."""
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "timeout"
+    text = str(exc).lower()
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    if "429" in text or "rate limit" in text or "secondary rate" in text:
+        return "rate_limit"
+    if any(
+        token in text
+        for token in (
+            "401",
+            "403",
+            "authentication",
+            "permission denied",
+            "access denied",
+            "bad credentials",
+            "invalid token",
+        )
+    ):
+        return "auth"
+    if "404" in text or "not found" in text or "does not exist" in text:
+        return "not_found"
+    if any(
+        token in text
+        for token in (
+            "no space left",
+            "disk quota",
+            "not enough space",
+            "errno 28",
+        )
+    ):
+        return "disk_full"
+    if any(
+        token in text
+        for token in (
+            "network",
+            "connection",
+            "could not resolve",
+            "temporary failure",
+            "tls",
+            "ssl",
+            "broken pipe",
+            "connection reset",
+            "unavailable",
+        )
+    ):
+        return "network"
+    return "unknown"
+
+
+def is_retryable_error_class(error_class: str) -> bool:
+    return error_class in RETRYABLE_ERROR_CLASSES
+
+
+def repo_row_key(org: str, repo: str) -> str:
+    return f"{org}/{repo}".strip("/")
+
+
+@dataclass
+class JobCheckpoint:
+    """Persist per-repo progress so interrupted runs can resume."""
+
+    run_dir: Path
+    total: int = 0
+    created_at: str = ""
+    updated_at: str = ""
+    status_by_key: dict[str, dict[str, Any]] = field(default_factory=dict)
+    rows_by_key: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def job_path(self) -> Path:
+        return self.run_dir / "job.json"
+
+    @property
+    def summary_path(self) -> Path:
+        return self.run_dir / "summary.csv"
+
+    @classmethod
+    def load_or_create(cls, run_dir: Path, total: int) -> "JobCheckpoint":
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        job = cls(run_dir=run_dir, total=total, created_at=stamp, updated_at=stamp)
+        if job.job_path.is_file():
+            try:
+                data = json.loads(job.job_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                data = {}
+            if isinstance(data, dict):
+                job.created_at = str(data.get("created_at") or stamp)
+                job.total = int(data.get("total") or total)
+                statuses = data.get("repos") or {}
+                if isinstance(statuses, dict):
+                    job.status_by_key = {
+                        str(key): value
+                        for key, value in statuses.items()
+                        if isinstance(value, dict)
+                    }
+        if job.summary_path.is_file():
+            with job.summary_path.open(newline="", encoding="utf-8") as handle:
+                for row in csv.DictReader(handle):
+                    org = str(row.get("org") or "")
+                    repo = str(row.get("repo") or "")
+                    if not org or not repo:
+                        continue
+                    key = repo_row_key(org, repo)
+                    job.rows_by_key[key] = dict(row)
+                    if key not in job.status_by_key:
+                        error = str(row.get("error") or "").strip()
+                        error_class = str(row.get("error_class") or "").strip()
+                        if not error_class and error:
+                            error_class = "unknown"
+                        job.status_by_key[key] = {
+                            "status": "failed" if error else "ok",
+                            "error_class": error_class,
+                            "updated_at": stamp,
+                        }
+        job.persist()
+        return job
+
+    def completed_ok_keys(self) -> set[str]:
+        return {
+            key
+            for key, meta in self.status_by_key.items()
+            if meta.get("status") == "ok"
+        }
+
+    def failed_keys(self, *, retryable_only: bool = False) -> set[str]:
+        failed: set[str] = set()
+        for key, meta in self.status_by_key.items():
+            if meta.get("status") != "failed":
+                continue
+            error_class = str(meta.get("error_class") or "unknown")
+            if retryable_only and not is_retryable_error_class(error_class):
+                continue
+            failed.add(key)
+        return failed
+
+    def record(self, full_name: str, row: dict[str, Any]) -> None:
+        key = full_name.strip("/")
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        error = str(row.get("error") or "").strip()
+        error_class = str(row.get("error_class") or "").strip()
+        status = "failed" if error else "ok"
+        with self._lock:
+            self.rows_by_key[key] = dict(row)
+            self.status_by_key[key] = {
+                "status": status,
+                "error_class": error_class,
+                "updated_at": stamp,
+            }
+            self.updated_at = stamp
+            self._write_summary_unlocked()
+            self._persist_unlocked()
+
+    def rows(self) -> list[dict[str, Any]]:
+        with self._lock:
+            values = list(self.rows_by_key.values())
+        values.sort(key=lambda r: (str(r.get("org")), str(r.get("repo"))))
+        return values
+
+    def persist(self) -> None:
+        with self._lock:
+            self._persist_unlocked()
+
+    def write_summary(self) -> None:
+        with self._lock:
+            self._write_summary_unlocked()
+
+    def replace_rows(self, rows: list[dict[str, Any]]) -> None:
+        with self._lock:
+            self.rows_by_key = {}
+            for row in rows:
+                key = repo_row_key(str(row.get("org") or ""), str(row.get("repo") or ""))
+                if key:
+                    self.rows_by_key[key] = dict(row)
+            self.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self._write_summary_unlocked()
+            self._persist_unlocked()
+
+    def progress_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            ok = sum(1 for m in self.status_by_key.values() if m.get("status") == "ok")
+            failed = sum(
+                1 for m in self.status_by_key.values() if m.get("status") == "failed"
+            )
+            by_class: dict[str, int] = {}
+            for meta in self.status_by_key.values():
+                if meta.get("status") != "failed":
+                    continue
+                error_class = str(meta.get("error_class") or "unknown")
+                by_class[error_class] = by_class.get(error_class, 0) + 1
+            return {
+                "total": self.total,
+                "ok": ok,
+                "failed": failed,
+                "done": ok + failed,
+                "error_classes": by_class,
+            }
+
+    def _persist_unlocked(self) -> None:
+        payload = {
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "total": self.total,
+            "progress": {
+                "ok": sum(
+                    1 for m in self.status_by_key.values() if m.get("status") == "ok"
+                ),
+                "failed": sum(
+                    1
+                    for m in self.status_by_key.values()
+                    if m.get("status") == "failed"
+                ),
+                "done": len(self.status_by_key),
+            },
+            "repos": self.status_by_key,
+        }
+        write_json(self.job_path, payload)
+
+    def _write_summary_unlocked(self) -> None:
+        rows = list(self.rows_by_key.values())
+        rows.sort(key=lambda r: (str(r.get("org")), str(r.get("repo"))))
+        with self.summary_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
 
 
 def is_bot_author(name: str, email: str = "") -> bool:
@@ -613,34 +964,124 @@ def fetch_gitlab_merged_mrs(
 # ── git / scc ───────────────────────────────────────────────────────────────
 
 
-def run_git(repo: Path, *args: str, timeout: int = 300) -> str:
+def run_git(
+    repo: Path,
+    *args: str,
+    timeout: int = 300,
+    log: logging.Logger | None = None,
+) -> str:
+    """Run a git command in ``repo``.
+
+    Always sets ``safe.directory=*`` so host-mounted clones remain readable inside
+    Docker when UID/GID ownership does not match the container user.
+    """
     proc = subprocess.run(
-        ["git", "-C", str(repo), *args],
+        [
+            "git",
+            "-c",
+            "safe.directory=*",
+            "-C",
+            str(repo),
+            *args,
+        ],
         capture_output=True,
         text=True,
         timeout=timeout,
     )
     if proc.returncode != 0:
+        if log is not None:
+            detail = (proc.stderr or proc.stdout or "git failed").strip()
+            log.warning("git %s failed in %s: %s", " ".join(args), repo, detail)
         return ""
     return proc.stdout
 
 
-def clone_repo(url: str, dest: Path, timeout: int = 900) -> None:
-    if dest.exists():
-        shutil.rmtree(dest, ignore_errors=True)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+def probe_local_git(repo: Path, log: logging.Logger) -> bool:
+    """Return True when git history is readable; log a clear warning otherwise."""
     proc = subprocess.run(
-        ["git", "clone", "--recurse-submodules=0", url, str(dest)],
+        [
+            "git",
+            "-c",
+            "safe.directory=*",
+            "-C",
+            str(repo),
+            "rev-list",
+            "--count",
+            "HEAD",
+        ],
         capture_output=True,
         text=True,
-        timeout=timeout,
-        env=env,
+        timeout=60,
     )
-    if proc.returncode != 0:
+    if proc.returncode == 0 and proc.stdout.strip().isdigit():
+        return True
+    detail = (proc.stderr or proc.stdout or "git failed").strip()
+    log.warning(
+        "Local git history unreadable at %s (%s). "
+        "If you see 'dubious ownership', the container cannot trust this mount; "
+        "this build marks safe.directory=* automatically — rebuild/restart the image, "
+        "or run: git config --global --add safe.directory '*'",
+        repo,
+        detail or "unknown error",
+    )
+    return False
+
+
+def clone_repo(
+    url: str,
+    dest: Path,
+    timeout: int = DEFAULT_CLONE_TIMEOUT_SECONDS,
+    retries: int = DEFAULT_CLONE_RETRIES,
+    log: logging.Logger | None = None,
+) -> None:
+    """Clone with a short timeout and a few retries, then move on to the next repo."""
+    attempts = max(1, retries + 1)
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+        try:
+            proc = subprocess.run(
+                ["git", "clone", "--recurse-submodules=0", url, str(dest)],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            shutil.rmtree(dest, ignore_errors=True)
+            last_error = RuntimeError(
+                f"clone timed out after {timeout}s (attempt {attempt}/{attempts})"
+            )
+            if log is not None:
+                log.warning("%s", last_error)
+            if attempt >= attempts:
+                raise last_error from exc
+            time.sleep(min(2**attempt, 20))
+            continue
+        if proc.returncode == 0:
+            return
         detail = proc.stderr or proc.stdout or "clone failed"
         detail = CLONE_CREDENTIAL_RE.sub(r"\1***:***@", detail)
-        raise RuntimeError(detail[-800:])
+        shutil.rmtree(dest, ignore_errors=True)
+        last_error = RuntimeError(detail[-800:])
+        error_class = classify_error(last_error)
+        # Auth / not-found will not improve with retries.
+        if error_class in {"auth", "not_found", "disk_full"} or attempt >= attempts:
+            raise last_error
+        if log is not None:
+            log.warning(
+                "clone failed (%s) attempt %s/%s; retrying: %s",
+                error_class,
+                attempt,
+                attempts,
+                str(last_error)[:200],
+            )
+        time.sleep(min(2**attempt, 20))
+    assert last_error is not None
+    raise last_error
 
 
 def github_clone_url(full_name: str, token: str, host: str) -> str:
@@ -1001,6 +1442,195 @@ def test_source_loc_pct(repo: Path) -> float | str:
     if source_loc <= 0:
         return ""
     return round(100.0 * test_loc / source_loc, 1)
+
+
+def _read_text_head(path: Path, limit: int = 12_000) -> str:
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as fh:
+            return fh.read(limit)
+    except OSError:
+        return ""
+
+
+def _license_text_is_oss(text: str) -> bool:
+    if not text.strip():
+        return False
+    has_oss = any(marker.search(text) for marker in OSS_LICENSE_MARKERS)
+    if not has_oss:
+        return False
+    # Reject proprietary wrappers that only mention OSS in passing.
+    proprietary_hits = sum(1 for marker in PROPRIETARY_LICENSE_MARKERS if marker.search(text))
+    if proprietary_hits and not re.search(
+        r"\b(?:licensed\s+under|released\s+under|permission\s+is\s+hereby\s+granted)\b",
+        text,
+        re.I,
+    ):
+        return False
+    return True
+
+
+def _spdx_ids_are_oss(spdx_value: str) -> bool:
+    # Support simple expressions: "MIT", "Apache-2.0 OR MIT"
+    tokens = re.split(r"[\s()]+", spdx_value.strip().lower())
+    ids = [t for t in tokens if t and t not in {"or", "and", "with"}]
+    if not ids:
+        return False
+    return all(token in OSS_SPDX_IDS for token in ids)
+
+
+def _file_has_oss_spdx(path: Path) -> bool:
+    head = _read_text_head(path, 4_096)
+    match = SPDX_LINE_RE.search(head)
+    if not match:
+        return False
+    return _spdx_ids_are_oss(match.group(1))
+
+
+def _collect_lockfile_backed_dep_roots(repo: Path) -> list[str]:
+    """Return repo-relative directory prefixes proven by package-manager lock/manifests."""
+    roots: list[str] = []
+    repo_files_lower = {p.name.lower() for p in repo.iterdir() if p.is_file()} if repo.is_dir() else set()
+
+    for dep_dir, markers in LOCKFILE_BACKED_DEP_DIRS:
+        target = repo / dep_dir
+        # Case variants: Pods vs pods, Vendor vs vendor
+        if not target.is_dir():
+            matches = [p for p in repo.iterdir() if p.is_dir() and p.name.lower() == dep_dir]
+            target = matches[0] if matches else target
+        if not target.is_dir():
+            continue
+        if repo_files_lower & {m.lower() for m in markers}:
+            roots.append(target.relative_to(repo).as_posix().rstrip("/") + "/")
+
+    # Nested package roots (monorepos): package.json + node_modules, composer + vendor
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [
+            d
+            for d in dirs
+            if d != ".git" and d.lower() not in {"node_modules", "vendor", "pods", ".venv", "venv"}
+        ]
+        files_lower = {name.lower() for name in files}
+        rel = Path(root).relative_to(repo)
+        for dep_dir, markers in LOCKFILE_BACKED_DEP_DIRS:
+            if not (files_lower & {m.lower() for m in markers}):
+                continue
+            dep_path = Path(root) / dep_dir
+            if not dep_path.is_dir():
+                continue
+            prefix = (
+                (rel / dep_dir).as_posix().rstrip("/") + "/"
+                if rel.as_posix() != "."
+                else dep_dir.rstrip("/") + "/"
+            )
+            roots.append(prefix)
+
+    carthage = repo / "Carthage" / "Checkouts"
+    if carthage.is_dir() and (repo_files_lower & CARTHAGE_MARKERS):
+        roots.append("Carthage/Checkouts/")
+    # Deduplicate longest-first for prefix checks
+    uniq = sorted({r.replace("\\", "/") for r in roots}, key=len, reverse=True)
+    return uniq
+
+
+def _collect_oss_license_roots(repo: Path) -> list[str]:
+    """Directories whose LICENSE/COPYING text matches a recognized OSS license."""
+    roots: list[str] = []
+    skip_dir_names = {
+        ".git",
+        "node_modules",
+        ".venv",
+        "venv",
+        "site-packages",
+        "dist",
+        "build",
+        "__pycache__",
+    }
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d not in skip_dir_names and not d.startswith(".")]
+        for filename in files:
+            if filename.lower() not in LICENSE_FILE_NAMES:
+                continue
+            path = Path(root) / filename
+            if not _license_text_is_oss(_read_text_head(path)):
+                continue
+            rel = Path(root).relative_to(repo).as_posix()
+            roots.append("" if rel == "." else rel.rstrip("/") + "/")
+    uniq = sorted({r.replace("\\", "/") for r in roots}, key=len, reverse=True)
+    return uniq
+
+
+def _dir_under_roots(rel_dir: str, roots: list[str]) -> bool:
+    """True if rel_dir ('' for repo root) is inside any root prefix.
+
+    Root '' means a repo-root OSS LICENSE covers the entire tree.
+    """
+    if not roots:
+        return False
+    if "" in roots:
+        return True
+    if not rel_dir or rel_dir == ".":
+        return False
+    prefix = rel_dir.replace("\\", "/").rstrip("/") + "/"
+    for root in roots:
+        if not root:
+            continue
+        r = root.replace("\\", "/")
+        if not r.endswith("/"):
+            r += "/"
+        if prefix.startswith(r) or prefix.rstrip("/") == r.rstrip("/"):
+            return True
+    return False
+
+
+def path_bucket_loc_pcts(repo: Path) -> dict[str, float | str]:
+    """LOC share for open-source (strong signals) vs library/framework/module paths.
+
+    Open Source LOC uses strong evidence only:
+      1) lockfile/manifest-backed dependency install trees (composer/npm/go/Pods/…)
+      2) subtrees with a recognized OSS LICENSE/COPYING file
+      3) files with SPDX-License-Identifier using a known OSS license id
+
+    Library/modules LOC still uses path segments (node_modules, lib, modules, …).
+
+    Denominator is all code-extension LOC under the checkout. Returns 0.0 when
+    measured with no matches; blank only if no code LOC is present.
+    """
+    dep_roots = _collect_lockfile_backed_dep_roots(repo)
+    license_roots = _collect_oss_license_roots(repo)
+
+    total = 0
+    open_source = 0
+    library_modules = 0
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [directory for directory in dirs if directory != ".git"]
+        rel_root = Path(root).relative_to(repo).as_posix().replace("\\", "/")
+        if rel_root == ".":
+            rel_root = ""
+        parts = {p for p in rel_root.lower().split("/") if p}
+        in_lib = bool(parts & LIBRARY_MODULE_DIR_NAMES)
+        under_dep = _dir_under_roots(rel_root, dep_roots)
+        under_license = _dir_under_roots(rel_root, license_roots)
+
+        for filename in files:
+            path = Path(root) / filename
+            if path.suffix.lower() not in CODE_LOC_EXTENSIONS:
+                continue
+            lines = _count_file_lines(path)
+            if lines <= 0:
+                continue
+            total += lines
+            if in_lib:
+                library_modules += lines
+            # SPDX check only when not already covered (avoids scanning every vendored file).
+            if under_dep or under_license or _file_has_oss_spdx(path):
+                open_source += lines
+
+    if total <= 0:
+        return {"open_source_loc_pct": "", "library_modules_loc_pct": ""}
+    return {
+        "open_source_loc_pct": round(100.0 * open_source / total, 1),
+        "library_modules_loc_pct": round(100.0 * library_modules / total, 1),
+    }
 
 
 def detect_library_code(repo: Path) -> bool:
@@ -1419,7 +2049,10 @@ def empty_summary_row(org: str, repo: str) -> dict[str, Any]:
             "has_test_runner": False,
             "has_ci_cd": False,
             "has_library_code": False,
+            "open_source_loc_pct": "",
+            "library_modules_loc_pct": "",
             "error": "",
+            "error_class": "",
         }
     )
     return row
@@ -1438,6 +2071,8 @@ def process_repo(
     github_host: str,
     gitlab_host: str,
     log: logging.Logger,
+    clone_timeout: int = DEFAULT_CLONE_TIMEOUT_SECONDS,
+    clone_retries: int = DEFAULT_CLONE_RETRIES,
 ) -> dict[str, Any]:
     org = target.org
     repo = target.full_name.split("/")[-1]
@@ -1500,6 +2135,7 @@ def process_repo(
         else:
             if target.local_path is None:
                 raise RuntimeError("Local repository path is missing")
+            probe_local_git(clone_path, log)
             row["repo_created_at"] = ""
             row["primary_language"] = ""
             row["size_kb"] = ""
@@ -1511,7 +2147,13 @@ def process_repo(
             row["contributor_count"] = 0
 
         if target.platform != "local":
-            clone_repo(clone_url, clone_path)
+            clone_repo(
+                clone_url,
+                clone_path,
+                timeout=clone_timeout,
+                retries=clone_retries,
+                log=log,
+            )
 
         git_stats = aggregate_git_stats(clone_path)
         write_json(git_dir / "git_stats.json", git_stats)
@@ -1554,6 +2196,10 @@ def process_repo(
         row["has_ci_cd"] = detect_ci_cd(clone_path)
         row["test_source_loc_pct"] = test_source_loc_pct(clone_path)
         row["has_library_code"] = detect_library_code(clone_path)
+        path_pcts = path_bucket_loc_pcts(clone_path)
+        row["open_source_loc_pct"] = path_pcts["open_source_loc_pct"]
+        row["library_modules_loc_pct"] = path_pcts["library_modules_loc_pct"]
+        write_json(git_dir / "loc_path_pcts.json", path_pcts)
         if llm_config is not None:
             try:
                 row.update(run_llm_analysis(clone_path, row, llm_config))
@@ -1571,7 +2217,13 @@ def process_repo(
         )
     except Exception as exc:
         row["error"] = str(exc)[:500]
-        log.exception("FAIL %s: %s", target.full_name, row["error"])
+        row["error_class"] = classify_error(exc)
+        log.exception(
+            "FAIL %s [%s]: %s",
+            target.full_name,
+            row["error_class"],
+            row["error"],
+        )
         if target.platform != "local":
             shutil.rmtree(clone_path, ignore_errors=True)
 
@@ -1585,8 +2237,86 @@ def zip_run_dir(run_dir: Path) -> Path:
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for path in run_dir.rglob("*"):
             if path.is_file():
+                # Keep the live clone cache out of the deliverable archive.
+                if "clones/" in path.relative_to(run_dir).as_posix():
+                    continue
                 zf.write(path, path.relative_to(run_dir.parent).as_posix())
     return zip_path
+
+
+def serialize_targets(targets: list[RepoTarget]) -> list[dict[str, Any]]:
+    return [
+        {
+            "platform": target.platform,
+            "org": target.org,
+            "full_name": target.full_name,
+            "meta": target.meta,
+            "local_path": str(target.local_path) if target.local_path else None,
+        }
+        for target in targets
+    ]
+
+
+def load_targets_from_repos_json(path: Path) -> list[RepoTarget] | None:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    targets: list[RepoTarget] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        full_name = str(item.get("full_name") or "").strip()
+        org = str(item.get("org") or "").strip()
+        platform = str(item.get("platform") or "").strip()
+        if not full_name or not org or not platform:
+            continue
+        local_raw = item.get("local_path")
+        local_path = Path(local_raw) if local_raw else None
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        targets.append(
+            RepoTarget(
+                platform=platform,
+                org=org,
+                full_name=full_name,
+                meta=meta,
+                local_path=local_path,
+            )
+        )
+    return targets or None
+
+
+def filter_targets_for_resume(
+    targets: list[RepoTarget],
+    checkpoint: JobCheckpoint,
+    *,
+    retry_failed: bool,
+    retry_all_failed: bool,
+) -> tuple[list[RepoTarget], int, int]:
+    """Return (to_process, skipped_ok, skipped_failed)."""
+    ok_keys = checkpoint.completed_ok_keys()
+    failed_keys = checkpoint.failed_keys(retryable_only=not retry_all_failed)
+    all_failed_keys = checkpoint.failed_keys(retryable_only=False)
+    to_process: list[RepoTarget] = []
+    skipped_ok = 0
+    skipped_failed = 0
+    for target in targets:
+        key = target.full_name.strip("/")
+        if key in ok_keys:
+            skipped_ok += 1
+            continue
+        if key in all_failed_keys:
+            if retry_failed and key in failed_keys:
+                to_process.append(target)
+            else:
+                skipped_failed += 1
+            continue
+        to_process.append(target)
+    return to_process, skipped_ok, skipped_failed
 
 
 def resolve_github_token(
@@ -1807,6 +2537,40 @@ def main() -> int:
         "--output-dir", type=Path, default=CODING / "outputs" / "raw-extracts"
     )
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--clone-timeout",
+        type=int,
+        default=DEFAULT_CLONE_TIMEOUT_SECONDS,
+        help=(
+            "Seconds before a git clone is aborted (default: "
+            f"{DEFAULT_CLONE_TIMEOUT_SECONDS}). Failed clones are skipped so the run continues."
+        ),
+    )
+    parser.add_argument(
+        "--clone-retries",
+        type=int,
+        default=DEFAULT_CLONE_RETRIES,
+        help=(
+            "Extra clone attempts after a timeout/network failure "
+            f"(default: {DEFAULT_CLONE_RETRIES})."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="Resume an interrupted run directory (skips repos already marked OK in summary.csv)",
+    )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="With --resume, re-process failed repos (retryable errors by default; see --retry-all-failed)",
+    )
+    parser.add_argument(
+        "--retry-all-failed",
+        action="store_true",
+        help="With --resume --retry-failed, retry every failed repo, not only timeout/network/rate-limit",
+    )
     parser.add_argument("--github-host", default=os.environ.get("GITHUB_HOST", "github.com"))
     parser.add_argument("--gitlab-host", default=os.environ.get("GITLAB_HOST", "gitlab.com"))
     parser.add_argument(
@@ -1915,7 +2679,24 @@ def main() -> int:
         serve(host=args.ui_host, port=args.ui_port)
         return 0
 
-    if args.offline and not args.local_repos_dir:
+    if args.retry_failed and not args.resume:
+        raise SystemExit("--retry-failed requires --resume")
+    if args.clone_timeout < 30:
+        raise SystemExit("--clone-timeout must be at least 30 seconds")
+    if args.clone_retries < 0:
+        raise SystemExit("--clone-retries must be >= 0")
+
+    resume_dir: Path | None = None
+    resumed_targets: list[RepoTarget] | None = None
+    if args.resume:
+        resume_dir = args.resume.expanduser().resolve()
+        if not resume_dir.is_dir():
+            raise SystemExit(f"--resume directory not found: {resume_dir}")
+        resumed_targets = load_targets_from_repos_json(resume_dir / "repos.json")
+        if resumed_targets and all(t.platform == "local" for t in resumed_targets):
+            args.offline = True
+
+    if args.offline and not args.local_repos_dir and resumed_targets is None:
         raise SystemExit("--offline requires --local-repos-dir")
     if args.offline and (
         args.github_org
@@ -1981,44 +2762,80 @@ def main() -> int:
     else:
         github_token_name = args.github_token_name
 
-    if args.offline:
-        targets = find_local_repositories(args.local_repos_dir.resolve())
-        if args.local_repo:
-            targets = filter_local_targets(targets, args.local_repo)
-    else:
-        targets = build_targets(
-            args,
-            tokens,
-            github_token_name,
-            args.gitlab_token_name,
-            github_token_fn=github_token_fn,
-        )
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    if args.offline:
-        label = args.local_repos_dir.name
-    elif args.github_org:
-        label = args.github_org[0]
-    elif args.gitlab_group:
-        label = args.gitlab_group[0]
-    elif args.github_accessible:
-        label = "github-accessible"
-    elif args.gitlab_accessible:
-        label = "gitlab-accessible"
-    elif args.github_repo:
-        label = args.github_repo[0].replace("/", "_")
-    elif args.gitlab_repo:
-        label = args.gitlab_repo[0].replace("/", "_")
-    else:
-        label = "repos"
+    all_targets: list[RepoTarget] | None = resumed_targets
 
-    run_dir = args.output_dir / f"raw-extract-{safe_name(label)}-{stamp}"
+    if all_targets is None:
+        if args.offline:
+            all_targets = find_local_repositories(args.local_repos_dir.resolve())
+            if args.local_repo:
+                all_targets = filter_local_targets(all_targets, args.local_repo)
+        else:
+            all_targets = build_targets(
+                args,
+                tokens,
+                github_token_name,
+                args.gitlab_token_name,
+                github_token_fn=github_token_fn,
+            )
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if resume_dir is not None:
+        run_dir = resume_dir
+        # Prefer the original stamp from the folder name when present.
+        stamp = run_dir.name.rsplit("-", 1)[-1] if "-" in run_dir.name else stamp
+    else:
+        if args.offline:
+            label = args.local_repos_dir.name
+        elif args.github_org:
+            label = args.github_org[0]
+        elif args.gitlab_group:
+            label = args.gitlab_group[0]
+        elif args.github_accessible:
+            label = "github-accessible"
+        elif args.gitlab_accessible:
+            label = "gitlab-accessible"
+        elif args.github_repo:
+            label = args.github_repo[0].replace("/", "_")
+        elif args.gitlab_repo:
+            label = args.gitlab_repo[0].replace("/", "_")
+        else:
+            label = "repos"
+        run_dir = args.output_dir / f"raw-extract-{safe_name(label)}-{stamp}"
+
     clones_dir = run_dir / "clones"
     logs_dir = run_dir / "logs"
     run_dir.mkdir(parents=True, exist_ok=True)
     clones_dir.mkdir(parents=True, exist_ok=True)
 
     log = setup_logger(logs_dir / "extract.log")
-    log.info("Extracting %s repos → %s", len(targets), run_dir)
+    # Emit early so the UI can offer partial downloads while the run is active.
+    print(f"JOB_DIR={run_dir}", flush=True)
+    log.info("JOB_DIR=%s", run_dir)
+
+    checkpoint = JobCheckpoint.load_or_create(run_dir, total=len(all_targets))
+    targets, skipped_ok, skipped_failed = filter_targets_for_resume(
+        all_targets,
+        checkpoint,
+        retry_failed=bool(args.retry_failed),
+        retry_all_failed=bool(args.retry_all_failed),
+    )
+    if resume_dir is not None:
+        log.info(
+            "Resume mode: %s pending, skipped_ok=%s skipped_failed=%s retry_failed=%s",
+            len(targets),
+            skipped_ok,
+            skipped_failed,
+            bool(args.retry_failed),
+        )
+
+    log.info("Extracting %s repos → %s", len(all_targets), run_dir)
+    log.info(
+        "This pass will process %s repos (clone_timeout=%ss clone_retries=%s workers=%s)",
+        len(targets),
+        args.clone_timeout,
+        args.clone_retries,
+        args.workers,
+    )
     log_runtime_diagnostics(log, args)
     if args.offline:
         log.info("Mode: offline local-clone analysis; no network requests will be made")
@@ -2043,53 +2860,64 @@ def main() -> int:
         logs_dir / "failures.json",
     )
 
-    write_json(
-        run_dir / "repos.json",
-        [
-            {"platform": t.platform, "org": t.org, "full_name": t.full_name}
-            for t in targets
-        ],
-    )
+    write_json(run_dir / "repos.json", serialize_targets(all_targets))
+    checkpoint.total = len(all_targets)
+    checkpoint.persist()
+    checkpoint.write_summary()
 
-    rows: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        futures = {
-            pool.submit(
-                process_repo,
-                t,
-                tokens=tokens,
-                github_token_name=github_token_name,
-                gitlab_token_name=args.gitlab_token_name,
-                github_token_fn=github_token_fn,
-                llm_config=llm_config,
-                run_dir=run_dir,
-                clones_dir=clones_dir,
-                github_host=args.github_host,
-                gitlab_host=args.gitlab_host,
-                log=log,
-            ): t
-            for t in targets
-        }
-        for fut in as_completed(futures):
-            try:
-                rows.append(fut.result())
-            except Exception:
-                log.exception("Worker crashed while collecting a repository result")
-                raise
+    if not targets:
+        log.info("Nothing left to process; refreshing final artifacts from checkpoint")
+    else:
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            futures = {
+                pool.submit(
+                    process_repo,
+                    t,
+                    tokens=tokens,
+                    github_token_name=github_token_name,
+                    gitlab_token_name=args.gitlab_token_name,
+                    github_token_fn=github_token_fn,
+                    llm_config=llm_config,
+                    run_dir=run_dir,
+                    clones_dir=clones_dir,
+                    github_host=args.github_host,
+                    gitlab_host=args.gitlab_host,
+                    log=log,
+                    clone_timeout=args.clone_timeout,
+                    clone_retries=args.clone_retries,
+                ): t
+                for t in targets
+            }
+            for fut in as_completed(futures):
+                target = futures[fut]
+                try:
+                    row = fut.result()
+                except Exception as exc:
+                    log.exception("Worker crashed while collecting a repository result")
+                    row = empty_summary_row(target.org, target.full_name.split("/")[-1])
+                    row["error"] = f"worker crash: {exc}"[:500]
+                    row["error_class"] = classify_error(exc)
+                checkpoint.record(target.full_name, row)
+                progress = checkpoint.progress_snapshot()
+                log.info(
+                    "Progress %s/%s ok=%s failed=%s",
+                    progress["done"],
+                    progress["total"],
+                    progress["ok"],
+                    progress["failed"],
+                )
 
-    rows.sort(key=lambda r: (str(r.get("org")), str(r.get("repo"))))
+    rows = checkpoint.rows()
     apply_company_periods(rows)
-    summary_path = run_dir / "summary.csv"
-    with summary_path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=SUMMARY_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+    checkpoint.replace_rows(rows)
 
+    summary_path = checkpoint.summary_path
     failures = [
         {
             "org": row.get("org"),
             "repo": row.get("repo"),
             "error": row.get("error"),
+            "error_class": row.get("error_class"),
         }
         for row in rows
         if row.get("error")
@@ -2097,11 +2925,17 @@ def main() -> int:
     write_json(logs_dir / "failures.json", failures)
     if failures:
         log.error("Repository failures: %s of %s", len(failures), len(rows))
+        by_class: dict[str, int] = {}
+        for failure in failures:
+            error_class = str(failure.get("error_class") or "unknown")
+            by_class[error_class] = by_class.get(error_class, 0) + 1
+        log.error("Failure classes: %s", by_class)
         for failure in failures[:50]:
             log.error(
-                "Failed repo %s/%s: %s",
+                "Failed repo %s/%s [%s]: %s",
                 failure.get("org"),
                 failure.get("repo"),
+                failure.get("error_class") or "unknown",
                 failure.get("error"),
             )
         if len(failures) > 50:
@@ -2111,20 +2945,32 @@ def main() -> int:
         "If you need help debugging this run, send these files to support:\n"
         f"- {logs_dir / 'extract.log'}\n"
         f"- {logs_dir / 'failures.json'}\n"
+        f"- {run_dir / 'job.json'}\n"
         f"- {run_dir / 'manifest.json'}\n"
         "Do not send your tokens file or API keys.\n"
+        "\n"
+        "To continue an interrupted or partial run:\n"
+        f"  python extract_org_raw_data.py --resume {run_dir}\n"
+        "To retry timeout/network/rate-limit failures:\n"
+        f"  python extract_org_raw_data.py --resume {run_dir} --retry-failed\n"
     )
     (logs_dir / "SUPPORT.txt").write_text(support_note, encoding="utf-8")
     log.info("Wrote support note: %s", logs_dir / "SUPPORT.txt")
 
     shutil.rmtree(clones_dir, ignore_errors=True)
 
+    progress = checkpoint.progress_snapshot()
     manifest = {
         "created_at": stamp,
-        "repos": len(targets),
-        "ok": sum(1 for r in rows if not r.get("error")),
-        "failed": sum(1 for r in rows if r.get("error")),
+        "repos": len(all_targets),
+        "ok": progress["ok"],
+        "failed": progress["failed"],
+        "error_classes": progress.get("error_classes") or {},
         "summary_csv": str(summary_path),
+        "job_json": str(checkpoint.job_path),
+        "resumable": True,
+        "clone_timeout_seconds": args.clone_timeout,
+        "clone_retries": args.clone_retries,
         "support_logs": {
             "extract_log": str(logs_dir / "extract.log"),
             "failures_json": str(logs_dir / "failures.json"),
@@ -2186,6 +3032,15 @@ def main() -> int:
             "has_library_code": (
                 "Library folders or publishable package/class-library manifests."
             ),
+            "open_source_loc_pct": (
+                "Share of code LOC with strong OSS evidence: lockfile-backed "
+                "dependency trees, recognized OSS LICENSE/COPYING text, or "
+                "SPDX-License-Identifier with a known OSS license."
+            ),
+            "library_modules_loc_pct": (
+                "Share of code LOC under library/framework/module path segments "
+                "(node_modules, lib, modules, frameworks, …)."
+            ),
             "company_period": (
                 "Earliest first_commit year through latest last_commit year "
                 "across all repos in the same org/group."
@@ -2196,6 +3051,17 @@ def main() -> int:
     zip_path = zip_run_dir(run_dir)
     log.info("Done. summary=%s", summary_path)
     log.info("Zip=%s", zip_path)
+    if failures:
+        log.info(
+            "Completed with errors. Resume pending repos with: "
+            "python extract_org_raw_data.py --resume %s",
+            run_dir,
+        )
+        log.info(
+            "Retry timeout/network/rate-limit failures with: "
+            "python extract_org_raw_data.py --resume %s --retry-failed",
+            run_dir,
+        )
     print(
         json.dumps(
             {"run_dir": str(run_dir), "zip": str(zip_path), **manifest},

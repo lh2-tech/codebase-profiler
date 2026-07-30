@@ -17,23 +17,64 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
+# Transient API failures worth retrying (rate limits + gateway blips).
+_RETRYABLE_HTTP = frozenset({429, 502, 503, 504})
+_DEFAULT_HTTP_RETRIES = 6
 
-def http_get_json(url: str, headers: dict[str, str]) -> tuple[Any, dict[str, str]]:
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            body = resp.read().decode("utf-8")
-            hdrs = {k: v for k, v in resp.headers.items()}
-            return (json.loads(body) if body else None), hdrs
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} for {url}: {detail}") from exc
+
+def _retry_after_seconds(exc: urllib.error.HTTPError, attempt: int) -> float:
+    """Prefer Retry-After / rate-limit reset; otherwise exponential backoff."""
+    raw = exc.headers.get("Retry-After") if exc.headers else None
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            pass
+    reset = exc.headers.get("X-RateLimit-Reset") if exc.headers else None
+    if reset:
+        try:
+            delay = int(reset) - int(time.time())
+            if delay > 0:
+                return float(min(delay + 1, 120))
+        except ValueError:
+            pass
+    return float(min(2**attempt, 60))
+
+
+def http_get_json(
+    url: str,
+    headers: dict[str, str],
+    *,
+    retries: int = _DEFAULT_HTTP_RETRIES,
+) -> tuple[Any, dict[str, str]]:
+    last_error: Exception | None = None
+    for attempt in range(retries):
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                body = resp.read().decode("utf-8")
+                hdrs = {k: v for k, v in resp.headers.items()}
+                return (json.loads(body) if body else None), hdrs
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            last_error = RuntimeError(f"HTTP {exc.code} for {url}: {detail}")
+            if exc.code not in _RETRYABLE_HTTP or attempt >= retries - 1:
+                raise last_error from exc
+            time.sleep(_retry_after_seconds(exc, attempt))
+        except (TimeoutError, urllib.error.URLError) as exc:
+            last_error = RuntimeError(f"Network error for {url}: {exc}")
+            if attempt >= retries - 1:
+                raise last_error from exc
+            time.sleep(float(min(2**attempt, 30)))
+    assert last_error is not None
+    raise last_error
 
 
 def paginate_github(url: str, token: str) -> list[Any]:
@@ -152,15 +193,33 @@ def github_graphql(token: str, host: str = "github.com") -> str:
     return "https://api.github.com/graphql" if host == "github.com" else f"https://{host}/api/graphql"
 
 
-def http_post_json(url: str, headers: dict[str, str], payload: dict[str, Any]) -> Any:
+def http_post_json(
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    *,
+    retries: int = _DEFAULT_HTTP_RETRIES,
+) -> Any:
     body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} for {url}: {detail}") from exc
+    last_error: Exception | None = None
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            last_error = RuntimeError(f"HTTP {exc.code} for {url}: {detail}")
+            if exc.code not in _RETRYABLE_HTTP or attempt >= retries - 1:
+                raise last_error from exc
+            time.sleep(_retry_after_seconds(exc, attempt))
+        except (TimeoutError, urllib.error.URLError) as exc:
+            last_error = RuntimeError(f"Network error for {url}: {exc}")
+            if attempt >= retries - 1:
+                raise last_error from exc
+            time.sleep(float(min(2**attempt, 30)))
+    assert last_error is not None
+    raise last_error
 
 
 def count_github_merged(

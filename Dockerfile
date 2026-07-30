@@ -35,7 +35,10 @@ ENV EXTRACT_UI_DOCKER=1 \
     DEFAULT_LOCAL_REPOS_DIR=/data/repos \
     DEFAULT_TOKENS_FILE=/app/tokens \
     HOST_OUTPUT_HINT=./outputs/raw-extracts \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    GIT_CONFIG_COUNT=1 \
+    GIT_CONFIG_KEY_0=safe.directory \
+    GIT_CONFIG_VALUE_0=*
 
 EXPOSE 8766
 

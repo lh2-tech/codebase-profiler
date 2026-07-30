@@ -44,6 +44,7 @@ from extract_org_raw_data import (  # noqa: E402
     list_gitlab_groups_for_token,
     list_gitlab_projects_for_group,
     parse_tokens_file,
+    zip_run_dir,
 )
 
 STATE: dict[str, Any] = {
@@ -166,6 +167,7 @@ def build_support_bundle() -> Path:
                 "logs/failures.json",
                 "logs/SUPPORT.txt",
                 "manifest.json",
+                "job.json",
                 "repos.json",
                 "summary.csv",
             ):
@@ -236,9 +238,7 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
     manual = parse_repo_selectors(fields.get("manual_repos", [""])[0])
     return {
         "mode": fields.get("mode", ["offline"])[0],
-        "local_repos_dir": fields.get("local_repos_dir", [""])[0].strip(),
         "hosted_platform": fields.get("hosted_platform", ["github"])[0],
-        "tokens_file": fields.get("tokens_file", ["tokens"])[0].strip() or "tokens",
         "github_org": fields.get("github_org", [""])[0].strip(),
         "github_token_name": fields.get("github_token_name", ["data-lh2-github-token"])[0].strip()
         or "data-lh2-github-token",
@@ -247,6 +247,8 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
         "gitlab_token_name": fields.get("gitlab_token_name", ["gitlab_token"])[0].strip()
         or "gitlab_token",
         "workers": fields.get("workers", ["4"])[0].strip() or "4",
+        "retry_failed": fields.get("retry_failed", [""])[0] == "on",
+        "resume_run_dir": fields.get("resume_run_dir", [""])[0].strip(),
         "llm_enabled": llm_enabled,
         "selected_repos": "\n".join(selected),
         "manual_repos": "\n".join(manual),
@@ -256,7 +258,7 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
 
 
 def read_token_from_fields(fields: dict[str, list[str]], platform: str) -> str:
-    tokens_file = Path(fields.get("tokens_file", ["tokens"])[0].strip() or "tokens")
+    tokens_file = Path(default_tokens_file())
     if not tokens_file.is_file():
         raise ValueError(f"Tokens file not found: {tokens_file}")
     tokens = parse_tokens_file(tokens_file)
@@ -283,11 +285,12 @@ def is_under_archive(path: Path) -> bool:
     return resolved == archive_root or archive_root in resolved.parents
 
 
-def compute_progress(log_lines: list[str]) -> dict[str, Any]:
+def compute_progress(log_lines: list[str], run_dir: str | None = None) -> dict[str, Any]:
     total = 0
     completed = 0
     failed = 0
     current = ""
+    error_classes: dict[str, int] = {}
     for line in log_lines:
         match = re.search(r"Extracting (\d+) repos", line)
         if match:
@@ -298,6 +301,32 @@ def compute_progress(log_lines: list[str]) -> dict[str, Any]:
         elif "FAIL " in line:
             failed += 1
             current = line.split("FAIL ", 1)[1].split(":", 1)[0].strip()
+            class_match = re.search(r"FAIL \S+ \[([^\]]+)\]", line)
+            if class_match:
+                error_class = class_match.group(1)
+                error_classes[error_class] = error_classes.get(error_class, 0) + 1
+    # Prefer durable job.json progress when available (survives UI refresh).
+    if run_dir:
+        job_path = Path(run_dir) / "job.json"
+        if job_path.is_file():
+            try:
+                payload = json.loads(job_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            if isinstance(payload, dict):
+                total = int(payload.get("total") or total or 0)
+                progress = payload.get("progress") or {}
+                if isinstance(progress, dict):
+                    completed = int(progress.get("ok") or completed)
+                    failed = int(progress.get("failed") or failed)
+                repos = payload.get("repos") or {}
+                if isinstance(repos, dict):
+                    error_classes = {}
+                    for meta in repos.values():
+                        if not isinstance(meta, dict) or meta.get("status") != "failed":
+                            continue
+                        error_class = str(meta.get("error_class") or "unknown")
+                        error_classes[error_class] = error_classes.get(error_class, 0) + 1
     done = completed + failed
     percent = int((done / total) * 100) if total else 0
     return {
@@ -307,7 +336,81 @@ def compute_progress(log_lines: list[str]) -> dict[str, Any]:
         "done": done,
         "percent": percent,
         "current": current,
+        "error_classes": error_classes,
     }
+
+
+def find_resumable_runs(limit: int = 8) -> list[dict[str, Any]]:
+    """List recent run folders that still have pending or failed repos."""
+    if not DEFAULT_OUTPUT.is_dir():
+        return []
+    runs: list[dict[str, Any]] = []
+    candidates = sorted(
+        DEFAULT_OUTPUT.glob("raw-extract-*"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for run_dir in candidates:
+        if not run_dir.is_dir():
+            continue
+        job_path = run_dir / "job.json"
+        summary_path = run_dir / "summary.csv"
+        repos_path = run_dir / "repos.json"
+        if not repos_path.is_file():
+            continue
+        total = 0
+        ok = 0
+        failed = 0
+        if job_path.is_file():
+            try:
+                payload = json.loads(job_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            if isinstance(payload, dict):
+                total = int(payload.get("total") or 0)
+                progress = payload.get("progress") or {}
+                if isinstance(progress, dict):
+                    ok = int(progress.get("ok") or 0)
+                    failed = int(progress.get("failed") or 0)
+        if total <= 0 and repos_path.is_file():
+            try:
+                repos = json.loads(repos_path.read_text(encoding="utf-8"))
+                total = len(repos) if isinstance(repos, list) else 0
+            except (OSError, json.JSONDecodeError):
+                total = 0
+        pending = max(total - ok - failed, 0)
+        if pending == 0 and failed == 0:
+            continue
+        runs.append(
+            {
+                "run_dir": str(run_dir),
+                "name": run_dir.name,
+                "total": total,
+                "ok": ok,
+                "failed": failed,
+                "pending": pending,
+                "has_summary": summary_path.is_file(),
+                "mtime": run_dir.stat().st_mtime,
+            }
+        )
+        if len(runs) >= limit:
+            break
+    return runs
+
+
+def maybe_capture_job_dir(line: str) -> None:
+    text = line.strip()
+    if not text.startswith("JOB_DIR="):
+        return
+    run_dir = Path(text.split("=", 1)[1].strip())
+    if not run_dir.is_dir() or not is_under_archive(run_dir):
+        return
+    summary = run_dir / "summary.csv"
+    set_state(
+        run_dir=str(run_dir),
+        summary_path=str(summary) if summary.is_file() else STATE.get("summary_path"),
+        output_dir=str(DEFAULT_OUTPUT.resolve()),
+    )
 
 
 def open_output_folder(output_dir: Path) -> dict[str, Any]:
@@ -428,9 +531,17 @@ def finalize_run_state(log_lines: list[str], returncode: int) -> None:
     if manifest.get("zip"):
         zip_path = Path(manifest["zip"])
 
+    if run_dir and not summary_path:
+        candidate = Path(run_dir) / "summary.csv"
+        if candidate.is_file():
+            summary_path = candidate
     xlsx_path = csv_to_xlsx(summary_path) if summary_path else None
-    phase = "completed" if returncode == 0 else "failed"
-    if summary_path and returncode != 0:
+    # Exit code 2 means some repos failed — still a usable partial/complete extract.
+    if returncode == 0:
+        phase = "completed"
+    elif summary_path and returncode == 2:
+        phase = "completed"
+    else:
         phase = "failed"
 
     set_state(
@@ -493,6 +604,7 @@ def run_extraction(command: list[str], env_overrides: dict[str, str] | None = No
         assert proc.stdout is not None
         for line in proc.stdout:
             add_log(line)
+            maybe_capture_job_dir(line)
         returncode = proc.wait()
         with LOCK:
             log_lines = list(STATE["log"])
@@ -532,25 +644,34 @@ def is_docker_mode() -> bool:
     return os.environ.get("EXTRACT_UI_DOCKER", "").strip().lower() in {"1", "true", "yes"}
 
 
+def default_local_repos_dir() -> str:
+    docker_mode = is_docker_mode()
+    return os.environ.get(
+        "DEFAULT_LOCAL_REPOS_DIR",
+        "/data/repos" if docker_mode else str((ROOT / "repos").resolve()),
+    )
+
+
+def default_tokens_file() -> str:
+    docker_mode = is_docker_mode()
+    return os.environ.get(
+        "DEFAULT_TOKENS_FILE",
+        "/app/tokens" if docker_mode else str((ROOT / "tokens").resolve()),
+    )
+
+
 def page() -> str:
     docker_mode = is_docker_mode()
-    default_local = os.environ.get(
-        "DEFAULT_LOCAL_REPOS_DIR",
-        "/data/repos" if docker_mode else "",
-    )
-    default_tokens = os.environ.get(
-        "DEFAULT_TOKENS_FILE",
-        "/app/tokens" if docker_mode else "tokens",
-    )
-    local_placeholder = "/data/repos" if docker_mode else "/Users/me/Repositories"
+    default_local = default_local_repos_dir()
+    default_tokens = default_tokens_file()
+    host_repos_hint = os.environ.get("HOST_REPOS_HINT", "./repos")
     docker_notice = ""
     if docker_mode:
         docker_notice = (
-            '<p class="notice"><strong>Docker mode:</strong> use container paths such as '
-            '<code>/data/repos</code> for offline clones and <code>/app/tokens</code> for the '
-            "token file. Results are written to the mounted <code>./outputs</code> folder on "
-            "your computer. Use Download buttons or open <code>outputs/raw-extracts</code> on "
-            "your computer."
+            '<p class="notice"><strong>Docker mode:</strong> put credentials in the mounted '
+            '<code>tokens</code> file on your computer, and put offline clones in the folder '
+            f"mapped by <code>LOCAL_REPOS_DIR</code> (default <code>{escape(host_repos_hint)}</code>). "
+            "Results are written to <code>./outputs/raw-extracts</code>."
             "</p>"
         )
     return """<!doctype html>
@@ -558,50 +679,76 @@ def page() -> str:
 <title>Repository Evidence Extractor</title>
 <link rel="icon" href="/logo.svg" type="image/svg+xml">
 <style>
-  :root { color-scheme: light; font-family: Inter, system-ui, sans-serif; color:#172033; background:#f4f7fb; }
-  body { margin:0; } main { max-width:900px; margin:0 auto; padding:34px 22px 54px; }
+  :root {
+    color-scheme: dark;
+    font-family: Inter, system-ui, sans-serif;
+    color: #e8edf7;
+    background: #0b1220;
+    --bg: #0b1220;
+    --surface: #141c2c;
+    --surface-2: #1a2438;
+    --border: #2a364d;
+    --border-strong: #3b4a66;
+    --text: #e8edf7;
+    --muted: #9aa8c0;
+    --accent: #3b82f6;
+    --accent-soft: #1e3a5f;
+    --danger: #f87171;
+    --danger-soft: #7f1d1d;
+    --good: #4ade80;
+  }
+  body { margin:0; background:var(--bg); color:var(--text); }
+  main { max-width:900px; margin:0 auto; padding:34px 22px 54px; }
   .brand { display:flex; align-items:center; gap:18px; margin-bottom:8px; }
   .brand-logo { height:48px; width:auto; flex-shrink:0; }
-  h1 { margin:0; font-size:28px; } .lead { color:#536078; margin:8px 0 28px; }
-  .req { color:#b91c1c; margin-left:3px; }
-  input.invalid, select.invalid, textarea.invalid { border-color:#b91c1c; box-shadow:0 0 0 2px #fecaca; }
-  .card { background:#fff; border:1px solid #dce3ef; border-radius:14px; padding:22px; margin:16px 0; box-shadow:0 2px 10px #1820330a; }
+  h1 { margin:0; font-size:28px; color:var(--text); }
+  .lead { color:var(--muted); margin:8px 0 28px; }
+  .req { color:var(--danger); margin-left:3px; }
+  input.invalid, select.invalid, textarea.invalid { border-color:var(--danger); box-shadow:0 0 0 2px var(--danger-soft); }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:22px; margin:16px 0; box-shadow:0 8px 24px #00000040; }
   .choices { display:grid; grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); gap:10px; }
-  label.choice { border:1px solid #dce3ef; border-radius:10px; padding:13px; display:block; cursor:pointer; }
-  label.choice:has(input:checked) { border-color:#2563eb; background:#eff6ff; }
-  .small { font-size:13px; color:#66758d; display:block; margin-top:5px; }
-  label.field { display:block; font-weight:600; margin:13px 0 5px; }
-  input, select { box-sizing:border-box; width:100%; padding:10px; border:1px solid #bdc9dc; border-radius:8px; font:inherit; background:#fff; }
-  input[type="checkbox"], input[type="radio"] { width:auto; padding:0; margin:0 7px 0 0; vertical-align:middle; }
-  .hidden { display:none; } button { border:0; border-radius:8px; background:#1d4ed8; color:#fff; font-weight:700; padding:11px 17px; cursor:pointer; margin-top:18px; }
-  button:disabled { background:#97a5bb; cursor:not-allowed; } .notice { color:#536078; font-size:14px; }
-  pre { white-space:pre-wrap; word-break:break-word; background:#111827; color:#d1fae5; border-radius:9px; padding:15px; min-height:160px; max-height:420px; overflow:auto; }
-  .status { font-weight:700; } .good { color:#15803d; } .bad { color:#b91c1c; }
-  .warning { color:#b91c1c; font-weight:700; font-size:14px; margin-top:10px; }
-  .csv-scroll { max-height:560px; overflow:auto; margin-top:12px; border:1px solid #dce3ef; border-radius:9px; }
-  .csv-scroll table { margin:0 !important; min-width:max-content; }
-  .csv-scroll th { position:sticky; top:0; background:#eff6ff; }
+  label.choice { border:1px solid var(--border); border-radius:10px; padding:13px; display:block; cursor:pointer; background:var(--surface-2); }
+  label.choice:has(input:checked) { border-color:var(--accent); background:var(--accent-soft); }
+  .small { font-size:13px; color:var(--muted); display:block; margin-top:5px; }
+  label.field { display:block; font-weight:600; margin:13px 0 5px; color:var(--text); }
+  input, select { box-sizing:border-box; width:100%; padding:10px; border:1px solid var(--border-strong); border-radius:8px; font:inherit; background:var(--surface-2); color:var(--text); }
+  input::placeholder, textarea::placeholder { color:#6b7a94; }
+  option { background:var(--surface); color:var(--text); }
+  input[type="checkbox"], input[type="radio"] { width:auto; padding:0; margin:0 7px 0 0; vertical-align:middle; accent-color:var(--accent); }
+  .hidden { display:none; }
+  button { border:0; border-radius:8px; background:var(--accent); color:#fff; font-weight:700; padding:11px 17px; cursor:pointer; margin-top:18px; }
+  button:disabled { background:#3b4a66; color:#9aa8c0; cursor:not-allowed; }
+  .notice { color:var(--muted); font-size:14px; }
+  .notice code, .paths code { background:#0f172a; border:1px solid var(--border); padding:1px 5px; border-radius:4px; }
+  pre { white-space:pre-wrap; word-break:break-word; background:#060a12; color:#a7f3d0; border:1px solid var(--border); border-radius:9px; padding:15px; min-height:160px; max-height:420px; overflow:auto; }
+  .status { font-weight:700; } .good { color:var(--good); } .bad { color:var(--danger); }
+  .warning { color:var(--danger); font-weight:700; font-size:14px; margin-top:10px; }
+  .csv-scroll { max-height:560px; overflow:auto; margin-top:12px; border:1px solid var(--border); border-radius:9px; background:var(--surface-2); }
+  .csv-scroll table { margin:0 !important; min-width:max-content; color:var(--text); }
+  .csv-scroll th { position:sticky; top:0; background:#1e3a5f; color:var(--text); }
+  .csv-scroll td, .csv-scroll th { border-color:var(--border) !important; }
   .actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }
   .actions button { margin-top:0; }
-  button.secondary { background:#fff; color:#1d4ed8; border:1px solid #93c5fd; }
-  a.button-link { display:inline-block; border-radius:8px; background:#fff; color:#1d4ed8; border:1px solid #93c5fd; font-weight:700; padding:11px 17px; text-decoration:none; }
-  a.button-link.disabled { pointer-events:none; opacity:.5; }
-  .paths { font-size:13px; color:#536078; margin-top:10px; line-height:1.5; }
+  button.secondary { background:var(--surface-2); color:#93c5fd; border:1px solid #3b82f6; }
+  a.button-link { display:inline-block; border-radius:8px; background:var(--surface-2); color:#93c5fd; border:1px solid #3b82f6; font-weight:700; padding:11px 17px; text-decoration:none; }
+  a.button-link.disabled { pointer-events:none; opacity:.45; }
+  .paths { font-size:13px; color:var(--muted); margin-top:10px; line-height:1.5; }
   .paths code { font-size:12px; word-break:break-all; }
-  .form-error { color:#b91c1c; font-weight:600; font-size:14px; margin-top:10px; }
-  .run-meta { font-size:13px; color:#536078; margin-top:6px; }
-  .progress-wrap { margin-top:12px; height:10px; background:#e5e7eb; border-radius:999px; overflow:hidden; }
-  #progress-bar { height:100%; width:0%; background:#2563eb; transition:width .4s ease; }
-  #progress-label { font-size:13px; color:#536078; margin-top:6px; }
-  textarea { box-sizing:border-box; width:100%; padding:10px; border:1px solid #bdc9dc; border-radius:8px; font:inherit; background:#fff; min-height:88px; resize:vertical; }
+  .form-error { color:var(--danger); font-weight:600; font-size:14px; margin-top:10px; }
+  .run-meta { font-size:13px; color:var(--muted); margin-top:6px; }
+  .progress-wrap { margin-top:12px; height:10px; background:#243147; border-radius:999px; overflow:hidden; }
+  #progress-bar { height:100%; width:0%; background:var(--accent); transition:width .4s ease; }
+  #progress-label { font-size:13px; color:var(--muted); margin-top:6px; }
+  textarea { box-sizing:border-box; width:100%; padding:10px; border:1px solid var(--border-strong); border-radius:8px; font:inherit; background:var(--surface-2); color:var(--text); min-height:88px; resize:vertical; }
   .inline-actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:8px 0 12px; }
   .inline-actions button { margin-top:0; }
-  .repo-picker { max-height:240px; overflow:auto; border:1px solid #dce3ef; border-radius:9px; padding:10px; background:#fafcff; }
+  .repo-picker { max-height:240px; overflow:auto; border:1px solid var(--border); border-radius:9px; padding:10px; background:var(--surface-2); }
   .repo-option { display:flex; align-items:flex-start; gap:8px; padding:6px 4px; font-size:14px; }
   .repo-option input { margin-top:3px; }
-  .picker-empty { color:#66758d; font-size:14px; padding:8px 4px; }
-  .picker-loading { color:#2563eb; font-size:14px; padding:8px 4px; font-weight:600; }
+  .picker-empty { color:var(--muted); font-size:14px; padding:8px 4px; }
+  .picker-loading { color:#93c5fd; font-size:14px; padding:8px 4px; font-weight:600; }
   button.is-loading { opacity:.8; cursor:wait; }
+  a { color:#93c5fd; }
 </style></head><body><main>
 <header class="brand">
   <img src="/logo.svg" alt="LH2 AI Labs" class="brand-logo">
@@ -619,10 +766,13 @@ __DOCKER_NOTICE__
   <label class="choice"><input type="radio" name="mode" value="hosted"> <strong>Hosted platform</strong><span class="small">Connect to a GitHub or GitLab organisation with a token file.</span></label>
 </div></div>
 <div class="card">
-  <div id="offline-fields"><label class="field">Folder holding full local clones<span class="req">*</span></label><input name="local_repos_dir" id="local-repos-dir" value="__DEFAULT_LOCAL_REPOS_DIR__" placeholder="__LOCAL_PLACEHOLDER__" required><div class="inline-actions"><button type="button" id="load-local-repos" class="secondary">Load repositories</button></div><p class="notice"><strong>How to prepare this folder:</strong> use a normal full clone for every repository, for example <code>git clone https://github.com/OWNER/REPO.git</code>. Do not use <code>--depth</code>, because the extractor needs the complete commit history.</p></div>
+  <div id="offline-fields">
+    <div class="inline-actions"><button type="button" id="load-local-repos" class="secondary">Load repositories</button></div>
+    <p class="notice"><strong>Offline clones:</strong> place full git clones in the mounted repos folder on your computer (default <code>./repos</code>, or the path set by <code>LOCAL_REPOS_DIR</code>). Use a normal <code>git clone</code> without <code>--depth</code>.</p>
+  </div>
   <div id="hosted-fields" class="hidden">
     <label class="field">Platform</label><select id="hosted-platform" name="hosted_platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option></select>
-    <label class="field">Path to token file<span class="req">*</span></label><input name="tokens_file" value="__DEFAULT_TOKENS_FILE__" placeholder="/path/to/tokens" required>
+    <p class="notice">Credentials come from the mounted <code>tokens</code> file on your computer.</p>
     <div id="github-fields"><label class="field">GitHub token key<span class="req">*</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file" required><label class="field">Organisation</label><div class="inline-actions"><button type="button" id="load-github-orgs" class="secondary">Load organisations</button><button type="button" id="load-github-accessible" class="secondary">Load accessible repositories</button></div><select name="github_org" id="github-org-select"><option value="">Choose an organisation (optional if using accessible repos or manual list)</option></select><p class="notice">Organisation listing only shows orgs you belong to. Use <strong>Load accessible repositories</strong> for direct collaborator access, or paste <code>owner/repo</code> names below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="github-accessible" type="checkbox" name="github_accessible"><strong>Analyse every accessible repository</strong><span class="small">Runs against all repos this token can access (owner, collaborator, and org member).</span></label></div>
     <div id="gitlab-fields" class="hidden"><label class="field">GitLab token key<span class="req">*</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file" required><label class="field">GitLab host / base URL</label><input name="gitlab_host" id="gitlab-host" value="" placeholder="https://gitlab.com"><p class="notice">Optional. Use a full URL for self-hosted GitLab (for example <code>https://gitlab.example.com</code>). Leave blank for gitlab.com.</p><label class="field">Group</label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button><button type="button" id="load-gitlab-accessible" class="secondary">Load all projects</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group (optional if using all projects or manual list)</option></select><p class="notice">Group listing shows groups you belong to. Use <strong>Load all projects</strong> for every project this token can access via membership, or paste <code>group/project</code> paths below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="gitlab-accessible" type="checkbox" name="gitlab_accessible"><strong>Analyse every accessible project</strong><span class="small">Runs against all GitLab projects this token can access (membership).</span></label></div>
   </div>
@@ -638,29 +788,38 @@ __DOCKER_NOTICE__
     <p class="notice" id="repo-selection-help">Leave all unchecked to include every repository discovered above (organisation mode). For accessible-repo loads, select the repos you want or use Select all.</p>
   </div>
   <label class="field">Parallel workers</label><input name="workers" type="number" value="4" min="1" max="20">
+  <div id="resume-card" style="margin-top:18px">
+    <label class="field">Resume previous run</label>
+    <select name="resume_run_dir" id="resume-run-dir"><option value="">Start a new run</option></select>
+    <div class="inline-actions"><button type="button" id="refresh-resumable" class="secondary">Refresh resumable runs</button></div>
+    <label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="retry-failed" type="checkbox" name="retry_failed"><strong>Retry failed repositories</strong><span class="small">Re-attempts timeout / network / rate-limit failures from the selected run.</span></label>
+    <p class="notice">Interrupted runs save progress after every repository. Pick a run above to continue from where it left off.</p>
+  </div>
   <label class="choice" style="margin-top:18px;display:flex;align-items:center"><input id="llm-enabled" type="checkbox" name="llm_enabled"><strong>Enable LLM analysis</strong><span class="small">Adds codebase description, industry/domain, vibe-code signals, and repository type.</span></label>
   <div id="llm-fields" class="hidden"><label class="field">OpenAI API key<span class="req">*</span></label><input name="openai_key" type="password" autocomplete="off" placeholder="sk-..."><p id="offline-llm-warning" class="warning hidden">LLM mode requires an internet connection in offline mode.</p></div>
   <button id="start">Create output</button>
   <p id="form-error" class="form-error hidden"></p>
-  <p class="notice">The browser interface only listens on this computer. Keep this page open while the analysis runs. If something fails, use <strong>Download support logs</strong> and send that zip (it does not include tokens or API keys).</p>
+  <p class="notice">The browser interface only listens on this computer. Keep this page open while the analysis runs. You can download a partial summary or archive zip while a run is in progress. If something fails, use <strong>Download support logs</strong> and send that zip (it does not include tokens or API keys).</p>
 </div></form>
 <div class="card"><span id="status" class="status">Ready</span><p id="run-meta" class="run-meta hidden"></p><div id="progress-wrap" class="progress-wrap hidden"><div id="progress-bar"></div></div><p id="progress-label" class="progress-label hidden"></p><pre id="log">No analysis has started.</pre>
 <div class="actions" style="margin-top:12px">
+  <a id="download-partial-summary" class="button-link secondary disabled" href="#">Download partial summary</a>
+  <a id="download-partial-zip" class="button-link secondary disabled" href="#">Download partial archive zip</a>
   <a id="download-support-logs" class="button-link secondary disabled" href="#">Download support logs</a>
 </div>
 <p class="notice">Support logs are written under <code>outputs/raw-extracts/support-logs/</code> and each run’s <code>logs/</code> folder.</p>
 </div>
 <div id="results" class="card hidden"><strong>Results</strong>
 <div class="actions">
-  <button id="open-folder" type="button" class="secondary">Open output folder</button>
   <a id="download-summary" class="button-link secondary" href="#">Download summary</a>
   <a id="download-zip" class="button-link secondary" href="#">Download archive zip</a>
-  <a id="download-support-logs-results" class="button-link secondary" href="#">Download support logs</a>
 </div>
 <p id="artifact-paths" class="paths hidden"></p>
 <div class="csv-scroll"><div id="csv-preview" class="notice">Loading summary…</div></div></div>
 <script>
-const FORM_STORAGE_KEY='extract-ui-form-v6';
+const FORM_STORAGE_KEY='extract-ui-form-v8';
+const DEFAULT_LOCAL_REPOS_DIR='__DEFAULT_LOCAL_REPOS_DIR__';
+const DEFAULT_TOKENS_FILE='__DEFAULT_TOKENS_FILE__';
 const forms = {offline:document.querySelector('#offline-fields'), hosted:document.querySelector('#hosted-fields')};
 let savedRepoChecks=new Set();
 function updateRepoPickerCopy(){
@@ -758,14 +917,12 @@ function fillSelect(select, items, placeholder){
 async function loadLocalRepos(){
   showFormError('');
   const button=document.querySelector('#load-local-repos');
-  const localDir=document.querySelector('#local-repos-dir').value.trim();
-  if (!localDir) { showFormError('Choose the folder holding local clones.'); return; }
   setButtonLoading(button, true, 'Load repositories');
   showRepoPickerLoading('Searching local folders…');
   try {
-    const payload=await postDiscover('/discover/local', {local_repos_dir:localDir});
+    const payload=await postDiscover('/discover/local', {local_repos_dir:DEFAULT_LOCAL_REPOS_DIR});
     rememberRepoChecks();
-    renderRepoPicker(payload.items, 'No Git repositories found in that folder.');
+    renderRepoPicker(payload.items, 'No Git repositories found in the mounted repos folder.');
   } catch (error) {
     document.querySelector('#repo-picker-wrap').classList.add('hidden');
     showFormError(error.message);
@@ -780,7 +937,7 @@ async function loadHostedOrgs(){
   const idleText=platform==='github' ? 'Load organisations' : 'Load groups';
   const extra={
     hosted_platform:platform,
-    tokens_file:document.querySelector('[name=tokens_file]').value,
+    tokens_file:DEFAULT_TOKENS_FILE,
     github_token_name:document.querySelector('[name=github_token_name]').value,
     gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
     gitlab_host:document.querySelector('[name=gitlab_host]')?.value||'',
@@ -799,7 +956,7 @@ async function loadHostedRepos(){
   const platform=document.querySelector('#hosted-platform').value;
   const extra={
     hosted_platform:platform,
-    tokens_file:document.querySelector('[name=tokens_file]').value,
+    tokens_file:DEFAULT_TOKENS_FILE,
     github_token_name:document.querySelector('[name=github_token_name]').value,
     gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
     gitlab_host:document.querySelector('[name=gitlab_host]')?.value||'',
@@ -826,7 +983,7 @@ async function loadAccessibleGithubRepos(){
   const button=document.querySelector('#load-github-accessible');
   const extra={
     hosted_platform:'github',
-    tokens_file:document.querySelector('[name=tokens_file]').value,
+    tokens_file:DEFAULT_TOKENS_FILE,
     github_token_name:document.querySelector('[name=github_token_name]').value,
   };
   setButtonLoading(button, true, 'Load accessible repositories');
@@ -850,7 +1007,7 @@ async function loadAccessibleGitlabProjects(){
   const button=document.querySelector('#load-gitlab-accessible');
   const extra={
     hosted_platform:'gitlab',
-    tokens_file:document.querySelector('[name=tokens_file]').value,
+    tokens_file:DEFAULT_TOKENS_FILE,
     gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
     gitlab_host:document.querySelector('[name=gitlab_host]')?.value||'',
   };
@@ -876,17 +1033,15 @@ function validateForm(){
   clearInvalid();
   const data=readFormSettings();
   const errors=[];
-  if (data.mode==='offline') {
-    if (!data.local_repos_dir.trim()) errors.push(['local-repos-dir','Choose the folder holding local clones.']);
-  } else {
-    if (!data.tokens_file.trim()) errors.push(['tokens_file','Enter the token file path.']);
+  const isResume=!!(data.resume_run_dir||'').trim();
+  if (data.mode!=='offline') {
     if (data.hosted_platform==='github') {
       if (!data.github_token_name.trim()) errors.push(['github_token_name','Enter the GitHub token key.']);
       const hasOrg=!!data.github_org.trim();
       const hasSelected=getSelectedRepos().length>0;
       const hasManual=getManualRepos().length>0;
       const hasAccessible=!!data.github_accessible;
-      if (!hasOrg && !hasSelected && !hasManual && !hasAccessible) {
+      if (!isResume && !hasOrg && !hasSelected && !hasManual && !hasAccessible) {
         errors.push(['github-org-select','Choose an organisation, load/select accessible repos, paste a manual list, or enable “Analyse every accessible repository”.']);
       }
     } else {
@@ -898,7 +1053,7 @@ function validateForm(){
       const hasSelected=getSelectedRepos().length>0;
       const hasManual=getManualRepos().length>0;
       const hasAccessible=!!data.gitlab_accessible;
-      if (!hasGroup && !hasSelected && !hasManual && !hasAccessible) {
+      if (!isResume && !hasGroup && !hasSelected && !hasManual && !hasAccessible) {
         errors.push(['gitlab-group-select','Choose a group, load/select all projects, paste a manual list, or enable “Analyse every accessible project”.']);
       }
     }
@@ -915,15 +1070,15 @@ function readFormSettings(){
   const data=new FormData(form);
   return {
     mode:data.get('mode')||'offline',
-    local_repos_dir:data.get('local_repos_dir')||'',
     hosted_platform:data.get('hosted_platform')||'github',
-    tokens_file:data.get('tokens_file')||'tokens',
     github_org:data.get('github_org')||'',
     github_token_name:data.get('github_token_name')||'data-lh2-github-token',
     gitlab_host:data.get('gitlab_host')||'',
     gitlab_group:data.get('gitlab_group')||'',
     gitlab_token_name:data.get('gitlab_token_name')||'gitlab_token',
     workers:data.get('workers')||'4',
+    resume_run_dir:data.get('resume_run_dir')||'',
+    retry_failed:!!data.get('retry_failed'),
     llm_enabled:!!data.get('llm_enabled'),
     github_accessible:!!data.get('github_accessible'),
     gitlab_accessible:!!data.get('gitlab_accessible'),
@@ -936,9 +1091,7 @@ function restoreFormSettings(settings){
   const modeInput=document.querySelector('input[name=mode][value="'+(settings.mode||'offline')+'"]');
   if (modeInput) modeInput.checked=true;
   const setValue=(name,value)=>{ const el=document.querySelector('[name="'+name+'"]'); if (el && value!=null) el.value=value; };
-  setValue('local_repos_dir', settings.local_repos_dir||'');
   setValue('hosted_platform', settings.hosted_platform||'github');
-  setValue('tokens_file', settings.tokens_file||'tokens');
   setValue('github_org', settings.github_org||'');
   setValue('github_token_name', settings.github_token_name||'data-lh2-github-token');
   setValue('gitlab_host', settings.gitlab_host||'');
@@ -947,12 +1100,40 @@ function restoreFormSettings(settings){
   setValue('workers', settings.workers||'4');
   setValue('manual_repos', settings.manual_repos||'');
   document.querySelector('#llm-enabled').checked=!!settings.llm_enabled;
+  document.querySelector('#retry-failed').checked=!!settings.retry_failed;
   const accessible=document.querySelector('#github-accessible');
   if (accessible) accessible.checked=!!settings.github_accessible;
   const gitlabAccessible=document.querySelector('#gitlab-accessible');
   if (gitlabAccessible) gitlabAccessible.checked=!!settings.gitlab_accessible;
   savedRepoChecks=new Set((settings.selected_repos||'').split(/\\n+/).filter(Boolean));
   choose();
+  if (settings.resume_run_dir) {
+    const resumeSelect=document.querySelector('#resume-run-dir');
+    if (resumeSelect && ![...resumeSelect.options].some(o=>o.value===settings.resume_run_dir)) {
+      const opt=document.createElement('option');
+      opt.value=settings.resume_run_dir;
+      opt.textContent=settings.resume_run_dir.split('/').pop()+' (saved)';
+      resumeSelect.appendChild(opt);
+    }
+    setValue('resume_run_dir', settings.resume_run_dir);
+  }
+}
+async function loadResumableRuns(){
+  const select=document.querySelector('#resume-run-dir');
+  if (!select) return;
+  const current=select.value;
+  try {
+    const payload=await fetch('/resumable').then(r=>r.json());
+    const runs=payload.runs||[];
+    select.innerHTML='<option value="">Start a new run</option>';
+    runs.forEach(run=>{
+      const opt=document.createElement('option');
+      opt.value=run.run_dir;
+      opt.textContent=run.name+' · ok '+run.ok+' · failed '+run.failed+' · pending '+run.pending;
+      select.appendChild(opt);
+    });
+    if (current && [...select.options].some(o=>o.value===current)) select.value=current;
+  } catch (_) {}
 }
 function persistFormSettings(settings){ try { localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(settings)); } catch (_) {} }
 function loadStoredFormSettings(){ try { const raw=localStorage.getItem(FORM_STORAGE_KEY); return raw ? JSON.parse(raw) : null; } catch (_) { return null; } }
@@ -969,6 +1150,7 @@ document.querySelector('#github-org-select').addEventListener('change', loadHost
 document.querySelector('#gitlab-group-select').addEventListener('change', loadHostedRepos);
 document.querySelector('#select-all-repos').addEventListener('click', ()=>document.querySelectorAll('input[name="selected_repos"]').forEach(el=>el.checked=true));
 document.querySelector('#clear-repos').addEventListener('click', ()=>document.querySelectorAll('input[name="selected_repos"]').forEach(el=>el.checked=false));
+document.querySelector('#refresh-resumable').addEventListener('click', loadResumableRuns);
 document.querySelector('#extract-form').addEventListener('input', ()=>{ persistFormSettings(readFormSettings()); clearInvalid(); });
 document.querySelector('#extract-form').addEventListener('change', ()=>persistFormSettings(readFormSettings()));
 document.querySelector('#extract-form').addEventListener('submit', async (event)=>{
@@ -991,8 +1173,9 @@ async function refresh(){
     window.formRestoredFromServer=true;
   }
   const phaseLabels={idle:'Ready', running:'Analysis running…', completed:'Completed successfully', failed:'Finished with errors'};
-  const label=data.running ? phaseLabels.running : phaseLabels[data.phase] || (data.returncode === 0 ? 'Completed successfully' : data.returncode === null ? 'Ready' : 'Finished with errors');
-  const status=document.querySelector('#status'); status.textContent=label; status.className='status '+(data.phase==='completed' || data.returncode===0?'good':data.phase==='running' || data.returncode===null?'':'bad');
+  let label=data.running ? phaseLabels.running : phaseLabels[data.phase] || (data.returncode === 0 ? 'Completed successfully' : data.returncode === null ? 'Ready' : 'Finished with errors');
+  if (!data.running && data.phase==='completed' && data.repos_failed>0) label='Completed with some repository failures';
+  const status=document.querySelector('#status'); status.textContent=label; status.className='status '+(data.phase==='completed' || data.returncode===0 || data.returncode===2?'good':data.phase==='running' || data.returncode===null?'':'bad');
   const meta=document.querySelector('#run-meta');
   const metaParts=[];
   if (data.started_at) metaParts.push('Started: '+new Date(data.started_at).toLocaleString());
@@ -1005,57 +1188,87 @@ async function refresh(){
   const progressWrap=document.querySelector('#progress-wrap');
   const progressBar=document.querySelector('#progress-bar');
   const progressLabel=document.querySelector('#progress-label');
-  const showProgress=data.running && progress.total>0;
+  const showProgress=(data.running || data.phase==='completed' || data.phase==='failed') && progress.total>0;
   progressWrap.classList.toggle('hidden', !showProgress);
   progressLabel.classList.toggle('hidden', !showProgress);
   if (showProgress) {
     progressBar.style.width=(progress.percent||0)+'%';
     const current=progress.current ? ' · current: '+progress.current : '';
-    progressLabel.textContent=(progress.done||0)+' / '+progress.total+' repositories'+current;
+    const classes=progress.error_classes && Object.keys(progress.error_classes).length
+      ? ' · errors: '+Object.entries(progress.error_classes).map(([k,v])=>k+'='+v).join(', ')
+      : '';
+    progressLabel.textContent=(progress.done||0)+' / '+progress.total+' repositories'+current+classes;
   }
   document.querySelector('#log').textContent=(data.log||[]).join('\\n') || 'No analysis has started.';
   document.querySelector('#start').disabled=data.running;
   showFormError(data.last_error||'');
   const token='csrf_token=__CSRF_TOKEN__';
   const supportEnabled=data.phase==='failed' || data.phase==='completed' || !!(data.log&&data.log.length);
-  ['#download-support-logs','#download-support-logs-results'].forEach(selector=>{
-    const link=document.querySelector(selector);
-    if (!link) return;
+  const supportLink=document.querySelector('#download-support-logs');
+  if (supportLink) {
     if (supportEnabled) {
-      link.href='/download/support-logs?'+token;
-      link.classList.remove('disabled');
+      supportLink.href='/download/support-logs?'+token;
+      supportLink.classList.remove('disabled');
     } else {
-      link.href='#';
-      link.classList.add('disabled');
+      supportLink.href='#';
+      supportLink.classList.add('disabled');
     }
-  });
+  }
+  const canDownloadPartial=!!(data.summary_path || data.run_dir);
+  const partialSummary=document.querySelector('#download-partial-summary');
+  if (partialSummary) {
+    if (canDownloadPartial) {
+      partialSummary.href='/download/summary?'+token;
+      partialSummary.classList.remove('disabled');
+    } else {
+      partialSummary.href='#';
+      partialSummary.classList.add('disabled');
+    }
+  }
+  const partialZip=document.querySelector('#download-partial-zip');
+  if (partialZip) {
+    if (canDownloadPartial) {
+      partialZip.href='/download/zip?'+token;
+      partialZip.classList.remove('disabled');
+    } else {
+      partialZip.href='#';
+      partialZip.classList.add('disabled');
+    }
+  }
   const results=document.querySelector('#results');
   const showCompleted=data.phase==='completed' && data.summary_path;
   const showFailed=data.phase==='failed';
-  results.classList.toggle('hidden', !(showCompleted || showFailed));
+  const showPartial=data.running && !!data.summary_path;
+  results.classList.toggle('hidden', !(showCompleted || showFailed || showPartial));
   const paths=document.querySelector('#artifact-paths');
-  if (showCompleted) {
+  if (showCompleted || showPartial) {
     const parts=[];
+    if (showPartial) parts.push('<strong>Partial results available</strong> — summary and archive update after each repository.');
     if (data.xlsx_path) parts.push('<strong>Summary (Excel):</strong> <code>'+data.xlsx_path+'</code>');
     else if (data.summary_path) parts.push('<strong>Summary (CSV):</strong> <code>'+data.summary_path+'</code>');
     if (data.zip_path) parts.push('<strong>Archive zip:</strong> <code>'+data.zip_path+'</code>');
+    if (data.run_dir) parts.push('<strong>Run folder:</strong> <code>'+data.run_dir+'</code>');
     if (data.host_output_hint) parts.push('<strong>Host folder:</strong> <code>'+data.host_output_hint+'</code>');
+    if (data.repos_failed>0) parts.push('Some repositories failed. Select this run under <strong>Resume previous run</strong> and enable <strong>Retry failed repositories</strong>.');
     paths.innerHTML=parts.join('<br>');
     paths.classList.toggle('hidden', parts.length===0);
     const summaryLink=document.querySelector('#download-summary');
     const zipLink=document.querySelector('#download-zip');
     summaryLink.href='/download/summary?'+token;
     summaryLink.classList.remove('disabled');
-    if (data.zip_path) {
+    zipLink.href='/download/zip?'+token;
+    zipLink.classList.remove('disabled');
+  } else if (data.phase==='failed') {
+    paths.innerHTML='<strong>Run failed.</strong> Download support logs and send that zip for help.' + (data.run_dir ? '<br><strong>Run folder:</strong> <code>'+data.run_dir+'</code><br>You can resume from this folder after fixing the issue.' : '');
+    paths.classList.remove('hidden');
+    const summaryLink=document.querySelector('#download-summary');
+    const zipLink=document.querySelector('#download-zip');
+    if (data.summary_path || data.run_dir) {
+      summaryLink.href='/download/summary?'+token;
+      summaryLink.classList.remove('disabled');
       zipLink.href='/download/zip?'+token;
       zipLink.classList.remove('disabled');
-    } else {
-      zipLink.href='#';
-      zipLink.classList.add('disabled');
     }
-  } else if (data.phase==='failed') {
-    paths.innerHTML='<strong>Run failed.</strong> Download support logs and send that zip for help.' + (data.run_dir ? '<br><strong>Run folder:</strong> <code>'+data.run_dir+'</code>' : '');
-    paths.classList.remove('hidden');
   } else {
     paths.classList.add('hidden');
   }
@@ -1069,21 +1282,15 @@ async function refresh(){
   }
   if (!data.summary_path || data.phase!=='completed') window.loadedSummaryFor=null;
 }
-document.querySelector('#open-folder').addEventListener('click', async ()=> {
-  const response=await fetch('/open-output', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'csrf_token=__CSRF_TOKEN__'});
-  let payload;
-  try { payload=await response.json(); } catch (_) { payload={message:await response.text()}; }
-  if (!response.ok) { alert(payload.message || 'Unable to open output folder.'); return; }
-  if (!payload.opened) alert(payload.message || ('Folder path: '+payload.path));
-});
 restoreFormSettings(loadStoredFormSettings());
 choose();
+loadResumableRuns();
 setInterval(refresh,1200); refresh();
 </script></main></body></html>""".replace("__CSRF_TOKEN__", CSRF_TOKEN).replace(
         "__DOCKER_NOTICE__", docker_notice
     ).replace("__DEFAULT_LOCAL_REPOS_DIR__", escape(default_local)).replace(
         "__DEFAULT_TOKENS_FILE__", escape(default_tokens)
-    ).replace("__LOCAL_PLACEHOLDER__", escape(local_placeholder))
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1132,12 +1339,28 @@ class Handler(BaseHTTPRequestHandler):
                     for key, value in STATE.items()
                     if key != "command"
                 }
-                safe_state["progress"] = compute_progress(safe_state.get("log") or [])
+                run_dir_value = safe_state.get("run_dir")
+                # Keep summary_path fresh while a run is writing incrementally.
+                if run_dir_value:
+                    live_summary = Path(str(run_dir_value)) / "summary.csv"
+                    if live_summary.is_file():
+                        safe_state["summary_path"] = str(live_summary)
+                safe_state["progress"] = compute_progress(
+                    safe_state.get("log") or [],
+                    run_dir=str(run_dir_value) if run_dir_value else None,
+                )
                 if is_docker_mode():
                     safe_state["host_output_hint"] = os.environ.get(
                         "HOST_OUTPUT_HINT", "./outputs/raw-extracts"
                     )
             self.respond(HTTPStatus.OK, "application/json", json.dumps(safe_state))
+            return
+        if path == "/resumable":
+            self.respond(
+                HTTPStatus.OK,
+                "application/json",
+                json.dumps({"runs": find_resumable_runs()}),
+            )
             return
         if path == "/download/summary":
             if not secrets.compare_digest(query.get("csrf_token", [""])[0], CSRF_TOKEN):
@@ -1145,8 +1368,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with LOCK:
                 summary_value = STATE.get("xlsx_path") or STATE.get("summary_path")
+                run_dir_value = STATE.get("run_dir")
+            if not summary_value and run_dir_value:
+                candidate = Path(str(run_dir_value)) / "summary.csv"
+                if candidate.is_file():
+                    summary_value = str(candidate)
             if not summary_value:
-                self.respond(HTTPStatus.NOT_FOUND, "text/plain", "No completed summary is available.")
+                self.respond(HTTPStatus.NOT_FOUND, "text/plain", "No summary is available yet.")
                 return
             summary_path = Path(summary_value)
             if not summary_path.is_file() or not is_under_archive(summary_path):
@@ -1186,12 +1414,28 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with LOCK:
                 zip_value = STATE.get("zip_path")
-            if not zip_value:
-                self.respond(HTTPStatus.NOT_FOUND, "text/plain", "No completed archive zip is available.")
-                return
-            zip_path = Path(zip_value)
-            if not zip_path.is_file() or not is_under_archive(zip_path):
-                self.respond(HTTPStatus.NOT_FOUND, "text/plain", "Archive zip is unavailable.")
+                run_dir_value = STATE.get("run_dir")
+            zip_path = Path(zip_value) if zip_value else None
+            run_dir = Path(run_dir_value) if run_dir_value else None
+            # Build (or rebuild) from the live run folder so partial downloads work mid-run.
+            if run_dir and run_dir.is_dir() and is_under_archive(run_dir):
+                try:
+                    zip_path = zip_run_dir(run_dir)
+                    set_state(zip_path=str(zip_path), run_dir=str(run_dir))
+                except Exception as exc:
+                    ui_log("Failed to build archive zip", exc=exc)
+                    self.respond(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        "text/plain",
+                        f"Unable to build archive zip: {exc}",
+                    )
+                    return
+            if not zip_path or not zip_path.is_file() or not is_under_archive(zip_path):
+                self.respond(
+                    HTTPStatus.NOT_FOUND,
+                    "text/plain",
+                    "No archive zip is available yet.",
+                )
                 return
             self.respond_file(zip_path, zip_path.name, "application/zip")
             return
@@ -1271,12 +1515,19 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(HTTPStatus.OK, "application/json", json.dumps(result))
             return
         if path == "/discover/local":
-            local_dir = fields.get("local_repos_dir", [""])[0].strip()
-            if not local_dir:
+            local_dir = default_local_repos_dir()
+            if not local_dir or not Path(local_dir).is_dir():
                 self.respond(
                     HTTPStatus.BAD_REQUEST,
                     "application/json",
-                    json.dumps({"error": "Choose the folder holding local clones."}),
+                    json.dumps(
+                        {
+                            "error": (
+                                "Mounted repos folder not found. Put full clones in "
+                                "./repos (or the LOCAL_REPOS_DIR path from .env)."
+                            )
+                        }
+                    ),
                 )
                 return
             try:
@@ -1456,6 +1707,8 @@ class Handler(BaseHTTPRequestHandler):
         manual_repos = parse_repo_selectors(fields.get("manual_repos", [""])[0])
         selected_repos = merge_repo_selectors(selected_repos, manual_repos)
         workers = fields.get("workers", ["4"])[0].strip()
+        resume_run_dir = fields.get("resume_run_dir", [""])[0].strip()
+        retry_failed = fields.get("retry_failed", [""])[0] == "on"
         try:
             workers_number = int(workers)
         except ValueError:
@@ -1464,6 +1717,22 @@ class Handler(BaseHTTPRequestHandler):
         if not 1 <= workers_number <= 20:
             self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Workers must be between 1 and 20.")
             return
+        if retry_failed and not resume_run_dir:
+            self.respond(
+                HTTPStatus.BAD_REQUEST,
+                "text/plain",
+                "Select a previous run before enabling Retry failed repositories.",
+            )
+            return
+        if resume_run_dir:
+            resume_path = Path(resume_run_dir)
+            if not resume_path.is_dir() or not is_under_archive(resume_path):
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "text/plain",
+                    "Resume run folder is missing or outside the output directory.",
+                )
+                return
         command = [
             sys.executable,
             str(EXTRACTOR),
@@ -1472,19 +1741,35 @@ class Handler(BaseHTTPRequestHandler):
             "--workers",
             str(workers_number),
         ]
+        if resume_run_dir:
+            command.extend(["--resume", resume_run_dir])
+            if retry_failed:
+                command.append("--retry-failed")
 
         if mode == "offline":
-            local_dir = fields.get("local_repos_dir", [""])[0].strip()
-            if not local_dir:
-                self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Choose the folder holding local clones.")
+            local_dir = default_local_repos_dir()
+            if not resume_run_dir and (not local_dir or not Path(local_dir).is_dir()):
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "text/plain",
+                    "Mounted repos folder not found. Put full clones in ./repos "
+                    "(or the LOCAL_REPOS_DIR path from .env).",
+                )
                 return
-            command.extend(["--offline", "--local-repos-dir", local_dir])
-            for repo_name in selected_repos:
-                command.extend(["--local-repo", repo_name])
+            command.append("--offline")
+            if local_dir:
+                command.extend(["--local-repos-dir", local_dir])
+            if not resume_run_dir:
+                for repo_name in selected_repos:
+                    command.extend(["--local-repo", repo_name])
         elif mode == "hosted":
-            tokens_file = fields.get("tokens_file", [""])[0].strip()
-            if not tokens_file:
-                self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Enter the token file path.")
+            tokens_file = default_tokens_file()
+            if not Path(tokens_file).is_file():
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "text/plain",
+                    "Tokens file not found. Copy tokens.example to tokens and fill in credentials.",
+                )
                 return
             command.extend(["--tokens-file", tokens_file])
             platform = fields.get("hosted_platform", ["github"])[0]
@@ -1499,21 +1784,22 @@ class Handler(BaseHTTPRequestHandler):
                         "Enter the GitHub token key.",
                     )
                     return
-                if selected_repos:
-                    for repo_name in selected_repos:
-                        command.extend(["--github-repo", repo_name])
-                elif github_accessible:
-                    command.append("--github-accessible")
-                elif org:
-                    command.extend(["--github-org", org])
-                else:
-                    self.respond(
-                        HTTPStatus.BAD_REQUEST,
-                        "text/plain",
-                        "Choose a GitHub organisation, select/paste repositories, "
-                        "or enable “Analyse every accessible repository”.",
-                    )
-                    return
+                if not resume_run_dir:
+                    if selected_repos:
+                        for repo_name in selected_repos:
+                            command.extend(["--github-repo", repo_name])
+                    elif github_accessible:
+                        command.append("--github-accessible")
+                    elif org:
+                        command.extend(["--github-org", org])
+                    else:
+                        self.respond(
+                            HTTPStatus.BAD_REQUEST,
+                            "text/plain",
+                            "Choose a GitHub organisation, select/paste repositories, "
+                            "or enable “Analyse every accessible repository”.",
+                        )
+                        return
                 command.extend(["--github-token-name", token_name])
             elif platform == "gitlab":
                 group = fields.get("gitlab_group", [""])[0].strip()
@@ -1533,21 +1819,22 @@ class Handler(BaseHTTPRequestHandler):
                         "Enter the GitLab token key.",
                     )
                     return
-                if selected_repos:
-                    for project in selected_repos:
-                        command.extend(["--gitlab-repo", project])
-                elif gitlab_accessible:
-                    command.append("--gitlab-accessible")
-                elif group:
-                    command.extend(["--gitlab-group", group])
-                else:
-                    self.respond(
-                        HTTPStatus.BAD_REQUEST,
-                        "text/plain",
-                        "Choose a GitLab group, select/paste projects, "
-                        "or enable “Analyse every accessible project”.",
-                    )
-                    return
+                if not resume_run_dir:
+                    if selected_repos:
+                        for project in selected_repos:
+                            command.extend(["--gitlab-repo", project])
+                    elif gitlab_accessible:
+                        command.append("--gitlab-accessible")
+                    elif group:
+                        command.extend(["--gitlab-group", group])
+                    else:
+                        self.respond(
+                            HTTPStatus.BAD_REQUEST,
+                            "text/plain",
+                            "Choose a GitLab group, select/paste projects, "
+                            "or enable “Analyse every accessible project”.",
+                        )
+                        return
                 command.extend(["--gitlab-token-name", token_name])
                 if gitlab_host:
                     command.extend(["--gitlab-host", gitlab_host])
