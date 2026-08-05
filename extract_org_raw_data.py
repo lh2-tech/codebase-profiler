@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from count_merged_prs import (
+    GITHUB_RATE_LIMIT_WAIT_SECONDS,
     github_api,
     github_graphql,
     github_headers,
@@ -481,6 +482,7 @@ def log_runtime_diagnostics(log: logging.Logger, args: argparse.Namespace) -> No
     log.info("workers=%s", args.workers)
     log.info("clone_timeout=%s", getattr(args, "clone_timeout", DEFAULT_CLONE_TIMEOUT_SECONDS))
     log.info("clone_retries=%s", getattr(args, "clone_retries", DEFAULT_CLONE_RETRIES))
+    log.info("github_rate_limit_wait_seconds=%s", GITHUB_RATE_LIMIT_WAIT_SECONDS)
     log.info("resume=%s", getattr(args, "resume", None))
     log.info("offline=%s", bool(args.offline))
     log.info("llm=%s", bool(args.llm))

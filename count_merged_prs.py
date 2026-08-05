@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -24,25 +26,82 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
+log = logging.getLogger(__name__)
+
 # Transient API failures worth retrying (rate limits + gateway blips).
 _RETRYABLE_HTTP = frozenset({429, 502, 503, 504})
 _DEFAULT_HTTP_RETRIES = 6
+GITHUB_RATE_LIMIT_WAIT_SECONDS = 30 * 60
+
+_GITHUB_RATE_LIMIT_LOCK = threading.Lock()
+_GITHUB_RATE_LIMIT_RESUME_AT = 0.0
+
+
+def _is_rate_limit_text(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        "rate limit" in lowered
+        or "rate_limit" in lowered
+        or "graphql_rate_limit" in lowered
+        or "secondary rate" in lowered
+    )
+
+
+def graphql_errors_are_rate_limit(errors: Any) -> bool:
+    """True when a GraphQL response body indicates GitHub rate limiting."""
+    if not isinstance(errors, list):
+        return _is_rate_limit_text(str(errors))
+    for err in errors:
+        if not isinstance(err, dict):
+            if _is_rate_limit_text(str(err)):
+                return True
+            continue
+        err_type = str(err.get("type") or "").upper()
+        err_code = str(err.get("code") or "").lower()
+        message = str(err.get("message") or "")
+        if err_type in {"RATE_LIMIT", "RATE_LIMITED"}:
+            return True
+        if "rate_limit" in err_code or _is_rate_limit_text(message):
+            return True
+    return False
+
+
+def _wait_for_github_rate_limit_cooldown(context: str = "") -> None:
+    """Block until any in-flight cross-thread rate-limit cooldown completes."""
+    with _GITHUB_RATE_LIMIT_LOCK:
+        delay = _GITHUB_RATE_LIMIT_RESUME_AT - time.time()
+    if delay <= 0:
+        return
+    log.warning(
+        "GitHub API rate limit cooldown active%s; waiting %.1f minutes",
+        f" ({context})" if context else "",
+        delay / 60,
+    )
+    time.sleep(delay)
+
+
+def _schedule_github_rate_limit_cooldown(context: str = "") -> None:
+    """Pause all workers for the configured rate-limit recovery window."""
+    global _GITHUB_RATE_LIMIT_RESUME_AT
+    with _GITHUB_RATE_LIMIT_LOCK:
+        _GITHUB_RATE_LIMIT_RESUME_AT = max(
+            _GITHUB_RATE_LIMIT_RESUME_AT,
+            time.time() + GITHUB_RATE_LIMIT_WAIT_SECONDS,
+        )
+    log.warning(
+        "GitHub API rate limit reached%s; waiting %s minutes before retry",
+        f" ({context})" if context else "",
+        GITHUB_RATE_LIMIT_WAIT_SECONDS // 60,
+    )
+    time.sleep(GITHUB_RATE_LIMIT_WAIT_SECONDS)
 
 
 def _retry_after_seconds(exc: urllib.error.HTTPError, attempt: int) -> float:
-    """Prefer Retry-After / rate-limit reset; otherwise exponential backoff."""
+    """Prefer Retry-After for gateway blips; otherwise exponential backoff."""
     raw = exc.headers.get("Retry-After") if exc.headers else None
     if raw:
         try:
             return max(1.0, float(raw))
-        except ValueError:
-            pass
-    reset = exc.headers.get("X-RateLimit-Reset") if exc.headers else None
-    if reset:
-        try:
-            delay = int(reset) - int(time.time())
-            if delay > 0:
-                return float(min(delay + 1, 120))
         except ValueError:
             pass
     return float(min(2**attempt, 60))
@@ -56,6 +115,7 @@ def http_get_json(
 ) -> tuple[Any, dict[str, str]]:
     last_error: Exception | None = None
     for attempt in range(retries):
+        _wait_for_github_rate_limit_cooldown(url)
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
@@ -67,6 +127,9 @@ def http_get_json(
             last_error = RuntimeError(f"HTTP {exc.code} for {url}: {detail}")
             if exc.code not in _RETRYABLE_HTTP or attempt >= retries - 1:
                 raise last_error from exc
+            if exc.code == 429:
+                _schedule_github_rate_limit_cooldown(url)
+                continue
             time.sleep(_retry_after_seconds(exc, attempt))
         except (TimeoutError, urllib.error.URLError) as exc:
             last_error = RuntimeError(f"Network error for {url}: {exc}")
@@ -203,21 +266,36 @@ def http_post_json(
     body = json.dumps(payload).encode("utf-8")
     last_error: Exception | None = None
     for attempt in range(retries):
+        _wait_for_github_rate_limit_cooldown(url)
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             last_error = RuntimeError(f"HTTP {exc.code} for {url}: {detail}")
             if exc.code not in _RETRYABLE_HTTP or attempt >= retries - 1:
                 raise last_error from exc
+            if exc.code == 429:
+                _schedule_github_rate_limit_cooldown(url)
+                continue
             time.sleep(_retry_after_seconds(exc, attempt))
+            continue
         except (TimeoutError, urllib.error.URLError) as exc:
             last_error = RuntimeError(f"Network error for {url}: {exc}")
             if attempt >= retries - 1:
                 raise last_error from exc
             time.sleep(float(min(2**attempt, 30)))
+            continue
+
+        if isinstance(data, dict) and data.get("errors"):
+            if graphql_errors_are_rate_limit(data["errors"]):
+                last_error = RuntimeError(str(data["errors"])[:500])
+                if attempt >= retries - 1:
+                    raise last_error
+                _schedule_github_rate_limit_cooldown(url)
+                continue
+        return data
     assert last_error is not None
     raise last_error
 
