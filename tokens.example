@@ -1,4 +1,13 @@
-# Copy to `tokens` and fill in real values. Never commit secrets.
+# Copy to `secrets/tokens` and fill in real values. Never commit secrets.
+#
+# Key names are free-form, but whatever you use here must be typed into the
+# UI's token field exactly. See "Token setup" in README.md for full details.
+#
+#   GitHub  — classic PAT, scopes: repo, read:org
+#   GitLab  — classic PAT, scopes: read_api AND read_repository,
+#             role Reporter or higher. Fine-grained GitLab tokens do NOT work:
+#             they return 200 with an empty project list instead of an error.
+#   OpenAI  — only needed for --llm mode
 
 github-data-token=ghp_your_github_token_here
 gitlab_token=glpat_your_gitlab_token_here
