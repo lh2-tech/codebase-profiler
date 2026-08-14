@@ -4,11 +4,13 @@ Privacy-safe repository evidence extractor with a local browser UI. Analyses Git
 
 ## Quick start (Docker)
 
-1. Copy the token template and add your credentials:
+1. Copy the token template into the `secrets/` folder and add your credentials:
 
 ```bash
-cp tokens.example tokens
+mkdir -p secrets && cp tokens.example secrets/tokens && chmod 600 secrets/tokens
 ```
+
+Do this **before** the first `docker compose up`. Docker mounts the whole `secrets/` folder rather than the single file: a single-file bind mount pins one inode, so a tokens file created or replaced after the container started leaves the container reading a dead reference and failing with `No such file or directory` even though the file is plainly there on your machine.
 
 2. Optional: copy the environment template if you want to change ports or the offline repos mount:
 
@@ -28,7 +30,55 @@ docker compose up --build
 
 A printable step-by-step guide for non-technical users is in [USER_GUIDE.pdf](USER_GUIDE.pdf).
 
-That is the only command needed after `tokens` is configured.
+That is the only command needed after `secrets/tokens` is configured.
+
+## Token setup
+
+Put one line per credential in `secrets/tokens` (`key=value`). The key name is what you type into the UI's token field, so it can be anything — but it must match exactly, or the run fails with `Missing '<name>' in tokens file`.
+
+### GitLab
+
+| | Required |
+|---|---|
+| Token type | **Classic** personal access token (`glpat-…`) |
+| Scopes | `read_api` **and** `read_repository` |
+| Role on the group | **Reporter** or higher |
+
+Both scopes are needed and they do different jobs: `read_api` covers every metadata call (groups, projects, merge requests, members, languages), `read_repository` is what lets the container `git clone` over HTTPS. A token with only `read_api` discovers repositories and then fails at the clone step.
+
+Reporter is the minimum useful role — Guest members can see that a private project exists but cannot read its code, so a Guest token produces empty or failed analyses.
+
+> **Avoid fine-grained GitLab tokens.** They are scoped to *selected resources*, not just permission types, and they fail in a way that looks like a broken tool: with `Group: Read` granted but the projects themselves out of scope, GitLab returns `200` with an **empty list** instead of a permission error. The UI then reports "no projects found" for a group you can plainly see in the dropdown. If you hit a `403` mentioning `insufficient_granular_scope`, you are on a fine-grained token — switch to a classic PAT.
+
+### GitHub
+
+| | Required |
+|---|---|
+| Token type | Classic PAT |
+| Scopes | `repo` (private repos + clone) and `read:org` (org and org-repo listing) |
+
+`public_repo` instead of `repo` is enough if you only ever analyse public repositories. For a fine-grained GitHub token the equivalents are Repository → Contents (Read), Metadata (Read), Pull requests (Read), and Organization → Members (Read); classic tokens are still the simpler choice.
+
+GitHub App auth is also supported via `--github-app` (see `tokens.example` for `github_app_id` / `github_app_pem`).
+
+### OpenAI
+
+`openai_key` is only read when LLM mode is enabled (`--llm`, or the checkbox in the UI). Leave it out entirely if you do not use that mode.
+
+### Checking a token before a run
+
+```bash
+cd ~/DataLabs/codebase-profiler && TOKEN=$(grep '^YOUR_KEY_NAME=' secrets/tokens | cut -d= -f2-) && curl -s -o /dev/null -w '%{http_code}\n' -H "PRIVATE-TOKEN: $TOKEN" "https://gitlab.com/api/v4/groups/YOUR_GROUP/projects?include_subgroups=true&per_page=1"
+```
+
+`200` with a non-empty body is a working token. `200` with `[]` means the token cannot see the group's projects — almost always a fine-grained token or a Guest role. `403` names the missing permission in the response body.
+
+### Endpoints used
+
+Useful when a security team asks what the token is actually allowed to touch. All calls are `GET`; the tool never writes.
+
+- **GitLab** — `/groups`, `/groups/:id/projects`, `/projects`, `/projects/:id`, `/projects/:id/languages`, `/projects/:id/members/all`, `/projects/:id/merge_requests` (plus `/:iid`, `/notes`, `/changes`), and `git clone` over HTTPS
+- **GitHub** — `/user`, `/user/orgs`, `/user/repos`, `/orgs/:org/repos`, `/repos/:full_name`, `/repos/:full_name/languages`, `/repos/:full_name/contributors`, `/repos/:owner/:name/pulls`, and `git clone` over HTTPS
 
 ## UI features
 
@@ -47,10 +97,10 @@ That is the only command needed after `tokens` is configured.
 
 ### Hosted platform (GitHub / GitLab)
 
-- Put credentials in the host `tokens` file (mounted into the container automatically)
+- Put credentials in the host `secrets/tokens` file (mounted into the container automatically)
 - In the UI, choose the token key name (for example `github-data-token`) — no path entry needed
 - Repositories are cloned inside the container, analysed, then removed before the zip is written
-- GitHub PAT needs the `repo` scope to see private collaborator repositories
+- See [Token setup](#token-setup) for the exact scopes each platform needs
 - Large orgs: prefer selecting a subset of repos, or use clone-then-offline (`clone_all_repos.py` + offline mode) if the platform run hits API rate limits
 - CLI equivalent for direct-access repos:
 
@@ -113,7 +163,7 @@ python extract_org_raw_data.py --ui
 
 ## Security notes
 
-- Never commit `tokens`, `.env`, or `*.pem` files
+- Never commit `secrets/`, `tokens`, `.env`, or `*.pem` files
 - The UI binds to localhost on your machine via Docker port mapping (`8766:8766`)
 - LLM mode sends bounded code excerpts to OpenAI; the API key is not stored in output archives
 

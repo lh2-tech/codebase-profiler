@@ -6,11 +6,14 @@ services:
     environment:
       EXTRACT_UI_DOCKER: "1"
       DEFAULT_LOCAL_REPOS_DIR: /data/repos
-      DEFAULT_TOKENS_FILE: /app/tokens
+      DEFAULT_TOKENS_FILE: /app/secrets/tokens
       HOST_OUTPUT_HINT: ./outputs/raw-extracts
       PYTHONUNBUFFERED: "1"
     volumes:
-      - ./tokens:/app/tokens:ro
+      # Mount the directory, not the file: a single-file bind mount pins one
+      # inode, so if the host tokens file is created or replaced after the
+      # container starts, stat() keeps succeeding while open() returns ENOENT.
+      - ./secrets:/app/secrets:ro
       - ./outputs:/app/outputs
       - ${LOCAL_REPOS_DIR:-./repos}:/data/repos:ro
     restart: unless-stopped

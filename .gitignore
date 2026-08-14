@@ -1,4 +1,5 @@
 tokens
+secrets/
 *.pem
 .env
 __pycache__/

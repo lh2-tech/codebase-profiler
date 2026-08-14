@@ -425,8 +425,20 @@ def parse_tokens_file(path: Path) -> dict[str, str]:
         )
     if not path.is_file():
         raise ValueError(f"Tokens file not found: {path}")
+    # The checks above can pass and the read below still fail: a Docker
+    # single-file bind mount keeps serving cached stat() attributes after the
+    # host file is replaced, so open() raises ENOENT for a path that "exists".
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(
+            f"Tokens file could not be read: {path} ({exc.strerror}). "
+            "If this is the Docker container, the bind mount for the tokens "
+            "file has gone stale — run 'docker compose down && docker compose "
+            "up -d' on the host and try again."
+        ) from exc
     tokens: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in raw.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
