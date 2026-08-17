@@ -116,7 +116,12 @@ def redact_command_for_logs(command: list[str]) -> list[str]:
 def safe_form_settings_for_logs(settings: dict[str, Any] | None) -> dict[str, Any]:
     if not settings:
         return {}
-    blocked = {"openai_key", "password", "api_key", "token", "secret"}
+    blocked = {"openai_key", "password", "api_key",
+        "token",
+        "secret",
+        "github_token",
+        "gitlab_token",
+    }
     return {
         key: value
         for key, value in settings.items()
@@ -258,9 +263,18 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
 
 
 def read_token_from_fields(fields: dict[str, list[str]], platform: str) -> str:
+    # A token pasted into the UI takes priority and is used as-is (in memory
+    # only). An empty field falls back to the mounted tokens file + key name.
+    pasted_field = "github_token" if platform == "github" else "gitlab_token"
+    pasted = fields.get(pasted_field, [""])[0].strip()
+    if pasted:
+        return pasted
     tokens_file = Path(default_tokens_file())
     if not tokens_file.is_file():
-        raise ValueError(f"Tokens file not found: {tokens_file}")
+        raise ValueError(
+            "Paste a token above, or add the mounted tokens file "
+            f"({tokens_file})."
+        )
     tokens = parse_tokens_file(tokens_file)
     if platform == "github":
         token_name = fields.get("github_token_name", ["data-lh2-github-token"])[0].strip()
@@ -772,9 +786,9 @@ __DOCKER_NOTICE__
   </div>
   <div id="hosted-fields" class="hidden">
     <label class="field">Platform</label><select id="hosted-platform" name="hosted_platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option></select>
-    <p class="notice">Credentials come from the mounted <code>tokens</code> file on your computer.</p>
-    <div id="github-fields"><label class="field">GitHub token key<span class="req">*</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file" required><label class="field">Organisation</label><div class="inline-actions"><button type="button" id="load-github-orgs" class="secondary">Load organisations</button><button type="button" id="load-github-accessible" class="secondary">Load accessible repositories</button></div><select name="github_org" id="github-org-select"><option value="">Choose an organisation (optional if using accessible repos or manual list)</option></select><p class="notice">Organisation listing only shows orgs you belong to. Use <strong>Load accessible repositories</strong> for direct collaborator access, or paste <code>owner/repo</code> names below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="github-accessible" type="checkbox" name="github_accessible"><strong>Analyse every accessible repository</strong><span class="small">Runs against all repos this token can access (owner, collaborator, and org member).</span></label></div>
-    <div id="gitlab-fields" class="hidden"><label class="field">GitLab token key<span class="req">*</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file" required><label class="field">GitLab host / base URL</label><input name="gitlab_host" id="gitlab-host" value="" placeholder="https://gitlab.com"><p class="notice">Optional. Use a full URL for self-hosted GitLab (for example <code>https://gitlab.example.com</code>). Leave blank for gitlab.com.</p><label class="field">Group</label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button><button type="button" id="load-gitlab-accessible" class="secondary">Load all projects</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group (optional if using all projects or manual list)</option></select><p class="notice">Group listing shows groups you belong to. Use <strong>Load all projects</strong> for every project this token can access via membership, or paste <code>group/project</code> paths below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="gitlab-accessible" type="checkbox" name="gitlab_accessible"><strong>Analyse every accessible project</strong><span class="small">Runs against all GitLab projects this token can access (membership).</span></label></div>
+    <p class="notice">Paste a token below to use it for this run only — it is held in memory and never written to disk, logs, or the output archive. Leave the token box blank to read the credential from the mounted <code>tokens</code> file instead.</p>
+    <div id="github-fields"><label class="field">GitHub token</label><input name="github_token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste a token (ghp_… / github_pat_…) — or leave blank to use the token file"><label class="field">GitHub token key <span class="small">(only used when the token box above is empty)</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file"><label class="field">Organisation</label><div class="inline-actions"><button type="button" id="load-github-orgs" class="secondary">Load organisations</button><button type="button" id="load-github-accessible" class="secondary">Load accessible repositories</button></div><select name="github_org" id="github-org-select"><option value="">Choose an organisation (optional if using accessible repos or manual list)</option></select><p class="notice">Organisation listing only shows orgs you belong to. Use <strong>Load accessible repositories</strong> for direct collaborator access, or paste <code>owner/repo</code> names below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="github-accessible" type="checkbox" name="github_accessible"><strong>Analyse every accessible repository</strong><span class="small">Runs against all repos this token can access (owner, collaborator, and org member).</span></label></div>
+    <div id="gitlab-fields" class="hidden"><label class="field">GitLab token</label><input name="gitlab_token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste a token (glpat-…) — or leave blank to use the token file"><label class="field">GitLab token key <span class="small">(only used when the token box above is empty)</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file"><label class="field">GitLab host / base URL</label><input name="gitlab_host" id="gitlab-host" value="" placeholder="https://gitlab.com"><p class="notice">Optional. Use a full URL for self-hosted GitLab (for example <code>https://gitlab.example.com</code>). Leave blank for gitlab.com.</p><label class="field">Group</label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button><button type="button" id="load-gitlab-accessible" class="secondary">Load all projects</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group (optional if using all projects or manual list)</option></select><p class="notice">Group listing shows groups you belong to. Use <strong>Load all projects</strong> for every project this token can access via membership, or paste <code>group/project</code> paths below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="gitlab-accessible" type="checkbox" name="gitlab_accessible"><strong>Analyse every accessible project</strong><span class="small">Runs against all GitLab projects this token can access (membership).</span></label></div>
   </div>
   <div id="manual-repos-wrap" class="hidden">
     <label class="field" id="manual-repos-label">Manual repository list</label>
@@ -938,6 +952,8 @@ async function loadHostedOrgs(){
   const extra={
     hosted_platform:platform,
     tokens_file:DEFAULT_TOKENS_FILE,
+    github_token:document.querySelector('[name=github_token]')?.value||'',
+    gitlab_token:document.querySelector('[name=gitlab_token]')?.value||'',
     github_token_name:document.querySelector('[name=github_token_name]').value,
     gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
     gitlab_host:document.querySelector('[name=gitlab_host]')?.value||'',
@@ -957,6 +973,8 @@ async function loadHostedRepos(){
   const extra={
     hosted_platform:platform,
     tokens_file:DEFAULT_TOKENS_FILE,
+    github_token:document.querySelector('[name=github_token]')?.value||'',
+    gitlab_token:document.querySelector('[name=gitlab_token]')?.value||'',
     github_token_name:document.querySelector('[name=github_token_name]').value,
     gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
     gitlab_host:document.querySelector('[name=gitlab_host]')?.value||'',
@@ -984,6 +1002,7 @@ async function loadAccessibleGithubRepos(){
   const extra={
     hosted_platform:'github',
     tokens_file:DEFAULT_TOKENS_FILE,
+    github_token:document.querySelector('[name=github_token]')?.value||'',
     github_token_name:document.querySelector('[name=github_token_name]').value,
   };
   setButtonLoading(button, true, 'Load accessible repositories');
@@ -1008,6 +1027,7 @@ async function loadAccessibleGitlabProjects(){
   const extra={
     hosted_platform:'gitlab',
     tokens_file:DEFAULT_TOKENS_FILE,
+    gitlab_token:document.querySelector('[name=gitlab_token]')?.value||'',
     gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
     gitlab_host:document.querySelector('[name=gitlab_host]')?.value||'',
   };
@@ -1036,7 +1056,8 @@ function validateForm(){
   const isResume=!!(data.resume_run_dir||'').trim();
   if (data.mode!=='offline') {
     if (data.hosted_platform==='github') {
-      if (!data.github_token_name.trim()) errors.push(['github_token_name','Enter the GitHub token key.']);
+      const ghToken=(document.querySelector('[name=github_token]')?.value||'').trim();
+      if (!ghToken && !data.github_token_name.trim()) errors.push(['github_token','Paste a GitHub token, or enter the token key from your file.']);
       const hasOrg=!!data.github_org.trim();
       const hasSelected=getSelectedRepos().length>0;
       const hasManual=getManualRepos().length>0;
@@ -1045,7 +1066,8 @@ function validateForm(){
         errors.push(['github-org-select','Choose an organisation, load/select accessible repos, paste a manual list, or enable “Analyse every accessible repository”.']);
       }
     } else {
-      if (!data.gitlab_token_name.trim()) errors.push(['gitlab_token_name','Enter the GitLab token key.']);
+      const glToken=(document.querySelector('[name=gitlab_token]')?.value||'').trim();
+      if (!glToken && !data.gitlab_token_name.trim()) errors.push(['gitlab_token','Paste a GitLab token, or enter the token key from your file.']);
       if (data.gitlab_host.trim() && !/^https?:\/\//i.test(data.gitlab_host.trim())) {
         errors.push(['gitlab-host','GitLab host must be a full URL, for example https://gitlab.example.com']);
       }
@@ -1746,6 +1768,10 @@ class Handler(BaseHTTPRequestHandler):
             if retry_failed:
                 command.append("--retry-failed")
 
+        # Secrets (pasted tokens, OpenAI key) travel to the child via the
+        # environment only — never argv — so they stay out of logs and archives.
+        env_overrides: dict[str, str] = {}
+
         if mode == "offline":
             local_dir = default_local_repos_dir()
             if not resume_run_dir and (not local_dir or not Path(local_dir).is_dir()):
@@ -1763,27 +1789,29 @@ class Handler(BaseHTTPRequestHandler):
                 for repo_name in selected_repos:
                     command.extend(["--local-repo", repo_name])
         elif mode == "hosted":
+            platform = fields.get("hosted_platform", ["github"])[0]
             tokens_file = default_tokens_file()
-            if not Path(tokens_file).is_file():
+            have_tokens_file = Path(tokens_file).is_file()
+            pasted_field = "github_token" if platform == "github" else "gitlab_token"
+            pasted_token = fields.get(pasted_field, [""])[0].strip()
+            if not pasted_token and not have_tokens_file:
                 self.respond(
                     HTTPStatus.BAD_REQUEST,
                     "text/plain",
-                    "Tokens file not found. Copy tokens.example to tokens and fill in credentials.",
+                    "Paste a token above, or create the tokens file "
+                    "(copy tokens.example to tokens and fill in credentials).",
                 )
                 return
-            command.extend(["--tokens-file", tokens_file])
-            platform = fields.get("hosted_platform", ["github"])[0]
+            if have_tokens_file:
+                command.extend(["--tokens-file", tokens_file])
             if platform == "github":
                 org = fields.get("github_org", [""])[0].strip()
-                token_name = fields.get("github_token_name", [""])[0].strip()
+                # Key name is only meaningful for the file; default it so a
+                # pasted-token run (no key entered) still resolves cleanly.
+                token_name = fields.get("github_token_name", [""])[0].strip() or "ui-github-token"
                 github_accessible = fields.get("github_accessible", [""])[0] == "on"
-                if not token_name:
-                    self.respond(
-                        HTTPStatus.BAD_REQUEST,
-                        "text/plain",
-                        "Enter the GitHub token key.",
-                    )
-                    return
+                if pasted_token:
+                    env_overrides["EXTRACT_GITHUB_TOKEN"] = pasted_token
                 if not resume_run_dir:
                     if selected_repos:
                         for repo_name in selected_repos:
@@ -1803,7 +1831,7 @@ class Handler(BaseHTTPRequestHandler):
                 command.extend(["--github-token-name", token_name])
             elif platform == "gitlab":
                 group = fields.get("gitlab_group", [""])[0].strip()
-                token_name = fields.get("gitlab_token_name", [""])[0].strip()
+                token_name = fields.get("gitlab_token_name", [""])[0].strip() or "gitlab_token"
                 gitlab_accessible = fields.get("gitlab_accessible", [""])[0] == "on"
                 try:
                     gitlab_host = normalize_gitlab_host(
@@ -1812,13 +1840,8 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     self.respond(HTTPStatus.BAD_REQUEST, "text/plain", str(exc))
                     return
-                if not token_name:
-                    self.respond(
-                        HTTPStatus.BAD_REQUEST,
-                        "text/plain",
-                        "Enter the GitLab token key.",
-                    )
-                    return
+                if pasted_token:
+                    env_overrides["EXTRACT_GITLAB_TOKEN"] = pasted_token
                 if not resume_run_dir:
                     if selected_repos:
                         for project in selected_repos:
@@ -1845,7 +1868,6 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Unknown mode.")
             return
 
-        env_overrides: dict[str, str] = {}
         if fields.get("llm_enabled", [""])[0] == "on":
             openai_key = fields.get("openai_key", [""])[0].strip()
             if not openai_key:

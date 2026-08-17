@@ -2728,6 +2728,11 @@ def main() -> int:
         )
 
     tokens: dict[str, str] = {}
+    # A token pasted into the local UI arrives through the environment (never on
+    # the command line) so it stays out of argv, the logs, and the output zip —
+    # the same channel already used for OPENAI_API_KEY.
+    ui_github_token = os.environ.get("EXTRACT_GITHUB_TOKEN", "").strip()
+    ui_gitlab_token = os.environ.get("EXTRACT_GITLAB_TOKEN", "").strip()
     # Offline mode analyses local clones only and never uses API tokens.
     # Skip loading so a Docker bind-mount directory at the default path
     # (created when the host tokens file was missing) cannot abort the run.
@@ -2743,8 +2748,19 @@ def main() -> int:
                 "If Docker created this after a missing bind mount, remove the "
                 "directory on the host and copy tokens.example to tokens."
             )
-        elif not args.list_installations and not args.github_app:
+        elif (
+            not args.list_installations
+            and not args.github_app
+            and not (ui_github_token or ui_gitlab_token)
+        ):
             raise SystemExit(f"Tokens file not found: {args.tokens_file}")
+        # A UI-pasted token overrides / creates the matching key so the rest of
+        # the pipeline (resolve_github_token, build_targets, process_repo) works
+        # unchanged whether the value came from the file or the UI field.
+        if ui_github_token:
+            tokens[args.github_token_name] = ui_github_token
+        if ui_gitlab_token:
+            tokens[args.gitlab_token_name] = ui_gitlab_token
 
     if args.list_installations:
         return cmd_list_installations(args, tokens)
