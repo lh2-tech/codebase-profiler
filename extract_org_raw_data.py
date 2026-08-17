@@ -963,14 +963,12 @@ def fetch_gitlab_merged_mrs(
             )
         except Exception:
             detail["notes"] = []
-        try:
-            changes, _ = http_get_json(
-                f"{api}/projects/{project_id}/merge_requests/{iid}/changes",
-                headers,
-            )
-            detail["changes"] = changes.get("changes") if isinstance(changes, dict) else []
-        except Exception:
-            detail["changes"] = []
+        # Deliberately NOT fetching /merge_requests/:iid/changes. Each entry in
+        # that response carries a `diff` field holding the actual source, which
+        # landed in merged_prs.json and shipped inside the deliverable zip --
+        # breaking the metadata-only guarantee this tool is built on. The size
+        # signal it was providing is already in `changes_count` on the detail
+        # above, at no extra request.
         enriched.append(detail)
     return enriched
 
