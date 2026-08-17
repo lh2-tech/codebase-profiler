@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 FROM python:3.11-slim-bookworm
 
 ARG TARGETARCH=amd64
@@ -15,8 +13,12 @@ RUN set -eux; \
       amd64) SCC_ARCH=x86_64 ;; \
       *) SCC_ARCH=x86_64 ;; \
     esac; \
-    curl -fsSL "https://github.com/boyter/scc/releases/download/v${SCC_VERSION}/scc_Linux_${SCC_ARCH}.tar.gz" \
-        -o /tmp/scc.tgz; \
+    #added a retry loop for curl for SSL issues 
+    for attempt in 1 2 3; do \
+      curl -fsSL "https://github.com/boyter/scc/releases/download/v${SCC_VERSION}/scc_Linux_${SCC_ARCH}.tar.gz" \
+        -o /tmp/scc.tgz && break || ([ $attempt -eq 3 ] && exit 1); \
+      sleep 2; \
+    done; \
     tar -xzf /tmp/scc.tgz -C /usr/local/bin scc; \
     rm /tmp/scc.tgz; \
     scc --version
