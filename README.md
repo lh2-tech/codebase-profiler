@@ -48,7 +48,7 @@ Both scopes are needed and they do different jobs: `read_api` covers every metad
 
 Reporter is the minimum useful role — Guest members can see that a private project exists but cannot read its code, so a Guest token produces empty or failed analyses.
 
-> **Avoid fine-grained GitLab tokens.** They are scoped to *selected resources*, not just permission types, and they fail in a way that looks like a broken tool: with `Group: Read` granted but the projects themselves out of scope, GitLab returns `200` with an **empty list** instead of a permission error. The UI then reports "no projects found" for a group you can plainly see in the dropdown. If you hit a `403` mentioning `insufficient_granular_scope`, you are on a fine-grained token — switch to a classic PAT.
+> **Avoid fine-grained GitLab tokens.** They are scoped to *selected resources*, not just permission types, so a token can hold the right permission names and still be unable to reach a given group's projects. The tell is a `403` whose body mentions `insufficient_granular_scope` and names the permission it wants — switch to a classic PAT.
 
 ### GitHub
 
@@ -71,7 +71,7 @@ GitHub App auth is also supported via `--github-app` (see `tokens.example` for `
 cd ~/DataLabs/codebase-profiler && TOKEN=$(grep '^YOUR_KEY_NAME=' secrets/tokens | cut -d= -f2-) && curl -s -o /dev/null -w '%{http_code}\n' -H "PRIVATE-TOKEN: $TOKEN" "https://gitlab.com/api/v4/groups/YOUR_GROUP/projects?include_subgroups=true&per_page=1"
 ```
 
-`200` with a non-empty body is a working token. `200` with `[]` means the token cannot see the group's projects — almost always a fine-grained token or a Guest role. `403` names the missing permission in the response body.
+`200` with a non-empty body is a working token. `403` names the missing permission in the response body. `200` with `[]` means GitLab found nothing to return — check that the account is a member of the group at Reporter or above, and that the projects actually live in the group you queried.
 
 ### Endpoints used
 
