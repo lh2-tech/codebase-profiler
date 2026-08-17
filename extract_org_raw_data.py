@@ -816,7 +816,7 @@ def list_gitlab_project_objects(token: str, group: str, host: str) -> list[dict[
         api,
         f"/groups/{encoded}/projects",
         token,
-        {"include_subgroups": "true", "archived": "true"},
+        {"include_subgroups": "true"},
     )
     if not projects:
         raise RuntimeError(f"No GitLab projects found for group {group!r}")
@@ -834,7 +834,6 @@ def list_gitlab_accessible_project_objects(
         token,
         {
             "membership": "true",
-            "archived": "true",
             "order_by": "path",
             "sort": "asc",
         },
