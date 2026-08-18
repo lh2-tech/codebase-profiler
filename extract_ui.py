@@ -1249,15 +1249,27 @@ document.querySelector('#extract-form').addEventListener('submit', async (event)
   event.preventDefault();
   showFormError('');
   if (!validateForm()) return;
+  // Client-side double-submit guard: block a second request while one is in
+  // flight (complements the server's atomic run-slot claim).
+  if (window.startInFlight) return;
+  window.startInFlight=true;
+  const startBtn=document.querySelector('#start'); if (startBtn) startBtn.disabled=true;
   const form=event.target;
   const body=new URLSearchParams(new FormData(form));
-  const response=await fetch('/start', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
-  const text=await response.text();
-  if (!response.ok) { showFormError(text || 'Unable to start analysis.'); toast(text || 'Unable to start analysis.', 'error', 'Could not start'); return; }
-  persistFormSettings(readFormSettings());
-  window.loadedSummary=false;
-  const startedMode=document.querySelector('input[name=mode]:checked')?.value;
-  if (startedMode==='hosted') noteFileSource(document.querySelector('#hosted-platform')?.value);
+  try {
+    const response=await fetch('/start', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+    const text=await response.text();
+    if (!response.ok) { showFormError(text || 'Unable to start analysis.'); toast(text || 'Unable to start analysis.', 'error', 'Could not start'); if (startBtn) startBtn.disabled=false; return; }
+    persistFormSettings(readFormSettings());
+    window.loadedSummary=false;
+    const startedMode=document.querySelector('input[name=mode]:checked')?.value;
+    if (startedMode==='hosted') noteFileSource(document.querySelector('#hosted-platform')?.value);
+  } catch (err) {
+    showFormError('Unable to start analysis.'); toast(String(err&&err.message||err), 'error', 'Could not start');
+    if (startBtn) startBtn.disabled=false;
+  } finally {
+    window.startInFlight=false;
+  }
 });
 async function refresh(){
   const data=await fetch('/status').then(r=>r.json());
@@ -1977,10 +1989,15 @@ class Handler(BaseHTTPRequestHandler):
             # Keep the key out of command arguments, logs, and output archives.
             env_overrides["OPENAI_API_KEY"] = openai_key
 
+        # Atomically claim the single run slot: check *and* set running under one
+        # lock hold so two concurrent /start requests can't both pass the guard
+        # (ThreadingHTTPServer handles each request on its own thread). set_state
+        # re-acquires LOCK, so we mutate STATE directly here rather than call it.
         with LOCK:
             if STATE["running"]:
                 self.respond(HTTPStatus.CONFLICT, "text/plain", "An extraction is already running.")
                 return
+            STATE["running"] = True
         ui_log(
             "Queued extraction "
             f"settings={json.dumps(safe_form_settings_for_logs(form_settings), ensure_ascii=False)} "
