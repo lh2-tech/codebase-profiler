@@ -763,7 +763,14 @@ def page() -> str:
   .picker-loading { color:#93c5fd; font-size:14px; padding:8px 4px; font-weight:600; }
   button.is-loading { opacity:.8; cursor:wait; }
   a { color:#93c5fd; }
-</style></head><body><main>
+  #toast-tray { position:fixed; top:16px; right:16px; display:flex; flex-direction:column; gap:10px; z-index:9999; max-width:360px; }
+  .toast { background:var(--surface-2); border:1px solid var(--border-strong); border-left-width:4px; border-radius:10px; padding:11px 13px; box-shadow:0 10px 30px #00000066; color:var(--text); font-size:13.5px; line-height:1.45; opacity:0; transform:translateX(12px); transition:opacity .18s ease, transform .18s ease; cursor:pointer; }
+  .toast.show { opacity:1; transform:none; }
+  .toast.error { border-left-color:var(--danger); }
+  .toast.info { border-left-color:var(--accent); }
+  .toast.success { border-left-color:var(--good); }
+  .toast .tt { font-weight:700; margin-bottom:2px; }
+</style></head><body><div id="toast-tray"></div><main>
 <header class="brand">
   <img src="/logo.svg" alt="LH2 AI Labs" class="brand-logo">
   <div>
@@ -964,7 +971,8 @@ async function loadHostedOrgs(){
     if (platform==='github') fillSelect(document.querySelector('#github-org-select'), payload.items, 'Choose an organisation');
     else fillSelect(document.querySelector('#gitlab-group-select'), payload.items, 'Choose a group');
     document.querySelector('#repo-picker-wrap').classList.add('hidden');
-  } catch (error) { showFormError(error.message); }
+    noteFileSource(platform);
+  } catch (error) { resetDiscoveryResults(); showFormError(error.message); toast(error.message, 'error', 'Load failed'); }
   finally { setButtonLoading(button, false); }
 }
 async function loadHostedRepos(){
@@ -991,9 +999,11 @@ async function loadHostedRepos(){
     const payload=await postDiscover('/discover/repos', extra);
     rememberRepoChecks();
     renderRepoPicker(payload.items, platform==='gitlab' ? 'No projects found in this group.' : 'No repositories found for this selection.');
+    noteFileSource(platform);
   } catch (error) {
     document.querySelector('#repo-picker-wrap').classList.add('hidden');
     showFormError(error.message);
+    toast(error.message, 'error', 'Load failed');
   }
 }
 async function loadAccessibleGithubRepos(){
@@ -1014,9 +1024,11 @@ async function loadAccessibleGithubRepos(){
       payload.items,
       'No accessible repositories found for this token (owner, collaborator, or org member).'
     );
+    noteFileSource('github');
   } catch (error) {
     document.querySelector('#repo-picker-wrap').classList.add('hidden');
     showFormError(error.message);
+    toast(error.message, 'error', 'Load failed');
   } finally {
     setButtonLoading(button, false);
   }
@@ -1040,9 +1052,11 @@ async function loadAccessibleGitlabProjects(){
       payload.items,
       'No accessible GitLab projects found for this token (membership).'
     );
+    noteFileSource('gitlab');
   } catch (error) {
     document.querySelector('#repo-picker-wrap').classList.add('hidden');
     showFormError(error.message);
+    toast(error.message, 'error', 'Load failed');
   } finally {
     setButtonLoading(button, false);
   }
@@ -1160,6 +1174,33 @@ async function loadResumableRuns(){
 function persistFormSettings(settings){ try { localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(settings)); } catch (_) {} }
 function loadStoredFormSettings(){ try { const raw=localStorage.getItem(FORM_STORAGE_KEY); return raw ? JSON.parse(raw) : null; } catch (_) { return null; } }
 function showFormError(message){ const el=document.querySelector('#form-error'); if (!message) { el.textContent=''; el.classList.add('hidden'); return; } el.textContent=message; el.classList.remove('hidden'); }
+function toast(message, type, title){
+  const tray=document.querySelector('#toast-tray'); if(!tray) return;
+  const el=document.createElement('div'); el.className='toast '+(type||'info');
+  if(title){ const t=document.createElement('div'); t.className='tt'; t.textContent=title; el.appendChild(t); }
+  const b=document.createElement('div'); b.textContent=message||''; el.appendChild(b);
+  tray.appendChild(el);
+  requestAnimationFrame(()=>el.classList.add('show'));
+  const kill=()=>{ el.classList.remove('show'); setTimeout(()=>el.remove(),200); };
+  el.addEventListener('click', kill);
+  setTimeout(kill, type==='error' ? 7000 : 4500);
+}
+function tokenInField(platform){
+  const name = platform==='gitlab' ? 'gitlab_token' : 'github_token';
+  return (document.querySelector('[name='+name+']')?.value||'').trim();
+}
+// Clears any previously loaded orgs/groups + the repo picker so a result from an
+// old token can never linger after the token changes or a fresh load fails.
+function resetDiscoveryResults(){
+  const gh=document.querySelector('#github-org-select'); if(gh) fillSelect(gh, [], 'Choose an organisation');
+  const gl=document.querySelector('#gitlab-group-select'); if(gl) fillSelect(gl, [], 'Choose a group');
+  const wrap=document.querySelector('#repo-picker-wrap'); if(wrap) wrap.classList.add('hidden');
+  const picker=document.querySelector('#repo-picker'); if(picker) picker.innerHTML='<p class="picker-empty">Load repositories to choose which ones to include.</p>';
+}
+// After a successful hosted load/run, tell the user when the file credential was used.
+function noteFileSource(platform){
+  if(!tokenInField(platform)) toast('Using the token from your tokens file.', 'info', 'File credential');
+}
 document.querySelectorAll('input[name=mode]').forEach(e=>e.addEventListener('change',choose));
 document.querySelector('#hosted-platform').addEventListener('change',choosePlatform);
 document.querySelector('#llm-enabled').addEventListener('change',chooseLlm);
@@ -1173,6 +1214,11 @@ document.querySelector('#gitlab-group-select').addEventListener('change', loadHo
 document.querySelector('#select-all-repos').addEventListener('click', ()=>document.querySelectorAll('input[name="selected_repos"]').forEach(el=>el.checked=true));
 document.querySelector('#clear-repos').addEventListener('click', ()=>document.querySelectorAll('input[name="selected_repos"]').forEach(el=>el.checked=false));
 document.querySelector('#refresh-resumable').addEventListener('click', loadResumableRuns);
+// Editing a token invalidates any orgs/repos loaded with the previous one.
+['github_token','gitlab_token'].forEach(function(n){
+  const el=document.querySelector('[name='+n+']');
+  if(el) el.addEventListener('input', resetDiscoveryResults);
+});
 document.querySelector('#extract-form').addEventListener('input', ()=>{ persistFormSettings(readFormSettings()); clearInvalid(); });
 document.querySelector('#extract-form').addEventListener('change', ()=>persistFormSettings(readFormSettings()));
 document.querySelector('#extract-form').addEventListener('submit', async (event)=>{
@@ -1183,9 +1229,11 @@ document.querySelector('#extract-form').addEventListener('submit', async (event)
   const body=new URLSearchParams(new FormData(form));
   const response=await fetch('/start', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
   const text=await response.text();
-  if (!response.ok) { showFormError(text || 'Unable to start analysis.'); return; }
+  if (!response.ok) { showFormError(text || 'Unable to start analysis.'); toast(text || 'Unable to start analysis.', 'error', 'Could not start'); return; }
   persistFormSettings(readFormSettings());
   window.loadedSummary=false;
+  const startedMode=document.querySelector('input[name=mode]:checked')?.value;
+  if (startedMode==='hosted') noteFileSource(document.querySelector('#hosted-platform')?.value);
 });
 async function refresh(){
   const data=await fetch('/status').then(r=>r.json());
