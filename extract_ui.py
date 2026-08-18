@@ -15,7 +15,7 @@ import threading
 import traceback
 import webbrowser
 import zipfile
-from csv import reader
+from csv import DictReader, reader
 from datetime import datetime, timezone
 from html import escape
 from http import HTTPStatus
@@ -519,6 +519,29 @@ def parse_manifest_from_log(log_lines: list[str]) -> dict[str, Any]:
     return {}
 
 
+def count_summary_outcomes(summary_path: Path | None) -> tuple[int | None, int | None]:
+    """Ground-truth (ok, failed) from the produced summary.csv itself.
+
+    A row with a non-empty ``error`` column is a failure; everything else is a
+    success. This reflects what is actually in the deliverable, independent of the
+    extractor's own progress counters.
+    """
+    if not summary_path or not summary_path.is_file():
+        return None, None
+    try:
+        ok = 0
+        failed = 0
+        with summary_path.open(newline="", encoding="utf-8") as handle:
+            for row in DictReader(handle):
+                if str(row.get("error") or "").strip():
+                    failed += 1
+                else:
+                    ok += 1
+        return ok, failed
+    except OSError:
+        return None, None
+
+
 def finalize_run_state(log_lines: list[str], returncode: int) -> None:
     summary_path: Path | None = None
     zip_path: Path | None = None
@@ -550,6 +573,7 @@ def finalize_run_state(log_lines: list[str], returncode: int) -> None:
         if candidate.is_file():
             summary_path = candidate
     xlsx_path = csv_to_xlsx(summary_path) if summary_path else None
+    csv_ok, csv_failed = count_summary_outcomes(summary_path)
     # Exit code 2 means some repos failed — still a usable partial/complete extract.
     if returncode == 0:
         phase = "completed"
@@ -568,8 +592,8 @@ def finalize_run_state(log_lines: list[str], returncode: int) -> None:
         xlsx_path=str(xlsx_path) if xlsx_path else None,
         output_dir=str(DEFAULT_OUTPUT.resolve()),
         finished_at=datetime.now(timezone.utc).isoformat(),
-        repos_ok=manifest.get("ok"),
-        repos_failed=manifest.get("failed"),
+        repos_ok=csv_ok if csv_ok is not None else manifest.get("ok"),
+        repos_failed=csv_failed if csv_failed is not None else manifest.get("failed"),
         log=log_lines[-500:],
     )
 
@@ -1242,10 +1266,34 @@ async function refresh(){
     persistFormSettings(data.form_settings);
     window.formRestoredFromServer=true;
   }
-  const phaseLabels={idle:'Ready', running:'Analysis running…', completed:'Completed successfully', failed:'Finished with errors'};
-  let label=data.running ? phaseLabels.running : phaseLabels[data.phase] || (data.returncode === 0 ? 'Completed successfully' : data.returncode === null ? 'Ready' : 'Finished with errors');
-  if (!data.running && data.phase==='completed' && data.repos_failed>0) label='Completed with some repository failures';
-  const status=document.querySelector('#status'); status.textContent=label; status.className='status '+(data.phase==='completed' || data.returncode===0 || data.returncode===2?'good':data.phase==='running' || data.returncode===null?'':'bad');
+  let label;
+  const isDone = !data.running && (data.phase==='completed' || data.phase==='failed' || data.returncode===0 || data.returncode===2);
+  if (data.running) {
+    label='Analysis running…';
+  } else if (isDone && data.repos_ok!=null) {
+    const ok=data.repos_ok, failed=data.repos_failed||0;
+    const s = ok===1 ? '' : 's';
+    label = failed>0
+      ? ('Completed — '+ok+' successful run'+s+', '+failed+' failed')
+      : ('Completed — '+ok+' successful run'+s);
+  } else if (data.phase==='completed' || data.returncode===0 || data.returncode===2) {
+    label='Completed';
+  } else if (data.returncode===null && data.phase!=='failed') {
+    label='Ready';
+  } else {
+    label='Finished with errors';
+  }
+  let statusClass;
+  if (data.running || (data.returncode===null && data.phase!=='failed')) {
+    statusClass='';  // running or idle
+  } else {
+    const ok=data.repos_ok||0, failed=data.repos_failed||0;
+    const totalFailure = data.phase==='failed'
+      || (data.returncode!=null && data.returncode!==0 && data.returncode!==2)
+      || (ok===0 && failed>0);
+    statusClass = totalFailure ? 'bad' : (failed>0 ? '' : 'good');  // green all-ok, neutral partial, red total fail
+  }
+  const status=document.querySelector('#status'); status.textContent=label; status.className='status '+statusClass;
   const meta=document.querySelector('#run-meta');
   const metaParts=[];
   if (data.started_at) metaParts.push('Started: '+new Date(data.started_at).toLocaleString());
