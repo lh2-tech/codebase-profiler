@@ -75,6 +75,28 @@ DEFAULT_GITLAB_TOKEN_NAME = "gitlab_token"
 GITHUB_APP_TOKEN_KEY = "__github_app_installation_token__"
 DEFAULT_CLONE_TIMEOUT_SECONDS = 300
 DEFAULT_CLONE_RETRIES = 2
+
+# ── large-repo cost controls ────────────────────────────────────────────────
+# The per-commit file-churn export (commits.jsonl) is the single most expensive
+# git step: it diffs every commit, which explodes on huge, binary-heavy histories
+# (e.g. a 14k-commit Android repo read over a slow Docker bind mount). For repos
+# past COMMIT_DETAIL_LIMIT commits we export per-file detail for only the most
+# recent N and skip rename detection. total_commits, authors, dates and the
+# merged-PR markers are unaffected — they come from cheaper full-history calls.
+# All three are override-able via env for tuning without a code change.
+#   EXTRACT_COMMIT_DETAIL_LIMIT  (0 = never cap; default 5000)
+#   EXTRACT_GIT_LOG_TIMEOUT      seconds for git-log steps (default 900)
+#   EXTRACT_SCC_TIMEOUT          seconds for scc (default 600)
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+COMMIT_DETAIL_LIMIT = _env_int("EXTRACT_COMMIT_DETAIL_LIMIT", 5000)
+GIT_LOG_TIMEOUT_SECONDS = _env_int("EXTRACT_GIT_LOG_TIMEOUT", 900)
+SCC_TIMEOUT_SECONDS = _env_int("EXTRACT_SCC_TIMEOUT", 600)
 RETRYABLE_ERROR_CLASSES = frozenset({"timeout", "rate_limit", "network"})
 
 BOT_NAME_PATTERNS = [
@@ -1174,14 +1196,36 @@ def aggregate_git_stats(repo: Path) -> dict[str, Any]:
     }
 
 
-def export_commits_jsonl(repo: Path, out_path: Path) -> int:
-    text = run_git(
-        repo,
-        "log",
-        "--pretty=format:COMMIT\t%H\t%aN\t%aE\t%aI\t%s",
-        "--numstat",
-        timeout=600,
-    )
+def export_commits_jsonl(
+    repo: Path,
+    out_path: Path,
+    *,
+    total_commits: int | None = None,
+    max_commits: int = COMMIT_DETAIL_LIMIT,
+    timeout: int = GIT_LOG_TIMEOUT_SECONDS,
+    log: logging.Logger | None = None,
+) -> int:
+    """Write per-commit file churn as JSONL.
+
+    For very large histories, cap the *detailed* export to the most recent
+    ``max_commits`` commits and skip rename detection — the two changes that make
+    a huge, binary-heavy repo finish cheaply. Full totals/authors/dates come from
+    ``aggregate_git_stats`` and are unaffected; a sibling ``commits_detail_meta``
+    records the cap so nothing is silently truncated.
+    """
+    pretty = "--pretty=format:COMMIT\t%H\t%aN\t%aE\t%aI\t%s"
+    capped = False
+    if max_commits and max_commits > 0:
+        if total_commits is None:
+            counted = run_git(repo, "rev-list", "--count", "HEAD", log=log).strip()
+            total_commits = int(counted) if counted.isdigit() else 0
+        if total_commits and total_commits > max_commits:
+            capped = True
+    if capped:
+        log_args = ["log", f"-n{max_commits}", "--no-renames", pretty, "--numstat"]
+    else:
+        log_args = ["log", pretty, "--numstat"]
+    text = run_git(repo, *log_args, timeout=timeout, log=log)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
     current: dict[str, Any] | None = None
@@ -1220,6 +1264,29 @@ def export_commits_jsonl(repo: Path, out_path: Path) -> int:
         if current is not None:
             fh.write(json.dumps(current, ensure_ascii=False) + "\n")
             count += 1
+    if capped:
+        if log is not None:
+            log.warning(
+                "commits.jsonl: exported per-file detail for the most recent %s of "
+                "%s commits (large history, cost cap); totals/authors/dates are complete.",
+                max_commits,
+                total_commits,
+            )
+        write_json(
+            out_path.parent / "commits_detail_meta.json",
+            {
+                "capped": True,
+                "total_commits": total_commits,
+                "detail_commits_exported": count,
+                "detail_limit": max_commits,
+                "rename_detection": False,
+                "note": (
+                    "Per-commit file churn was limited to the most recent commits to "
+                    "keep cost bounded on a large history. total_commits, authors, "
+                    "dates and merged-PR markers reflect the FULL history."
+                ),
+            },
+        )
     return count
 
 
@@ -1230,7 +1297,7 @@ def run_scc(repo: Path) -> dict[str, Any]:
         ["scc", "--format", "json", str(repo)],
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=SCC_TIMEOUT_SECONDS,
     )
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or "scc failed")[-500:])
@@ -1285,7 +1352,7 @@ def detect_merged_prs_from_git(repo: Path) -> list[dict[str, str]]:
         repo,
         "log",
         "--pretty=format:%H%x1f%aI%x1f%an%x1f%ae%x1f%s%x1f%b%x1e",
-        timeout=600,
+        timeout=GIT_LOG_TIMEOUT_SECONDS,
     )
     records: dict[str, dict[str, str]] = {}
     for raw_record in text.split("\x1e"):
@@ -2184,7 +2251,12 @@ def process_repo(
         row["bot_authors"] = git_stats["bot_authors"]
         row["bot_commit_ratio"] = git_stats["bot_commit_ratio"]
 
-        export_commits_jsonl(clone_path, git_dir / "commits.jsonl")
+        export_commits_jsonl(
+            clone_path,
+            git_dir / "commits.jsonl",
+            total_commits=git_stats.get("total_commits"),
+            log=log,
+        )
 
         scc = run_scc(clone_path)
         write_json(git_dir / "scc.json", scc)
