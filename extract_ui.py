@@ -34,6 +34,10 @@ STATE_FILE = DEFAULT_OUTPUT / ".ui_state.json"
 LOGO_PATH = ROOT / "LH2-DataLabs.svg"
 CSRF_TOKEN = secrets.token_urlsafe(32)
 UI_LOG_LOCK = threading.Lock()
+# Serializes building/reading the download archive so concurrent /download/zip
+# requests can't rebuild the same path on top of each other, or read it
+# half-written (U2).
+ZIP_LOCK = threading.Lock()
 
 from extract_org_raw_data import (  # noqa: E402
     discover_local_repositories,
@@ -1545,29 +1549,50 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 zip_value = STATE.get("zip_path")
                 run_dir_value = STATE.get("run_dir")
-            zip_path = Path(zip_value) if zip_value else None
+                running = bool(STATE.get("running"))
             run_dir = Path(run_dir_value) if run_dir_value else None
-            # Build (or rebuild) from the live run folder so partial downloads work mid-run.
-            if run_dir and run_dir.is_dir() and is_under_archive(run_dir):
-                try:
-                    zip_path = zip_run_dir(run_dir)
-                    set_state(zip_path=str(zip_path), run_dir=str(run_dir))
-                except Exception as exc:
-                    ui_log("Failed to build archive zip", exc=exc)
-                    self.respond(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        "text/plain",
-                        f"Unable to build archive zip: {exc}",
-                    )
-                    return
-            if not zip_path or not zip_path.is_file() or not is_under_archive(zip_path):
+            zip_path = Path(zip_value) if zip_value else (
+                run_dir.with_suffix(".zip") if run_dir else None
+            )
+            # Serialize build+read so two concurrent clicks can't rebuild the same
+            # path on top of each other, and no request reads a half-written zip.
+            payload: bytes | None = None
+            served_name = "archive.zip"
+            with ZIP_LOCK:
+                # Only (re)build when a run is live (partial download must reflect
+                # current progress) or when no final zip exists yet. A finished run
+                # already has its archive — reuse it instead of re-zipping GBs per click.
+                need_build = running or not (zip_path and zip_path.is_file())
+                if need_build and run_dir and run_dir.is_dir() and is_under_archive(run_dir):
+                    try:
+                        zip_path = zip_run_dir(run_dir)
+                        set_state(zip_path=str(zip_path), run_dir=str(run_dir))
+                    except Exception as exc:
+                        ui_log("Failed to build archive zip", exc=exc)
+                        self.respond(
+                            HTTPStatus.INTERNAL_SERVER_ERROR,
+                            "text/plain",
+                            f"Unable to build archive zip: {exc}",
+                        )
+                        return
+                if zip_path and zip_path.is_file() and is_under_archive(zip_path):
+                    served_name = zip_path.name
+                    with zip_path.open("rb") as handle:
+                        payload = handle.read()
+            if payload is None:
                 self.respond(
                     HTTPStatus.NOT_FOUND,
                     "text/plain",
                     "No archive zip is available yet.",
                 )
                 return
-            self.respond_file(zip_path, zip_path.name, "application/zip")
+            # Send outside the lock so the network transfer doesn't block other builds.
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{served_name}"')
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
             return
         if path == "/summary":
             with LOCK:
