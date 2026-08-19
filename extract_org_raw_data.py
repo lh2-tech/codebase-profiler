@@ -94,7 +94,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-COMMIT_DETAIL_LIMIT = _env_int("EXTRACT_COMMIT_DETAIL_LIMIT", 5000)
+COMMIT_DETAIL_LIMIT = _env_int("EXTRACT_COMMIT_DETAIL_LIMIT", 0)
 GIT_LOG_TIMEOUT_SECONDS = _env_int("EXTRACT_GIT_LOG_TIMEOUT", 900)
 SCC_TIMEOUT_SECONDS = _env_int("EXTRACT_SCC_TIMEOUT", 600)
 RETRYABLE_ERROR_CLASSES = frozenset({"timeout", "rate_limit", "network"})
