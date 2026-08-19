@@ -2293,7 +2293,20 @@ def process_repo(
                 row["llm_analysis_error"] = str(exc)[:500]
 
         if target.platform != "local":
-            shutil.rmtree(clone_path, ignore_errors=True)
+            try:
+                shutil.rmtree(clone_path)
+            except OSError as exc:
+                log.warning(
+                    "Failed to delete clone %s: %s (disk space may accumulate)",
+                    target.full_name,
+                    exc,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Unexpected error deleting clone %s: %s",
+                    target.full_name,
+                    exc,
+                )
         log.info(
             "OK %s: merged_prs=%s loc=%s span_days=%s",
             target.full_name,
@@ -2311,7 +2324,20 @@ def process_repo(
             row["error"],
         )
         if target.platform != "local":
-            shutil.rmtree(clone_path, ignore_errors=True)
+            try:
+                shutil.rmtree(clone_path)
+            except OSError as exc:
+                log.warning(
+                    "Failed to delete clone %s: %s (disk space may accumulate)",
+                    target.full_name,
+                    exc,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Unexpected error deleting clone %s: %s",
+                    target.full_name,
+                    exc,
+                )
 
     return row
 
