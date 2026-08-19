@@ -400,9 +400,9 @@ def count_gitlab_merged(
     params: dict[str, str] = {"state": "merged", "per_page": "100"}
 
     if since:
-        params["updated_after"] = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+        params["merged_after"] = since.strftime("%Y-%m-%dT%H:%M:%SZ")
     if until:
-        params["updated_before"] = until.strftime("%Y-%m-%dT%H:%M:%SZ")
+        params["merged_before"] = until.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     probe_params = {**params, "per_page": "1"}
     url = f"{api}/projects/{encoded}/merge_requests?{urllib.parse.urlencode(probe_params)}"
