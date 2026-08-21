@@ -798,6 +798,10 @@ def page() -> str:
   .toast.info { border-left-color:var(--accent); }
   .toast.success { border-left-color:var(--good); }
   .toast .tt { font-weight:700; margin-bottom:2px; }
+  .token-feedback { font-size:13px; margin-top:5px; min-height:18px; }
+  .success-text { color:var(--good); font-weight:500; }
+  .warning-text { color:#fbbf24; font-weight:500; }
+  .info-text { color:var(--muted); font-style:italic; }
 </style></head><body><div id="toast-tray"></div><main>
 <header class="brand">
   <img src="/logo.svg" alt="LH2 AI Labs" class="brand-logo">
@@ -822,8 +826,8 @@ __DOCKER_NOTICE__
   <div id="hosted-fields" class="hidden">
     <label class="field">Platform</label><select id="hosted-platform" name="hosted_platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option></select>
     <p class="notice">Paste a token below to use it for this run only — it is held in memory and never written to disk, logs, or the output archive. Leave the token box blank to read the credential from the mounted <code>tokens</code> file instead.</p>
-    <div id="github-fields"><label class="field">GitHub token</label><input name="github_token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste a token (ghp_… / github_pat_…) — or leave blank to use the token file"><label class="field">GitHub token key <span class="small">(only used when the token box above is empty)</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file"><label class="field">Organisation</label><div class="inline-actions"><button type="button" id="load-github-orgs" class="secondary">Load organisations</button><button type="button" id="load-github-accessible" class="secondary">Load accessible repositories</button></div><select name="github_org" id="github-org-select"><option value="">Choose an organisation (optional if using accessible repos or manual list)</option></select><p class="notice">Organisation listing only shows orgs you belong to. Use <strong>Load accessible repositories</strong> for direct collaborator access, or paste <code>owner/repo</code> names below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="github-accessible" type="checkbox" name="github_accessible"><strong>Analyse every accessible repository</strong><span class="small">Runs against all repos this token can access (owner, collaborator, and org member).</span></label></div>
-    <div id="gitlab-fields" class="hidden"><label class="field">GitLab token</label><input name="gitlab_token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste a token (glpat-…) — or leave blank to use the token file"><label class="field">GitLab token key <span class="small">(only used when the token box above is empty)</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file"><label class="field">GitLab host / base URL</label><input name="gitlab_host" id="gitlab-host" value="" placeholder="https://gitlab.com"><p class="notice">Optional. Use a full URL for self-hosted GitLab (for example <code>https://gitlab.example.com</code>). Leave blank for gitlab.com.</p><label class="field">Group</label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button><button type="button" id="load-gitlab-accessible" class="secondary">Load all projects</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group (optional if using all projects or manual list)</option></select><p class="notice">Group listing shows groups you belong to. Use <strong>Load all projects</strong> for every project this token can access via membership, or paste <code>group/project</code> paths below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="gitlab-accessible" type="checkbox" name="gitlab_accessible"><strong>Analyse every accessible project</strong><span class="small">Runs against all GitLab projects this token can access (membership).</span></label></div>
+    <div id="github-fields"><label class="field">GitHub token <span class="small">(PRIMARY METHOD)</span></label><input name="github_token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste token here (ghp_… / github_pat_…)"><div id="github-token-feedback" class="token-feedback"></div><label class="field">GitHub token key <span class="small">(FALLBACK: only used when the token box above is empty)</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file"><label class="field">Organisation</label><div class="inline-actions"><button type="button" id="load-github-orgs" class="secondary">Load organisations</button><button type="button" id="load-github-accessible" class="secondary">Load accessible repositories</button></div><select name="github_org" id="github-org-select"><option value="">Choose an organisation (optional if using accessible repos or manual list)</option></select><p class="notice">Organisation listing only shows orgs you belong to. Use <strong>Load accessible repositories</strong> for direct collaborator access, or paste <code>owner/repo</code> names below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="github-accessible" type="checkbox" name="github_accessible"><strong>Analyse every accessible repository</strong><span class="small">Runs against all repos this token can access (owner, collaborator, and org member).</span></label></div>
+    <div id="gitlab-fields" class="hidden"><label class="field">GitLab token <span class="small">(PRIMARY METHOD)</span></label><input name="gitlab_token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste token here (glpat-…)"><div id="gitlab-token-feedback" class="token-feedback"></div><label class="field">GitLab token key <span class="small">(FALLBACK: only used when the token box above is empty)</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file"><label class="field">GitLab host / base URL</label><input name="gitlab_host" id="gitlab-host" value="" placeholder="https://gitlab.com"><p class="notice">Optional. Use a full URL for self-hosted GitLab (for example <code>https://gitlab.example.com</code>). Leave blank for gitlab.com.</p><label class="field">Group</label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button><button type="button" id="load-gitlab-accessible" class="secondary">Load all projects</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group (optional if using all projects or manual list)</option></select><p class="notice">Group listing shows groups you belong to. Use <strong>Load all projects</strong> for every project this token can access via membership, or paste <code>group/project</code> paths below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="gitlab-accessible" type="checkbox" name="gitlab_accessible"><strong>Analyse every accessible project</strong><span class="small">Runs against all GitLab projects this token can access (membership).</span></label></div>
   </div>
   <div id="manual-repos-wrap" class="hidden">
     <label class="field" id="manual-repos-label">Manual repository list</label>
@@ -1217,6 +1221,36 @@ function tokenInField(platform){
   const name = platform==='gitlab' ? 'gitlab_token' : 'github_token';
   return (document.querySelector('[name='+name+']')?.value||'').trim();
 }
+// Validate token format and provide real-time feedback to user
+function validateTokenFormat(platform){
+  const token = tokenInField(platform);
+  const feedbackId = platform === 'gitlab' ? 'gitlab-token-feedback' : 'github-token-feedback';
+  const feedbackEl = document.getElementById(feedbackId);
+
+  if (!token) {
+    if (feedbackEl) feedbackEl.innerHTML = '<span class="info-text">Paste a token here, or leave blank to use the token file below</span>';
+    return;
+  }
+
+  // GitHub token validation
+  if (platform === 'github') {
+    const isValid = /^(ghp_|github_pat_)[a-zA-Z0-9_]{36,255}$/.test(token);
+    if (isValid) {
+      if (feedbackEl) feedbackEl.innerHTML = '<span class="success-text">✓ Token format looks valid</span>';
+    } else {
+      if (feedbackEl) feedbackEl.innerHTML = '<span class="warning-text">⚠ Token format invalid. GitHub tokens should start with ghp_ or github_pat_</span>';
+    }
+  }
+  // GitLab token validation
+  else if (platform === 'gitlab') {
+    const isValid = /^glpat-[a-zA-Z0-9_-]{20,}$/.test(token);
+    if (isValid) {
+      if (feedbackEl) feedbackEl.innerHTML = '<span class="success-text">✓ Token format looks valid</span>';
+    } else {
+      if (feedbackEl) feedbackEl.innerHTML = '<span class="warning-text">⚠ Token format invalid. GitLab tokens should start with glpat-</span>';
+    }
+  }
+}
 // Clears any previously loaded orgs/groups + the repo picker so a result from an
 // old token can never linger after the token changes or a fresh load fails.
 function resetDiscoveryResults(){
@@ -1243,9 +1277,17 @@ document.querySelector('#select-all-repos').addEventListener('click', ()=>docume
 document.querySelector('#clear-repos').addEventListener('click', ()=>document.querySelectorAll('input[name="selected_repos"]').forEach(el=>el.checked=false));
 document.querySelector('#refresh-resumable').addEventListener('click', loadResumableRuns);
 // Editing a token invalidates any orgs/repos loaded with the previous one.
+// Also provide real-time token format validation feedback.
 ['github_token','gitlab_token'].forEach(function(n){
   const el=document.querySelector('[name='+n+']');
-  if(el) el.addEventListener('input', resetDiscoveryResults);
+  if(el) {
+    el.addEventListener('input', resetDiscoveryResults);
+    // Add token format validation feedback
+    el.addEventListener('input', ()=>{
+      const platform = n === 'github_token' ? 'github' : 'gitlab';
+      validateTokenFormat(platform);
+    });
+  }
 });
 document.querySelector('#extract-form').addEventListener('input', ()=>{ persistFormSettings(readFormSettings()); clearInvalid(); });
 document.querySelector('#extract-form').addEventListener('change', ()=>persistFormSettings(readFormSettings()));

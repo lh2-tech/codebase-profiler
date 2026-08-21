@@ -251,15 +251,15 @@ def list_github_repos(token: str, org: str, host: str) -> list[str]:
     for kind in (f"orgs/{org}/repos", f"users/{org}/repos"):
         try:
             batch = paginate_github(f"{api}/{kind}?per_page=100&type=all", token)
-            if batch:
-                repos = [r["full_name"] for r in batch if not r.get("archived")]
-                break
-        except RuntimeError as e:
-            if "HTTP 404" not in str(e):
-                log.exception(f"{org} is not an organization.")
+        except RuntimeError as exc:
+            # If org endpoint returns 404, try the user endpoint instead
+            if "HTTP 404" not in str(exc):
                 raise
             continue
-    if not repos: 
+        if batch:
+            repos = [r["full_name"] for r in batch if not r.get("archived")]
+            break
+    if not repos:
         raise RuntimeError(f"No GitHub repos found for {org!r}")
     return repos
 

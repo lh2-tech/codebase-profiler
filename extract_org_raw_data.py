@@ -1101,7 +1101,11 @@ def clone_repo(
             return
         detail = proc.stderr or proc.stdout or "clone failed"
         detail = CLONE_CREDENTIAL_RE.sub(r"\1***:***@", detail)
-        shutil.rmtree(dest, ignore_errors=True)
+        try:
+            shutil.rmtree(dest)
+        except OSError as exc:
+            # Log cleanup failure but don't suppress - will be caught in process_repo()
+            log.warning("Cleanup failed after clone error (disk may be full): %s", exc)
         last_error = RuntimeError(detail[-800:])
         error_class = classify_error(last_error)
         # Auth / not-found will not improve with retries.
@@ -2327,11 +2331,21 @@ def process_repo(
             try:
                 shutil.rmtree(clone_path)
             except OSError as exc:
-                log.warning(
-                    "Failed to delete clone %s: %s (disk space may accumulate)",
-                    target.full_name,
-                    exc,
-                )
+                # If the original error was disk_full, escalate cleanup failure to CRITICAL
+                if row["error_class"] == "disk_full":
+                    log.critical(
+                        "CRITICAL: Cannot delete clone directory %s. Disk space may accumulate. "
+                        "Manual cleanup required: rm -rf %s\nCleanup error: %s",
+                        target.full_name,
+                        clone_path,
+                        exc,
+                    )
+                else:
+                    log.warning(
+                        "Failed to delete clone %s: %s",
+                        target.full_name,
+                        exc,
+                    )
             except Exception as exc:
                 log.warning(
                     "Unexpected error deleting clone %s: %s",
