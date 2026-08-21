@@ -15,7 +15,7 @@ import threading
 import traceback
 import webbrowser
 import zipfile
-from csv import reader
+from csv import DictReader, reader
 from datetime import datetime, timezone
 from html import escape
 from http import HTTPStatus
@@ -34,6 +34,10 @@ STATE_FILE = DEFAULT_OUTPUT / ".ui_state.json"
 LOGO_PATH = ROOT / "LH2-DataLabs.svg"
 CSRF_TOKEN = secrets.token_urlsafe(32)
 UI_LOG_LOCK = threading.Lock()
+# Serializes building/reading the download archive so concurrent /download/zip
+# requests can't rebuild the same path on top of each other, or read it
+# half-written (U2).
+ZIP_LOCK = threading.Lock()
 
 from extract_org_raw_data import (  # noqa: E402
     discover_local_repositories,
@@ -116,7 +120,12 @@ def redact_command_for_logs(command: list[str]) -> list[str]:
 def safe_form_settings_for_logs(settings: dict[str, Any] | None) -> dict[str, Any]:
     if not settings:
         return {}
-    blocked = {"openai_key", "password", "api_key", "token", "secret"}
+    blocked = {"openai_key", "password", "api_key",
+        "token",
+        "secret",
+        "github_token",
+        "gitlab_token",
+    }
     return {
         key: value
         for key, value in settings.items()
@@ -258,9 +267,18 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
 
 
 def read_token_from_fields(fields: dict[str, list[str]], platform: str) -> str:
+    # A token pasted into the UI takes priority and is used as-is (in memory
+    # only). An empty field falls back to the mounted tokens file + key name.
+    pasted_field = "github_token" if platform == "github" else "gitlab_token"
+    pasted = fields.get(pasted_field, [""])[0].strip()
+    if pasted:
+        return pasted
     tokens_file = Path(default_tokens_file())
     if not tokens_file.is_file():
-        raise ValueError(f"Tokens file not found: {tokens_file}")
+        raise ValueError(
+            "Paste a token above, or add the mounted tokens file "
+            f"({tokens_file})."
+        )
     tokens = parse_tokens_file(tokens_file)
     if platform == "github":
         token_name = fields.get("github_token_name", ["data-lh2-github-token"])[0].strip()
@@ -505,6 +523,29 @@ def parse_manifest_from_log(log_lines: list[str]) -> dict[str, Any]:
     return {}
 
 
+def count_summary_outcomes(summary_path: Path | None) -> tuple[int | None, int | None]:
+    """Ground-truth (ok, failed) from the produced summary.csv itself.
+
+    A row with a non-empty ``error`` column is a failure; everything else is a
+    success. This reflects what is actually in the deliverable, independent of the
+    extractor's own progress counters.
+    """
+    if not summary_path or not summary_path.is_file():
+        return None, None
+    try:
+        ok = 0
+        failed = 0
+        with summary_path.open(newline="", encoding="utf-8") as handle:
+            for row in DictReader(handle):
+                if str(row.get("error") or "").strip():
+                    failed += 1
+                else:
+                    ok += 1
+        return ok, failed
+    except OSError:
+        return None, None
+
+
 def finalize_run_state(log_lines: list[str], returncode: int) -> None:
     summary_path: Path | None = None
     zip_path: Path | None = None
@@ -536,6 +577,7 @@ def finalize_run_state(log_lines: list[str], returncode: int) -> None:
         if candidate.is_file():
             summary_path = candidate
     xlsx_path = csv_to_xlsx(summary_path) if summary_path else None
+    csv_ok, csv_failed = count_summary_outcomes(summary_path)
     # Exit code 2 means some repos failed — still a usable partial/complete extract.
     if returncode == 0:
         phase = "completed"
@@ -554,8 +596,8 @@ def finalize_run_state(log_lines: list[str], returncode: int) -> None:
         xlsx_path=str(xlsx_path) if xlsx_path else None,
         output_dir=str(DEFAULT_OUTPUT.resolve()),
         finished_at=datetime.now(timezone.utc).isoformat(),
-        repos_ok=manifest.get("ok"),
-        repos_failed=manifest.get("failed"),
+        repos_ok=csv_ok if csv_ok is not None else manifest.get("ok"),
+        repos_failed=csv_failed if csv_failed is not None else manifest.get("failed"),
         log=log_lines[-500:],
     )
 
@@ -749,7 +791,18 @@ def page() -> str:
   .picker-loading { color:#93c5fd; font-size:14px; padding:8px 4px; font-weight:600; }
   button.is-loading { opacity:.8; cursor:wait; }
   a { color:#93c5fd; }
-</style></head><body><main>
+  #toast-tray { position:fixed; top:16px; right:16px; display:flex; flex-direction:column; gap:10px; z-index:9999; max-width:360px; }
+  .toast { background:var(--surface-2); border:1px solid var(--border-strong); border-left-width:4px; border-radius:10px; padding:11px 13px; box-shadow:0 10px 30px #00000066; color:var(--text); font-size:13.5px; line-height:1.45; opacity:0; transform:translateX(12px); transition:opacity .18s ease, transform .18s ease; cursor:pointer; }
+  .toast.show { opacity:1; transform:none; }
+  .toast.error { border-left-color:var(--danger); }
+  .toast.info { border-left-color:var(--accent); }
+  .toast.success { border-left-color:var(--good); }
+  .toast .tt { font-weight:700; margin-bottom:2px; }
+  .token-feedback { font-size:13px; margin-top:5px; min-height:18px; }
+  .success-text { color:var(--good); font-weight:500; }
+  .warning-text { color:#fbbf24; font-weight:500; }
+  .info-text { color:var(--muted); font-style:italic; }
+</style></head><body><div id="toast-tray"></div><main>
 <header class="brand">
   <img src="/logo.svg" alt="LH2 AI Labs" class="brand-logo">
   <div>
@@ -772,9 +825,9 @@ __DOCKER_NOTICE__
   </div>
   <div id="hosted-fields" class="hidden">
     <label class="field">Platform</label><select id="hosted-platform" name="hosted_platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option></select>
-    <p class="notice">Credentials come from the mounted <code>tokens</code> file on your computer.</p>
-    <div id="github-fields"><label class="field">GitHub token key<span class="req">*</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file" required><label class="field">Organisation</label><div class="inline-actions"><button type="button" id="load-github-orgs" class="secondary">Load organisations</button><button type="button" id="load-github-accessible" class="secondary">Load accessible repositories</button></div><select name="github_org" id="github-org-select"><option value="">Choose an organisation (optional if using accessible repos or manual list)</option></select><p class="notice">Organisation listing only shows orgs you belong to. Use <strong>Load accessible repositories</strong> for direct collaborator access, or paste <code>owner/repo</code> names below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="github-accessible" type="checkbox" name="github_accessible"><strong>Analyse every accessible repository</strong><span class="small">Runs against all repos this token can access (owner, collaborator, and org member).</span></label></div>
-    <div id="gitlab-fields" class="hidden"><label class="field">GitLab token key<span class="req">*</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file" required><label class="field">GitLab host / base URL</label><input name="gitlab_host" id="gitlab-host" value="" placeholder="https://gitlab.com"><p class="notice">Optional. Use a full URL for self-hosted GitLab (for example <code>https://gitlab.example.com</code>). Leave blank for gitlab.com.</p><label class="field">Group</label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button><button type="button" id="load-gitlab-accessible" class="secondary">Load all projects</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group (optional if using all projects or manual list)</option></select><p class="notice">Group listing shows groups you belong to. Use <strong>Load all projects</strong> for every project this token can access via membership, or paste <code>group/project</code> paths below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="gitlab-accessible" type="checkbox" name="gitlab_accessible"><strong>Analyse every accessible project</strong><span class="small">Runs against all GitLab projects this token can access (membership).</span></label></div>
+    <p class="notice">Paste a token below to use it for this run only — it is held in memory and never written to disk, logs, or the output archive. Leave the token box blank to read the credential from the mounted <code>tokens</code> file instead.</p>
+    <div id="github-fields"><label class="field">GitHub token <span class="small">(PRIMARY METHOD)</span></label><input name="github_token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste token here (ghp_… / github_pat_…)"><div id="github-token-feedback" class="token-feedback"></div><label class="field">GitHub token key <span class="small">(FALLBACK: only used when the token box above is empty)</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file"><label class="field">Organisation</label><div class="inline-actions"><button type="button" id="load-github-orgs" class="secondary">Load organisations</button><button type="button" id="load-github-accessible" class="secondary">Load accessible repositories</button></div><select name="github_org" id="github-org-select"><option value="">Choose an organisation (optional if using accessible repos or manual list)</option></select><p class="notice">Organisation listing only shows orgs you belong to. Use <strong>Load accessible repositories</strong> for direct collaborator access, or paste <code>owner/repo</code> names below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="github-accessible" type="checkbox" name="github_accessible"><strong>Analyse every accessible repository</strong><span class="small">Runs against all repos this token can access (owner, collaborator, and org member).</span></label></div>
+    <div id="gitlab-fields" class="hidden"><label class="field">GitLab token <span class="small">(PRIMARY METHOD)</span></label><input name="gitlab_token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste token here (glpat-…)"><div id="gitlab-token-feedback" class="token-feedback"></div><label class="field">GitLab token key <span class="small">(FALLBACK: only used when the token box above is empty)</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file"><label class="field">GitLab host / base URL</label><input name="gitlab_host" id="gitlab-host" value="" placeholder="https://gitlab.com"><p class="notice">Optional. Use a full URL for self-hosted GitLab (for example <code>https://gitlab.example.com</code>). Leave blank for gitlab.com.</p><label class="field">Group</label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button><button type="button" id="load-gitlab-accessible" class="secondary">Load all projects</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group (optional if using all projects or manual list)</option></select><p class="notice">Group listing shows groups you belong to. Use <strong>Load all projects</strong> for every project this token can access via membership, or paste <code>group/project</code> paths below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="gitlab-accessible" type="checkbox" name="gitlab_accessible"><strong>Analyse every accessible project</strong><span class="small">Runs against all GitLab projects this token can access (membership).</span></label></div>
   </div>
   <div id="manual-repos-wrap" class="hidden">
     <label class="field" id="manual-repos-label">Manual repository list</label>
@@ -938,6 +991,8 @@ async function loadHostedOrgs(){
   const extra={
     hosted_platform:platform,
     tokens_file:DEFAULT_TOKENS_FILE,
+    github_token:document.querySelector('[name=github_token]')?.value||'',
+    gitlab_token:document.querySelector('[name=gitlab_token]')?.value||'',
     github_token_name:document.querySelector('[name=github_token_name]').value,
     gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
     gitlab_host:document.querySelector('[name=gitlab_host]')?.value||'',
@@ -948,7 +1003,8 @@ async function loadHostedOrgs(){
     if (platform==='github') fillSelect(document.querySelector('#github-org-select'), payload.items, 'Choose an organisation');
     else fillSelect(document.querySelector('#gitlab-group-select'), payload.items, 'Choose a group');
     document.querySelector('#repo-picker-wrap').classList.add('hidden');
-  } catch (error) { showFormError(error.message); }
+    noteFileSource(platform);
+  } catch (error) { resetDiscoveryResults(); showFormError(error.message); toast(error.message, 'error', 'Load failed'); }
   finally { setButtonLoading(button, false); }
 }
 async function loadHostedRepos(){
@@ -957,6 +1013,8 @@ async function loadHostedRepos(){
   const extra={
     hosted_platform:platform,
     tokens_file:DEFAULT_TOKENS_FILE,
+    github_token:document.querySelector('[name=github_token]')?.value||'',
+    gitlab_token:document.querySelector('[name=gitlab_token]')?.value||'',
     github_token_name:document.querySelector('[name=github_token_name]').value,
     gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
     gitlab_host:document.querySelector('[name=gitlab_host]')?.value||'',
@@ -973,9 +1031,11 @@ async function loadHostedRepos(){
     const payload=await postDiscover('/discover/repos', extra);
     rememberRepoChecks();
     renderRepoPicker(payload.items, platform==='gitlab' ? 'No projects found in this group.' : 'No repositories found for this selection.');
+    noteFileSource(platform);
   } catch (error) {
     document.querySelector('#repo-picker-wrap').classList.add('hidden');
     showFormError(error.message);
+    toast(error.message, 'error', 'Load failed');
   }
 }
 async function loadAccessibleGithubRepos(){
@@ -984,6 +1044,7 @@ async function loadAccessibleGithubRepos(){
   const extra={
     hosted_platform:'github',
     tokens_file:DEFAULT_TOKENS_FILE,
+    github_token:document.querySelector('[name=github_token]')?.value||'',
     github_token_name:document.querySelector('[name=github_token_name]').value,
   };
   setButtonLoading(button, true, 'Load accessible repositories');
@@ -995,9 +1056,11 @@ async function loadAccessibleGithubRepos(){
       payload.items,
       'No accessible repositories found for this token (owner, collaborator, or org member).'
     );
+    noteFileSource('github');
   } catch (error) {
     document.querySelector('#repo-picker-wrap').classList.add('hidden');
     showFormError(error.message);
+    toast(error.message, 'error', 'Load failed');
   } finally {
     setButtonLoading(button, false);
   }
@@ -1008,6 +1071,7 @@ async function loadAccessibleGitlabProjects(){
   const extra={
     hosted_platform:'gitlab',
     tokens_file:DEFAULT_TOKENS_FILE,
+    gitlab_token:document.querySelector('[name=gitlab_token]')?.value||'',
     gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
     gitlab_host:document.querySelector('[name=gitlab_host]')?.value||'',
   };
@@ -1020,9 +1084,11 @@ async function loadAccessibleGitlabProjects(){
       payload.items,
       'No accessible GitLab projects found for this token (membership).'
     );
+    noteFileSource('gitlab');
   } catch (error) {
     document.querySelector('#repo-picker-wrap').classList.add('hidden');
     showFormError(error.message);
+    toast(error.message, 'error', 'Load failed');
   } finally {
     setButtonLoading(button, false);
   }
@@ -1036,7 +1102,8 @@ function validateForm(){
   const isResume=!!(data.resume_run_dir||'').trim();
   if (data.mode!=='offline') {
     if (data.hosted_platform==='github') {
-      if (!data.github_token_name.trim()) errors.push(['github_token_name','Enter the GitHub token key.']);
+      const ghToken=(document.querySelector('[name=github_token]')?.value||'').trim();
+      if (!ghToken && !data.github_token_name.trim()) errors.push(['github_token','Paste a GitHub token, or enter the token key from your file.']);
       const hasOrg=!!data.github_org.trim();
       const hasSelected=getSelectedRepos().length>0;
       const hasManual=getManualRepos().length>0;
@@ -1045,7 +1112,8 @@ function validateForm(){
         errors.push(['github-org-select','Choose an organisation, load/select accessible repos, paste a manual list, or enable “Analyse every accessible repository”.']);
       }
     } else {
-      if (!data.gitlab_token_name.trim()) errors.push(['gitlab_token_name','Enter the GitLab token key.']);
+      const glToken=(document.querySelector('[name=gitlab_token]')?.value||'').trim();
+      if (!glToken && !data.gitlab_token_name.trim()) errors.push(['gitlab_token','Paste a GitLab token, or enter the token key from your file.']);
       if (data.gitlab_host.trim() && !/^https?:\/\//i.test(data.gitlab_host.trim())) {
         errors.push(['gitlab-host','GitLab host must be a full URL, for example https://gitlab.example.com']);
       }
@@ -1138,6 +1206,63 @@ async function loadResumableRuns(){
 function persistFormSettings(settings){ try { localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(settings)); } catch (_) {} }
 function loadStoredFormSettings(){ try { const raw=localStorage.getItem(FORM_STORAGE_KEY); return raw ? JSON.parse(raw) : null; } catch (_) { return null; } }
 function showFormError(message){ const el=document.querySelector('#form-error'); if (!message) { el.textContent=''; el.classList.add('hidden'); return; } el.textContent=message; el.classList.remove('hidden'); }
+function toast(message, type, title){
+  const tray=document.querySelector('#toast-tray'); if(!tray) return;
+  const el=document.createElement('div'); el.className='toast '+(type||'info');
+  if(title){ const t=document.createElement('div'); t.className='tt'; t.textContent=title; el.appendChild(t); }
+  const b=document.createElement('div'); b.textContent=message||''; el.appendChild(b);
+  tray.appendChild(el);
+  requestAnimationFrame(()=>el.classList.add('show'));
+  const kill=()=>{ el.classList.remove('show'); setTimeout(()=>el.remove(),200); };
+  el.addEventListener('click', kill);
+  setTimeout(kill, type==='error' ? 7000 : 4500);
+}
+function tokenInField(platform){
+  const name = platform==='gitlab' ? 'gitlab_token' : 'github_token';
+  return (document.querySelector('[name='+name+']')?.value||'').trim();
+}
+// Validate token format and provide real-time feedback to user
+function validateTokenFormat(platform){
+  const token = tokenInField(platform);
+  const feedbackId = platform === 'gitlab' ? 'gitlab-token-feedback' : 'github-token-feedback';
+  const feedbackEl = document.getElementById(feedbackId);
+
+  if (!token) {
+    if (feedbackEl) feedbackEl.innerHTML = '<span class="info-text">Paste a token here, or leave blank to use the token file below</span>';
+    return;
+  }
+
+  // GitHub token validation
+  if (platform === 'github') {
+    const isValid = /^(ghp_|github_pat_)[a-zA-Z0-9_]{36,255}$/.test(token);
+    if (isValid) {
+      if (feedbackEl) feedbackEl.innerHTML = '<span class="success-text">✓ Token format looks valid</span>';
+    } else {
+      if (feedbackEl) feedbackEl.innerHTML = '<span class="warning-text">⚠ Token format invalid. GitHub tokens should start with ghp_ or github_pat_</span>';
+    }
+  }
+  // GitLab token validation
+  else if (platform === 'gitlab') {
+    const isValid = /^glpat-[a-zA-Z0-9_-]{20,}$/.test(token);
+    if (isValid) {
+      if (feedbackEl) feedbackEl.innerHTML = '<span class="success-text">✓ Token format looks valid</span>';
+    } else {
+      if (feedbackEl) feedbackEl.innerHTML = '<span class="warning-text">⚠ Token format invalid. GitLab tokens should start with glpat-</span>';
+    }
+  }
+}
+// Clears any previously loaded orgs/groups + the repo picker so a result from an
+// old token can never linger after the token changes or a fresh load fails.
+function resetDiscoveryResults(){
+  const gh=document.querySelector('#github-org-select'); if(gh) fillSelect(gh, [], 'Choose an organisation');
+  const gl=document.querySelector('#gitlab-group-select'); if(gl) fillSelect(gl, [], 'Choose a group');
+  const wrap=document.querySelector('#repo-picker-wrap'); if(wrap) wrap.classList.add('hidden');
+  const picker=document.querySelector('#repo-picker'); if(picker) picker.innerHTML='<p class="picker-empty">Load repositories to choose which ones to include.</p>';
+}
+// After a successful hosted load/run, tell the user when the file credential was used.
+function noteFileSource(platform){
+  if(!tokenInField(platform)) toast('Using the token from your tokens file.', 'info', 'File credential');
+}
 document.querySelectorAll('input[name=mode]').forEach(e=>e.addEventListener('change',choose));
 document.querySelector('#hosted-platform').addEventListener('change',choosePlatform);
 document.querySelector('#llm-enabled').addEventListener('change',chooseLlm);
@@ -1151,19 +1276,46 @@ document.querySelector('#gitlab-group-select').addEventListener('change', loadHo
 document.querySelector('#select-all-repos').addEventListener('click', ()=>document.querySelectorAll('input[name="selected_repos"]').forEach(el=>el.checked=true));
 document.querySelector('#clear-repos').addEventListener('click', ()=>document.querySelectorAll('input[name="selected_repos"]').forEach(el=>el.checked=false));
 document.querySelector('#refresh-resumable').addEventListener('click', loadResumableRuns);
+// Editing a token invalidates any orgs/repos loaded with the previous one.
+// Also provide real-time token format validation feedback.
+['github_token','gitlab_token'].forEach(function(n){
+  const el=document.querySelector('[name='+n+']');
+  if(el) {
+    el.addEventListener('input', resetDiscoveryResults);
+    // Add token format validation feedback
+    el.addEventListener('input', ()=>{
+      const platform = n === 'github_token' ? 'github' : 'gitlab';
+      validateTokenFormat(platform);
+    });
+  }
+});
 document.querySelector('#extract-form').addEventListener('input', ()=>{ persistFormSettings(readFormSettings()); clearInvalid(); });
 document.querySelector('#extract-form').addEventListener('change', ()=>persistFormSettings(readFormSettings()));
 document.querySelector('#extract-form').addEventListener('submit', async (event)=>{
   event.preventDefault();
   showFormError('');
   if (!validateForm()) return;
+  // Client-side double-submit guard: block a second request while one is in
+  // flight (complements the server's atomic run-slot claim).
+  if (window.startInFlight) return;
+  window.startInFlight=true;
+  const startBtn=document.querySelector('#start'); if (startBtn) startBtn.disabled=true;
   const form=event.target;
   const body=new URLSearchParams(new FormData(form));
-  const response=await fetch('/start', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
-  const text=await response.text();
-  if (!response.ok) { showFormError(text || 'Unable to start analysis.'); return; }
-  persistFormSettings(readFormSettings());
-  window.loadedSummary=false;
+  try {
+    const response=await fetch('/start', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+    const text=await response.text();
+    if (!response.ok) { showFormError(text || 'Unable to start analysis.'); toast(text || 'Unable to start analysis.', 'error', 'Could not start'); if (startBtn) startBtn.disabled=false; return; }
+    persistFormSettings(readFormSettings());
+    window.loadedSummary=false;
+    const startedMode=document.querySelector('input[name=mode]:checked')?.value;
+    if (startedMode==='hosted') noteFileSource(document.querySelector('#hosted-platform')?.value);
+  } catch (err) {
+    showFormError('Unable to start analysis.'); toast(String(err&&err.message||err), 'error', 'Could not start');
+    if (startBtn) startBtn.disabled=false;
+  } finally {
+    window.startInFlight=false;
+  }
 });
 async function refresh(){
   const data=await fetch('/status').then(r=>r.json());
@@ -1172,10 +1324,34 @@ async function refresh(){
     persistFormSettings(data.form_settings);
     window.formRestoredFromServer=true;
   }
-  const phaseLabels={idle:'Ready', running:'Analysis running…', completed:'Completed successfully', failed:'Finished with errors'};
-  let label=data.running ? phaseLabels.running : phaseLabels[data.phase] || (data.returncode === 0 ? 'Completed successfully' : data.returncode === null ? 'Ready' : 'Finished with errors');
-  if (!data.running && data.phase==='completed' && data.repos_failed>0) label='Completed with some repository failures';
-  const status=document.querySelector('#status'); status.textContent=label; status.className='status '+(data.phase==='completed' || data.returncode===0 || data.returncode===2?'good':data.phase==='running' || data.returncode===null?'':'bad');
+  let label;
+  const isDone = !data.running && (data.phase==='completed' || data.phase==='failed' || data.returncode===0 || data.returncode===2);
+  if (data.running) {
+    label='Analysis running…';
+  } else if (isDone && data.repos_ok!=null) {
+    const ok=data.repos_ok, failed=data.repos_failed||0;
+    const s = ok===1 ? '' : 's';
+    label = failed>0
+      ? ('Completed — '+ok+' successful run'+s+', '+failed+' failed')
+      : ('Completed — '+ok+' successful run'+s);
+  } else if (data.phase==='completed' || data.returncode===0 || data.returncode===2) {
+    label='Completed';
+  } else if (data.returncode===null && data.phase!=='failed') {
+    label='Ready';
+  } else {
+    label='Finished with errors';
+  }
+  let statusClass;
+  if (data.running || (data.returncode===null && data.phase!=='failed')) {
+    statusClass='';  // running or idle
+  } else {
+    const ok=data.repos_ok||0, failed=data.repos_failed||0;
+    const totalFailure = data.phase==='failed'
+      || (data.returncode!=null && data.returncode!==0 && data.returncode!==2)
+      || (ok===0 && failed>0);
+    statusClass = totalFailure ? 'bad' : (failed>0 ? '' : 'good');  // green all-ok, neutral partial, red total fail
+  }
+  const status=document.querySelector('#status'); status.textContent=label; status.className='status '+statusClass;
   const meta=document.querySelector('#run-meta');
   const metaParts=[];
   if (data.started_at) metaParts.push('Started: '+new Date(data.started_at).toLocaleString());
@@ -1415,29 +1591,50 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 zip_value = STATE.get("zip_path")
                 run_dir_value = STATE.get("run_dir")
-            zip_path = Path(zip_value) if zip_value else None
+                running = bool(STATE.get("running"))
             run_dir = Path(run_dir_value) if run_dir_value else None
-            # Build (or rebuild) from the live run folder so partial downloads work mid-run.
-            if run_dir and run_dir.is_dir() and is_under_archive(run_dir):
-                try:
-                    zip_path = zip_run_dir(run_dir)
-                    set_state(zip_path=str(zip_path), run_dir=str(run_dir))
-                except Exception as exc:
-                    ui_log("Failed to build archive zip", exc=exc)
-                    self.respond(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        "text/plain",
-                        f"Unable to build archive zip: {exc}",
-                    )
-                    return
-            if not zip_path or not zip_path.is_file() or not is_under_archive(zip_path):
+            zip_path = Path(zip_value) if zip_value else (
+                run_dir.with_suffix(".zip") if run_dir else None
+            )
+            # Serialize build+read so two concurrent clicks can't rebuild the same
+            # path on top of each other, and no request reads a half-written zip.
+            payload: bytes | None = None
+            served_name = "archive.zip"
+            with ZIP_LOCK:
+                # Only (re)build when a run is live (partial download must reflect
+                # current progress) or when no final zip exists yet. A finished run
+                # already has its archive — reuse it instead of re-zipping GBs per click.
+                need_build = running or not (zip_path and zip_path.is_file())
+                if need_build and run_dir and run_dir.is_dir() and is_under_archive(run_dir):
+                    try:
+                        zip_path = zip_run_dir(run_dir)
+                        set_state(zip_path=str(zip_path), run_dir=str(run_dir))
+                    except Exception as exc:
+                        ui_log("Failed to build archive zip", exc=exc)
+                        self.respond(
+                            HTTPStatus.INTERNAL_SERVER_ERROR,
+                            "text/plain",
+                            f"Unable to build archive zip: {exc}",
+                        )
+                        return
+                if zip_path and zip_path.is_file() and is_under_archive(zip_path):
+                    served_name = zip_path.name
+                    with zip_path.open("rb") as handle:
+                        payload = handle.read()
+            if payload is None:
                 self.respond(
                     HTTPStatus.NOT_FOUND,
                     "text/plain",
                     "No archive zip is available yet.",
                 )
                 return
-            self.respond_file(zip_path, zip_path.name, "application/zip")
+            # Send outside the lock so the network transfer doesn't block other builds.
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{served_name}"')
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
             return
         if path == "/summary":
             with LOCK:
@@ -1746,6 +1943,10 @@ class Handler(BaseHTTPRequestHandler):
             if retry_failed:
                 command.append("--retry-failed")
 
+        # Secrets (pasted tokens, OpenAI key) travel to the child via the
+        # environment only — never argv — so they stay out of logs and archives.
+        env_overrides: dict[str, str] = {}
+
         if mode == "offline":
             local_dir = default_local_repos_dir()
             if not resume_run_dir and (not local_dir or not Path(local_dir).is_dir()):
@@ -1763,27 +1964,29 @@ class Handler(BaseHTTPRequestHandler):
                 for repo_name in selected_repos:
                     command.extend(["--local-repo", repo_name])
         elif mode == "hosted":
+            platform = fields.get("hosted_platform", ["github"])[0]
             tokens_file = default_tokens_file()
-            if not Path(tokens_file).is_file():
+            have_tokens_file = Path(tokens_file).is_file()
+            pasted_field = "github_token" if platform == "github" else "gitlab_token"
+            pasted_token = fields.get(pasted_field, [""])[0].strip()
+            if not pasted_token and not have_tokens_file:
                 self.respond(
                     HTTPStatus.BAD_REQUEST,
                     "text/plain",
-                    "Tokens file not found. Copy tokens.example to tokens and fill in credentials.",
+                    "Paste a token above, or create the tokens file "
+                    "(copy tokens.example to tokens and fill in credentials).",
                 )
                 return
-            command.extend(["--tokens-file", tokens_file])
-            platform = fields.get("hosted_platform", ["github"])[0]
+            if have_tokens_file:
+                command.extend(["--tokens-file", tokens_file])
             if platform == "github":
                 org = fields.get("github_org", [""])[0].strip()
-                token_name = fields.get("github_token_name", [""])[0].strip()
+                # Key name is only meaningful for the file; default it so a
+                # pasted-token run (no key entered) still resolves cleanly.
+                token_name = fields.get("github_token_name", [""])[0].strip() or "ui-github-token"
                 github_accessible = fields.get("github_accessible", [""])[0] == "on"
-                if not token_name:
-                    self.respond(
-                        HTTPStatus.BAD_REQUEST,
-                        "text/plain",
-                        "Enter the GitHub token key.",
-                    )
-                    return
+                if pasted_token:
+                    env_overrides["EXTRACT_GITHUB_TOKEN"] = pasted_token
                 if not resume_run_dir:
                     if selected_repos:
                         for repo_name in selected_repos:
@@ -1803,7 +2006,7 @@ class Handler(BaseHTTPRequestHandler):
                 command.extend(["--github-token-name", token_name])
             elif platform == "gitlab":
                 group = fields.get("gitlab_group", [""])[0].strip()
-                token_name = fields.get("gitlab_token_name", [""])[0].strip()
+                token_name = fields.get("gitlab_token_name", [""])[0].strip() or "gitlab_token"
                 gitlab_accessible = fields.get("gitlab_accessible", [""])[0] == "on"
                 try:
                     gitlab_host = normalize_gitlab_host(
@@ -1812,13 +2015,8 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     self.respond(HTTPStatus.BAD_REQUEST, "text/plain", str(exc))
                     return
-                if not token_name:
-                    self.respond(
-                        HTTPStatus.BAD_REQUEST,
-                        "text/plain",
-                        "Enter the GitLab token key.",
-                    )
-                    return
+                if pasted_token:
+                    env_overrides["EXTRACT_GITLAB_TOKEN"] = pasted_token
                 if not resume_run_dir:
                     if selected_repos:
                         for project in selected_repos:
@@ -1845,7 +2043,6 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Unknown mode.")
             return
 
-        env_overrides: dict[str, str] = {}
         if fields.get("llm_enabled", [""])[0] == "on":
             openai_key = fields.get("openai_key", [""])[0].strip()
             if not openai_key:
@@ -1859,10 +2056,15 @@ class Handler(BaseHTTPRequestHandler):
             # Keep the key out of command arguments, logs, and output archives.
             env_overrides["OPENAI_API_KEY"] = openai_key
 
+        # Atomically claim the single run slot: check *and* set running under one
+        # lock hold so two concurrent /start requests can't both pass the guard
+        # (ThreadingHTTPServer handles each request on its own thread). set_state
+        # re-acquires LOCK, so we mutate STATE directly here rather than call it.
         with LOCK:
             if STATE["running"]:
                 self.respond(HTTPStatus.CONFLICT, "text/plain", "An extraction is already running.")
                 return
+            STATE["running"] = True
         ui_log(
             "Queued extraction "
             f"settings={json.dumps(safe_form_settings_for_logs(form_settings), ensure_ascii=False)} "

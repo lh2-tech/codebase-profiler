@@ -125,12 +125,29 @@ def http_get_json(
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             last_error = RuntimeError(f"HTTP {exc.code} for {url}: {detail}")
-            if exc.code not in _RETRYABLE_HTTP or attempt >= retries - 1:
-                raise last_error from exc
-            if exc.code == 429:
+
+            # Detect rate limits: both HTTP 429 and HTTP 403 with rate-limit message
+            # (GitHub returns 403 for secondary/abuse rate limits)
+            is_rate_limit_429 = exc.code == 429
+            is_rate_limit_403 = exc.code == 403 and _is_rate_limit_text(detail)
+            is_rate_limit = is_rate_limit_429 or is_rate_limit_403
+
+            # If it's a rate limit, trigger cooldown and retry
+            if is_rate_limit:
+                if attempt >= retries - 1:
+                    raise last_error from exc
                 _schedule_github_rate_limit_cooldown(url)
                 continue
-            time.sleep(_retry_after_seconds(exc, attempt))
+
+            # For other retryable errors (502, 503, 504), use exponential backoff
+            if exc.code in _RETRYABLE_HTTP:
+                if attempt >= retries - 1:
+                    raise last_error from exc
+                time.sleep(_retry_after_seconds(exc, attempt))
+                continue
+
+            # Non-retryable errors (403 without rate limit, 401, etc.) fail immediately
+            raise last_error from exc
         except (TimeoutError, urllib.error.URLError) as exc:
             last_error = RuntimeError(f"Network error for {url}: {exc}")
             if attempt >= retries - 1:
@@ -232,7 +249,13 @@ def list_github_repos(token: str, org: str, host: str) -> list[str]:
     api = github_api(token, host)
     repos: list[str] = []
     for kind in (f"orgs/{org}/repos", f"users/{org}/repos"):
-        batch = paginate_github(f"{api}/{kind}?per_page=100&type=all", token)
+        try:
+            batch = paginate_github(f"{api}/{kind}?per_page=100&type=all", token)
+        except RuntimeError as exc:
+            # If org endpoint returns 404, try the user endpoint instead
+            if "HTTP 404" not in str(exc):
+                raise
+            continue
         if batch:
             repos = [r["full_name"] for r in batch if not r.get("archived")]
             break
@@ -383,9 +406,9 @@ def count_gitlab_merged(
     params: dict[str, str] = {"state": "merged", "per_page": "100"}
 
     if since:
-        params["updated_after"] = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+        params["merged_after"] = since.strftime("%Y-%m-%dT%H:%M:%SZ")
     if until:
-        params["updated_before"] = until.strftime("%Y-%m-%dT%H:%M:%SZ")
+        params["merged_before"] = until.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     probe_params = {**params, "per_page": "1"}
     url = f"{api}/projects/{encoded}/merge_requests?{urllib.parse.urlencode(probe_params)}"
