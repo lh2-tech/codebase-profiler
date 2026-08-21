@@ -185,6 +185,7 @@ SUMMARY_FIELDS = [
     "org",
     "project_name",
     "repo",
+    "branch",
     "merged_prs",
     "languages_breakdown",
     "repo_created_at",
@@ -436,6 +437,7 @@ class RepoTarget:
     full_name: str
     meta: dict[str, Any]
     local_path: Path | None = None
+    branch: str | None = None  # Branch name for multi-branch analysis
 
 
 def parse_tokens_file(path: Path) -> dict[str, str]:
@@ -652,6 +654,10 @@ class JobCheckpoint:
                     if not org or not repo:
                         continue
                     key = repo_row_key(org, repo)
+                    # Include branch in key for multi-branch analysis support
+                    branch = str(row.get("branch") or "").strip()
+                    if branch:
+                        key = f"{key}@{branch}"
                     job.rows_by_key[key] = dict(row)
                     if key not in job.status_by_key:
                         error = str(row.get("error") or "").strip()
@@ -685,7 +691,11 @@ class JobCheckpoint:
         return failed
 
     def record(self, full_name: str, row: dict[str, Any]) -> None:
+        # Include branch in key for multi-branch analysis support
         key = full_name.strip("/")
+        branch = str(row.get("branch") or "").strip()
+        if branch:
+            key = f"{key}@{branch}"
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         error = str(row.get("error") or "").strip()
         error_class = str(row.get("error_class") or "").strip()
@@ -720,6 +730,10 @@ class JobCheckpoint:
             self.rows_by_key = {}
             for row in rows:
                 key = repo_row_key(str(row.get("org") or ""), str(row.get("repo") or ""))
+                # Include branch in key for multi-branch analysis support
+                branch = str(row.get("branch") or "").strip()
+                if branch:
+                    key = f"{key}@{branch}"
                 if key:
                     self.rows_by_key[key] = dict(row)
             self.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -2193,13 +2207,14 @@ def filter_local_targets(
 # ── per-repo orchestration ──────────────────────────────────────────────────
 
 
-def empty_summary_row(org: str, repo: str) -> dict[str, Any]:
+def empty_summary_row(org: str, repo: str, branch: str | None = None) -> dict[str, Any]:
     row: dict[str, Any] = {k: "" for k in SUMMARY_FIELDS}
     row.update(
         {
             "org": org,
             "project_name": org,
             "repo": repo,
+            "branch": branch or "",
             "merged_prs": 0,
             "loc": 0,
             "total_files": 0,
@@ -2234,13 +2249,16 @@ def process_repo(
 ) -> dict[str, Any]:
     org = target.org
     repo = target.full_name.split("/")[-1]
-    slug = safe_name(target.full_name.replace("/", "__"))
+    branch = target.branch
+    # Include branch in slug for multi-branch analysis
+    branch_suffix = f"__{safe_name(branch)}" if branch else ""
+    slug = safe_name(target.full_name.replace("/", "__")) + branch_suffix
     api_dir = run_dir / "api" / slug
     git_dir = run_dir / "git" / slug
     api_dir.mkdir(parents=True, exist_ok=True)
     git_dir.mkdir(parents=True, exist_ok=True)
 
-    row = empty_summary_row(org, repo)
+    row = empty_summary_row(org, repo, branch)
     meta = target.meta
     if target.platform != "local":
         write_json(api_dir / "repo.json", meta)
@@ -2312,6 +2330,12 @@ def process_repo(
                 retries=clone_retries,
                 log=log,
             )
+            # Checkout the specified branch if provided
+            if branch:
+                try:
+                    run_git(clone_path, "checkout", branch, timeout=60, log=log)
+                except Exception as exc:
+                    log.warning("Failed to checkout branch %s: %s", branch, exc)
 
         git_stats = aggregate_git_stats(clone_path)
         write_json(git_dir / "git_stats.json", git_stats)
@@ -2384,9 +2408,14 @@ def process_repo(
                     target.full_name,
                     exc,
                 )
+        # Log message with branch info for multi-branch analysis
+        if target.branch:
+            log_ident = f"{target.full_name}:{target.branch}"
+        else:
+            log_ident = target.full_name
         log.info(
             "OK %s: merged_prs=%s loc=%s span_days=%s",
-            target.full_name,
+            log_ident,
             row["merged_prs"],
             row["loc"],
             row["span_days"],
@@ -2394,9 +2423,14 @@ def process_repo(
     except Exception as exc:
         row["error"] = str(exc)[:500]
         row["error_class"] = classify_error(exc)
+        # Log message with branch info for multi-branch analysis
+        if target.branch:
+            log_ident = f"{target.full_name}:{target.branch}"
+        else:
+            log_ident = target.full_name
         log.exception(
             "FAIL %s [%s]: %s",
-            target.full_name,
+            log_ident,
             row["error_class"],
             row["error"],
         )
@@ -2429,6 +2463,61 @@ def process_repo(
     return row
 
 
+def generate_branch_consolidated_csvs(rows: list[dict[str, Any]], run_dir: Path) -> None:
+    """Generate per-branch and consolidated CSVs for multi-branch analysis.
+
+    For repos with multiple branches selected, creates:
+    - owner-repo_branch.csv for each branch
+    - owner-repo_all-branches.csv consolidated file
+    """
+    # Group rows by repo (org/repo)
+    repos_by_key: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        org = str(row.get("org") or "")
+        repo = str(row.get("repo") or "")
+        if not org or not repo:
+            continue
+        key = f"{org}/{repo}"
+        if key not in repos_by_key:
+            repos_by_key[key] = []
+        repos_by_key[key].append(row)
+
+    # For each repo with multiple branches, write branch-specific and consolidated CSVs
+    for repo_key, repo_rows in repos_by_key.items():
+        # Check if this repo has multiple branches
+        branches = set()
+        for row in repo_rows:
+            branch = str(row.get("branch") or "").strip()
+            if branch:
+                branches.add(branch)
+
+        if len(branches) > 1:
+            # Multiple branches: write per-branch CSVs
+            org, repo = repo_key.split("/", 1)
+            safe_repo_name = safe_name(repo_key.replace("/", "-"))
+
+            for branch in sorted(branches):
+                branch_rows = [r for r in repo_rows if str(r.get("branch") or "").strip() == branch]
+                if branch_rows:
+                    branch_csv_name = f"{safe_repo_name}_{safe_name(branch)}.csv"
+                    branch_csv_path = run_dir / branch_csv_name
+                    write_branch_csv(branch_csv_path, branch_rows)
+
+            # Write consolidated CSV for all branches
+            consolidated_csv_name = f"{safe_repo_name}_all-branches.csv"
+            consolidated_csv_path = run_dir / consolidated_csv_name
+            write_branch_csv(consolidated_csv_path, repo_rows)
+
+
+def write_branch_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Write rows to a CSV file with proper fieldnames."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def zip_run_dir(run_dir: Path) -> Path:
     zip_path = run_dir.with_suffix(".zip")
     if zip_path.exists():
@@ -2451,9 +2540,31 @@ def serialize_targets(targets: list[RepoTarget]) -> list[dict[str, Any]]:
             "full_name": target.full_name,
             "meta": target.meta,
             "local_path": str(target.local_path) if target.local_path else None,
+            "branch": target.branch,
         }
         for target in targets
     ]
+
+
+def parse_branch_selections(branch_selections: list[str]) -> dict[str, list[str]]:
+    """Parse branch selections from format: ['repo_id:branch1', 'repo_id:branch2', ...]
+
+    Returns dict mapping repo_id to list of branch names.
+    """
+    branches_by_repo: dict[str, list[str]] = {}
+    for selection in branch_selections:
+        selection = selection.strip()
+        if not selection or ":" not in selection:
+            continue
+        repo_id, branch = selection.split(":", 1)
+        repo_id = repo_id.strip()
+        branch = branch.strip()
+        if repo_id and branch:
+            if repo_id not in branches_by_repo:
+                branches_by_repo[repo_id] = []
+            if branch not in branches_by_repo[repo_id]:
+                branches_by_repo[repo_id].append(branch)
+    return branches_by_repo
 
 
 def load_targets_from_repos_json(path: Path) -> list[RepoTarget] | None:
@@ -2477,6 +2588,7 @@ def load_targets_from_repos_json(path: Path) -> list[RepoTarget] | None:
         local_raw = item.get("local_path")
         local_path = Path(local_raw) if local_raw else None
         meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        branch = str(item.get("branch") or "").strip() or None
         targets.append(
             RepoTarget(
                 platform=platform,
@@ -2484,6 +2596,7 @@ def load_targets_from_repos_json(path: Path) -> list[RepoTarget] | None:
                 full_name=full_name,
                 meta=meta,
                 local_path=local_path,
+                branch=branch,
             )
         )
     return targets or None
@@ -2505,6 +2618,9 @@ def filter_targets_for_resume(
     skipped_failed = 0
     for target in targets:
         key = target.full_name.strip("/")
+        # Include branch in key for multi-branch analysis support
+        if target.branch:
+            key = f"{key}@{target.branch}"
         if key in ok_keys:
             skipped_ok += 1
             continue
@@ -2536,6 +2652,7 @@ def build_targets(
     github_token_name: str,
     gitlab_token_name: str,
     github_token_fn: Callable[[], str] | None = None,
+    branch_selections: dict[str, list[str]] | None = None,
 ) -> list[RepoTarget]:
     targets: list[RepoTarget] = []
 
@@ -2644,6 +2761,31 @@ def build_targets(
             continue
         seen.add(key)
         unique.append(target)
+
+    # Expand targets by branch if branch_selections are provided
+    if branch_selections:
+        branch_targets: list[RepoTarget] = []
+        for target in unique:
+            repo_id = target.full_name
+            branches = branch_selections.get(repo_id, [])
+            if branches:
+                # Create a target for each selected branch
+                for branch in branches:
+                    branch_targets.append(
+                        RepoTarget(
+                            platform=target.platform,
+                            org=target.org,
+                            full_name=target.full_name,
+                            meta=target.meta,
+                            local_path=target.local_path,
+                            branch=branch,
+                        )
+                    )
+            else:
+                # Keep the target without branch selection
+                branch_targets.append(target)
+        unique = branch_targets
+
     return unique
 
 
@@ -2985,12 +3127,20 @@ def main() -> int:
             if args.local_repo:
                 all_targets = filter_local_targets(all_targets, args.local_repo)
         else:
+            # Parse branch selections from environment variable
+            branch_selections_str = os.environ.get("EXTRACT_SELECTED_BRANCHES", "").strip()
+            branch_selections: dict[str, list[str]] | None = None
+            if branch_selections_str:
+                branch_list = branch_selections_str.split("|")
+                branch_selections = parse_branch_selections(branch_list)
+
             all_targets = build_targets(
                 args,
                 tokens,
                 github_token_name,
                 args.gitlab_token_name,
                 github_token_fn=github_token_fn,
+                branch_selections=branch_selections,
             )
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -3127,6 +3277,9 @@ def main() -> int:
     checkpoint.replace_rows(rows)
 
     summary_path = checkpoint.summary_path
+
+    # Generate per-branch and consolidated CSVs for multi-branch analysis
+    generate_branch_consolidated_csvs(rows, run_dir)
     failures = [
         {
             "org": row.get("org"),
@@ -3175,11 +3328,42 @@ def main() -> int:
     shutil.rmtree(clones_dir, ignore_errors=True)
 
     progress = checkpoint.progress_snapshot()
+
+    # Count unique repos and branches for multi-branch analysis awareness
+    unique_repos: set[str] = set()
+    ok_repos: set[str] = set()
+    failed_repos: set[str] = set()
+    ok_branch_count = 0
+    failed_branch_count = 0
+
+    for target in all_targets:
+        repo_key = f"{target.org}/{target.full_name}"
+        unique_repos.add(repo_key)
+
+        # Check if this target is OK or failed
+        target_key = repo_key
+        if target.branch:
+            target_key = f"{target_key}@{target.branch}"
+        status_meta = checkpoint.status_by_key.get(target_key, {})
+        is_ok = status_meta.get("status") == "ok"
+
+        if is_ok:
+            ok_repos.add(repo_key)
+            ok_branch_count += 1
+        else:
+            failed_repos.add(repo_key)
+            failed_branch_count += 1
+
     manifest = {
         "created_at": stamp,
-        "repos": len(all_targets),
-        "ok": progress["ok"],
-        "failed": progress["failed"],
+        "repos": len(unique_repos),
+        "branches": len(all_targets),  # Total (repo, branch) pairs
+        "ok_repos": len(ok_repos),
+        "ok_branches": ok_branch_count,
+        "failed_repos": len(failed_repos),
+        "failed_branches": failed_branch_count,
+        "ok": progress["ok"],  # Alias for backward compatibility
+        "failed": progress["failed"],  # Alias for backward compatibility
         "error_classes": progress.get("error_classes") or {},
         "summary_csv": str(summary_path),
         "job_json": str(checkpoint.job_path),

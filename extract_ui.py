@@ -67,6 +67,12 @@ STATE: dict[str, Any] = {
     "finished_at": None,
     "repos_ok": None,
     "repos_failed": None,
+    "repos_total": None,
+    "branches_total": None,
+    "ok_repos": None,
+    "ok_branches": None,
+    "failed_repos": None,
+    "failed_branches": None,
     "form_settings": None,
     "last_error": None,
 }
@@ -204,6 +210,12 @@ def _empty_state() -> dict[str, Any]:
         "finished_at": None,
         "repos_ok": None,
         "repos_failed": None,
+        "repos_total": None,
+        "branches_total": None,
+        "ok_repos": None,
+        "ok_branches": None,
+        "failed_repos": None,
+        "failed_branches": None,
         "form_settings": None,
         "last_error": None,
     }
@@ -246,6 +258,7 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
     llm_enabled = fields.get("llm_enabled", [""])[0] == "on"
     selected = extract_selected_repos(fields)
     manual = parse_repo_selectors(fields.get("manual_repos", [""])[0])
+    selected_branches = fields.get("selected_branches", [])
     return {
         "mode": fields.get("mode", ["offline"])[0],
         "hosted_platform": fields.get("hosted_platform", ["github"])[0],
@@ -262,6 +275,7 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
         "llm_enabled": llm_enabled,
         "selected_repos": "\n".join(selected),
         "manual_repos": "\n".join(manual),
+        "selected_branches": "|".join(selected_branches),
         "github_accessible": fields.get("github_accessible", [""])[0] == "on",
         "gitlab_accessible": fields.get("gitlab_accessible", [""])[0] == "on",
     }
@@ -309,6 +323,8 @@ def compute_progress(log_lines: list[str], run_dir: str | None = None) -> dict[s
     completed = 0
     failed = 0
     current = ""
+    current_repo = ""
+    current_branch = ""
     error_classes: dict[str, int] = {}
     for line in log_lines:
         match = re.search(r"Extracting (\d+) repos", line)
@@ -316,10 +332,26 @@ def compute_progress(log_lines: list[str], run_dir: str | None = None) -> dict[s
             total = int(match.group(1))
         if " OK " in line:
             completed += 1
-            current = line.split(" OK ", 1)[1].split(":", 1)[0].strip()
+            # Extract repo and branch from "OK repo_id:branch_name"
+            after_ok = line.split(" OK ", 1)[1].split(":", 1)[0].strip()
+            if ":" in after_ok:
+                current_repo = after_ok.split(":")[0].strip()
+                current_branch = after_ok.split(":", 1)[1].strip()
+            else:
+                current_repo = after_ok
+                current_branch = ""
+            current = after_ok
         elif "FAIL " in line:
             failed += 1
-            current = line.split("FAIL ", 1)[1].split(":", 1)[0].strip()
+            # Extract repo and branch from "FAIL repo_id:branch_name [error_class]"
+            after_fail = line.split("FAIL ", 1)[1].split("[")[0].strip()
+            if ":" in after_fail:
+                current_repo = after_fail.split(":")[0].strip()
+                current_branch = after_fail.split(":", 1)[1].strip()
+            else:
+                current_repo = after_fail
+                current_branch = ""
+            current = after_fail
             class_match = re.search(r"FAIL \S+ \[([^\]]+)\]", line)
             if class_match:
                 error_class = class_match.group(1)
@@ -355,6 +387,8 @@ def compute_progress(log_lines: list[str], run_dir: str | None = None) -> dict[s
         "done": done,
         "percent": percent,
         "current": current,
+        "current_repo": current_repo,
+        "current_branch": current_branch,
         "error_classes": error_classes,
     }
 
@@ -599,6 +633,12 @@ def finalize_run_state(log_lines: list[str], returncode: int) -> None:
         finished_at=datetime.now(timezone.utc).isoformat(),
         repos_ok=csv_ok if csv_ok is not None else manifest.get("ok"),
         repos_failed=csv_failed if csv_failed is not None else manifest.get("failed"),
+        repos_total=manifest.get("repos"),
+        branches_total=manifest.get("branches"),
+        ok_repos=manifest.get("ok_repos"),
+        ok_branches=manifest.get("ok_branches"),
+        failed_repos=manifest.get("failed_repos"),
+        failed_branches=manifest.get("failed_branches"),
         log=log_lines[-500:],
     )
 
@@ -1490,10 +1530,22 @@ async function refresh(){
     label='Analysis running…';
   } else if (isDone && data.repos_ok!=null) {
     const ok=data.repos_ok, failed=data.repos_failed||0;
+    const repos=data.repos_total, branches=data.branches_total;
+    // Show repo and branch-aware completion message
+    let repoStr = '';
+    if (repos!=null && branches!=null && repos>0) {
+      if (branches > repos) {
+        // Multi-branch analysis
+        repoStr = ' — '+repos+' repo'+(repos===1?'':'s')+' ('+branches+' branches)';
+      } else {
+        // Single-branch or single-repo
+        repoStr = '';
+      }
+    }
     const s = ok===1 ? '' : 's';
     label = failed>0
-      ? ('Completed — '+ok+' successful run'+s+', '+failed+' failed')
-      : ('Completed — '+ok+' successful run'+s);
+      ? ('Completed'+repoStr+': '+ok+' successful sub-run'+s+', '+failed+' failed')
+      : ('Completed'+repoStr+': '+ok+' successful sub-run'+s);
   } else if (data.phase==='completed' || data.returncode===0 || data.returncode===2) {
     label='Completed';
   } else if (data.returncode===null && data.phase!=='failed') {
@@ -1516,8 +1568,23 @@ async function refresh(){
   const metaParts=[];
   if (data.started_at) metaParts.push('Started: '+new Date(data.started_at).toLocaleString());
   if (data.finished_at) metaParts.push('Finished: '+new Date(data.finished_at).toLocaleString());
-  if (data.repos_ok!=null) metaParts.push('Repos OK: '+data.repos_ok);
-  if (data.repos_failed!=null && data.repos_failed>0) metaParts.push('Repos failed: '+data.repos_failed);
+  if (data.repos_ok!=null) {
+    // Show branch count if this is multi-branch analysis
+    const branches=data.branches_total;
+    if (branches!=null && branches > data.repos_ok) {
+      metaParts.push('Repos OK: '+data.repos_ok+' (Branches: '+data.ok_branches+')');
+    } else {
+      metaParts.push('Repos OK: '+data.repos_ok);
+    }
+  }
+  if (data.repos_failed!=null && data.repos_failed>0) {
+    const branches=data.branches_total, failedBranches=data.failed_branches;
+    if (branches!=null && failedBranches!=null && branches > (data.repos_ok||0)) {
+      metaParts.push('Repos failed: '+data.repos_failed+' (Branches: '+failedBranches+')');
+    } else {
+      metaParts.push('Repos failed: '+data.repos_failed);
+    }
+  }
   if (metaParts.length) { meta.textContent=metaParts.join(' · '); meta.classList.remove('hidden'); }
   else { meta.textContent=''; meta.classList.add('hidden'); }
   const progress=data.progress||{};
@@ -1529,11 +1596,27 @@ async function refresh(){
   progressLabel.classList.toggle('hidden', !showProgress);
   if (showProgress) {
     progressBar.style.width=(progress.percent||0)+'%';
-    const current=progress.current ? ' · current: '+progress.current : '';
+    // Format current with repo and branch info if available
+    let current='';
+    if (progress.current) {
+      if (progress.current_branch) {
+        current = ' · current: Repo: '+progress.current_repo+', Branch: '+progress.current_branch;
+      } else {
+        current = ' · current: '+progress.current;
+      }
+    }
     const classes=progress.error_classes && Object.keys(progress.error_classes).length
       ? ' · errors: '+Object.entries(progress.error_classes).map(([k,v])=>k+'='+v).join(', ')
       : '';
-    progressLabel.textContent=(progress.done||0)+' / '+progress.total+' repositories'+current+classes;
+    // Show branch count if this is multi-branch analysis
+    const total=progress.total, repos=data.repos_total;
+    let progressText='';
+    if (repos!=null && total > repos) {
+      progressText = (progress.done||0)+' / '+total+' branches analyzed ('+repos+' repos)';
+    } else {
+      progressText = (progress.done||0)+' / '+total+' repositories';
+    }
+    progressLabel.textContent=progressText+current+classes;
   }
   document.querySelector('#log').textContent=(data.log||[]).join('\\n') || 'No analysis has started.';
   document.querySelector('#start').disabled=data.running;
@@ -2261,6 +2344,12 @@ class Handler(BaseHTTPRequestHandler):
             command.append("--llm")
             # Keep the key out of command arguments, logs, and output archives.
             env_overrides["OPENAI_API_KEY"] = openai_key
+
+        # Pass selected branches via environment variable (like tokens and API keys)
+        selected_branches = fields.get("selected_branches", [])
+        if selected_branches:
+            # Format: "repo_id:branch1,repo_id:branch2|repo_id2:branch3"
+            env_overrides["EXTRACT_SELECTED_BRANCHES"] = "|".join(selected_branches)
 
         # Atomically claim the single run slot: check *and* set running under one
         # lock hold so two concurrent /start requests can't both pass the guard
