@@ -47,6 +47,7 @@ from extract_org_raw_data import (  # noqa: E402
     list_gitlab_accessible_projects,
     list_gitlab_groups_for_token,
     list_gitlab_projects_for_group,
+    list_repo_branches,
     parse_tokens_file,
     zip_run_dir,
 )
@@ -873,6 +874,13 @@ __DOCKER_NOTICE__
 const FORM_STORAGE_KEY='extract-ui-form-v8';
 const DEFAULT_LOCAL_REPOS_DIR='__DEFAULT_LOCAL_REPOS_DIR__';
 const DEFAULT_TOKENS_FILE='__DEFAULT_TOKENS_FILE__';
+// Set accessible repo checkboxes to unchecked by default
+document.addEventListener('DOMContentLoaded', ()=>{
+  const ghAccessible=document.querySelector('#github-accessible');
+  const glAccessible=document.querySelector('#gitlab-accessible');
+  if(ghAccessible) ghAccessible.checked=false;
+  if(glAccessible) glAccessible.checked=false;
+});
 const forms = {offline:document.querySelector('#offline-fields'), hosted:document.querySelector('#hosted-fields')};
 let savedRepoChecks=new Set();
 function updateRepoPickerCopy(){
@@ -941,18 +949,142 @@ function renderRepoPicker(items, emptyMessage){
   }
   picker.innerHTML='';
   items.forEach(item=>{
-    const label=document.createElement('label');
-    label.className='repo-option';
+    const container=document.createElement('div');
+    container.className='repo-item';
+    container.style.cssText='margin-bottom:10px;border-bottom:1px solid var(--border);padding-bottom:8px';
+
+    // Main repo checkbox and toggle
+    const header=document.createElement('div');
+    header.className='repo-header';
+    header.style.cssText='display:flex;align-items:center;gap:8px';
+
     const box=document.createElement('input');
     box.type='checkbox';
     box.name='selected_repos';
     box.value=item.id;
+    box.className='repo-check';
     if (savedRepoChecks.has(item.id)) box.checked=true;
+
     const text=document.createElement('span');
+    text.style.cssText='flex:1;font-weight:500';
     text.textContent=item.archived ? item.name+' (archived)' : item.name;
-    label.appendChild(box); label.appendChild(text); picker.appendChild(label);
+
+    const toggleBtn=document.createElement('button');
+    toggleBtn.type='button';
+    toggleBtn.className='branch-toggle';
+    toggleBtn.textContent='Branches ▼';
+    toggleBtn.style.cssText='background:var(--surface-2);color:var(--accent);border:1px solid var(--border);padding:5px 10px;border-radius:6px;font-size:12px;cursor:pointer';
+    toggleBtn.onclick=(e)=>{e.preventDefault();toggleBranchList(item.id);};
+
+    header.appendChild(box);
+    header.appendChild(text);
+    header.appendChild(toggleBtn);
+    container.appendChild(header);
+
+    // Branch list (hidden by default)
+    const branchList=document.createElement('div');
+    branchList.id='branch-list-'+item.id;
+    branchList.className='branch-list';
+    branchList.style.cssText='display:none;margin-left:28px;margin-top:8px;padding:8px;background:var(--surface-2);border-radius:6px;max-height:200px;overflow-y:auto';
+    branchList.innerHTML='<p style="color:var(--muted);font-size:12px;margin:0">Click to load branches...</p>';
+
+    container.appendChild(branchList);
+    picker.appendChild(container);
+
+    // Load branches when toggle is first clicked
+    const toggleBtnInst=toggleBtn;
+    let branchesLoaded=false;
+    toggleBtnInst.dataset.branchesLoaded='false';
+    toggleBtnInst.onclick=(e)=>{
+      e.preventDefault();
+      if (!branchesLoaded) {
+        branchesLoaded=true;
+        toggleBtnInst.dataset.branchesLoaded='true';
+        loadBranchesForRepo(item.id);
+      }
+      toggleBranchList(item.id);
+    };
   });
   wrap.classList.remove('hidden');
+}
+
+function toggleBranchList(repoId){
+  const list=document.querySelector('#'+CSS.escape('branch-list-'+repoId));
+  if(list) list.style.display=list.style.display==='none' ? 'block' : 'none';
+}
+
+async function loadBranchesForRepo(repoId){
+  const list=document.querySelector('#'+CSS.escape('branch-list-'+repoId));
+  if(!list) return;
+  const platform=document.querySelector('#hosted-platform')?.value||'github';
+  try {
+    const body=new URLSearchParams({
+      csrf_token:'__CSRF_TOKEN__',
+      hosted_platform:platform,
+      repo_id:repoId,
+      tokens_file:DEFAULT_TOKENS_FILE,
+      github_token:document.querySelector('[name=github_token]')?.value||'',
+      gitlab_token:document.querySelector('[name=gitlab_token]')?.value||'',
+      github_token_name:document.querySelector('[name=github_token_name]').value,
+      gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
+      gitlab_host:document.querySelector('[name=gitlab_host]')?.value||'',
+    });
+    const response=await fetch('/discover/branches', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+    if(!response.ok) { const err=await response.text(); throw new Error(err||'Branch discovery failed'); }
+    const payload=await response.json();
+    renderBranchList(repoId, payload.items||[]);
+  } catch(error) {
+    list.innerHTML='<p style="color:var(--danger);font-size:12px;margin:0">Failed to load branches: '+error.message+'</p>';
+  }
+}
+
+function renderBranchList(repoId, branches){
+  const list=document.querySelector('#'+CSS.escape('branch-list-'+repoId));
+  if(!list) return;
+  if(!branches.length) { list.innerHTML='<p style="color:var(--muted);font-size:12px;margin:0">No branches found.</p>'; return; }
+  list.innerHTML='';
+  const defaultNote=document.createElement('p');
+  defaultNote.style.cssText='font-size:11px;color:var(--muted);margin:0 0 6px 0';
+  defaultNote.textContent='Default branch marked with *';
+  list.appendChild(defaultNote);
+
+  branches.forEach(branch=>{
+    const label=document.createElement('label');
+    label.style.cssText='display:block;padding:5px 0;font-size:12px;cursor:pointer';
+    const check=document.createElement('input');
+    check.type='checkbox';
+    check.name='selected_branches';
+    check.value=repoId+':'+branch.id;
+    check.style.cssText='margin-right:6px';
+    if(branch.is_default) check.checked=true;
+    const text=document.createElement('span');
+    text.textContent=branch.name+(branch.is_default ? ' *' : '');
+    label.appendChild(check);
+    label.appendChild(text);
+    list.appendChild(label);
+  });
+}
+
+function getSelectedBranches(){
+  return [...document.querySelectorAll('input[name="selected_branches"]:checked')].map(el=>el.value);
+}
+
+function validateBranchSelections(){
+  const branches=getSelectedBranches();
+  if(!branches.length) return {valid:false, message:'Select at least one branch for each repository.'};
+  const repoCount={};
+  const selectedRepos=getSelectedRepos();
+  selectedRepos.forEach(r=>repoCount[r]=0);
+  branches.forEach(b=>{
+    const [repoId]=b.split(':');
+    if(repoCount.hasOwnProperty(repoId)) repoCount[repoId]++;
+  });
+  for(const repoId in repoCount) {
+    if(repoCount[repoId]===0) {
+      return {valid:false, message:'Select at least one branch for each repository. Repository '+repoId+' has no branches selected.'};
+    }
+  }
+  return {valid:true};
 }
 async function postDiscover(path, extra){
   const body=new URLSearchParams({csrf_token:'__CSRF_TOKEN__', ...extra});
@@ -1111,6 +1243,13 @@ function validateForm(){
       if (!isResume && !hasOrg && !hasSelected && !hasManual && !hasAccessible) {
         errors.push(['github-org-select','Choose an organisation, load/select accessible repos, paste a manual list, or enable “Analyse every accessible repository”.']);
       }
+      // Validate branch selections if repos are selected
+      if (hasSelected && !isResume) {
+        const branchCheck=validateBranchSelections();
+        if (!branchCheck.valid) {
+          errors.push(['repo-picker', branchCheck.message]);
+        }
+      }
     } else {
       const glToken=(document.querySelector('[name=gitlab_token]')?.value||'').trim();
       if (!glToken && !data.gitlab_token_name.trim()) errors.push(['gitlab_token','Paste a GitLab token, or enter the token key from your file.']);
@@ -1124,13 +1263,20 @@ function validateForm(){
       if (!isResume && !hasGroup && !hasSelected && !hasManual && !hasAccessible) {
         errors.push(['gitlab-group-select','Choose a group, load/select all projects, paste a manual list, or enable “Analyse every accessible project”.']);
       }
+      // Validate branch selections if repos are selected
+      if (hasSelected && !isResume) {
+        const branchCheck=validateBranchSelections();
+        if (!branchCheck.valid) {
+          errors.push(['repo-picker', branchCheck.message]);
+        }
+      }
     }
   }
   if (data.llm_enabled && !document.querySelector('[name=openai_key]').value.trim()) errors.push(['openai_key','Enter an OpenAI API key to enable LLM analysis.']);
   if (!errors.length) return true;
   showFormError(errors[0][1]);
   errors.forEach(([name])=>markInvalid(name));
-  document.querySelector('[name="'+errors[0][0]+'"],#'+errors[0][0])?.scrollIntoView({behavior:'smooth', block:'center'});
+  document.querySelector('[name=”'+errors[0][0]+'”],#'+errors[0][0])?.scrollIntoView({behavior:'smooth', block:'center'});
   return false;
 }
 function readFormSettings(){
@@ -1294,7 +1440,13 @@ document.querySelector('#extract-form').addEventListener('change', ()=>persistFo
 document.querySelector('#extract-form').addEventListener('submit', async (event)=>{
   event.preventDefault();
   showFormError('');
-  if (!validateForm()) return;
+  if (!validateForm()) {
+    const branchCheck=validateBranchSelections();
+    if (!branchCheck.valid) {
+      toast(branchCheck.message, 'error', 'Branch selection required');
+    }
+    return;
+  }
   // Client-side double-submit guard: block a second request while one is in
   // flight (complements the server's atomic run-slot claim).
   if (window.startInFlight) return;
@@ -1674,6 +1826,7 @@ class Handler(BaseHTTPRequestHandler):
             "/discover/orgs",
             "/discover/repos",
             "/discover/accessible-repos",
+            "/discover/branches",
         }:
             self.respond(HTTPStatus.NOT_FOUND, "text/plain", "Not found")
             return
@@ -1897,6 +2050,51 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": items}))
+            return
+        if path == "/discover/branches":
+            platform = fields.get("hosted_platform", ["github"])[0]
+            repo_id = fields.get("repo_id", [""])[0].strip()
+            if not repo_id:
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "application/json",
+                    json.dumps({"error": "Missing repo_id parameter."}),
+                )
+                return
+            try:
+                token = read_token_from_fields(fields, platform)
+            except ValueError as exc:
+                ui_log(f"Discover branches token error platform={platform}", exc=exc)
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "application/json",
+                    json.dumps({"error": str(exc)}),
+                )
+                return
+            try:
+                gitlab_host = None
+                if platform == "gitlab":
+                    gitlab_host = normalize_gitlab_host(
+                        fields.get("gitlab_host", [""])[0]
+                    ) or "gitlab.com"
+                branches = list_repo_branches(
+                    token, repo_id, platform, host=gitlab_host
+                )
+                ui_log(
+                    f"Discover branches ok platform={platform} repo={repo_id!r} count={len(branches)}"
+                )
+            except Exception as exc:
+                ui_log(
+                    f"Discover branches failed platform={platform} repo={repo_id!r}",
+                    exc=exc,
+                )
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "application/json",
+                    json.dumps({"error": str(exc)[:500]}),
+                )
+                return
+            self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": branches}))
             return
         mode = fields.get("mode", ["offline"])[0]
         form_settings = extract_form_settings(fields)

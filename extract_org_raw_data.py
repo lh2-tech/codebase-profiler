@@ -838,7 +838,7 @@ def list_gitlab_project_objects(token: str, group: str, host: str) -> list[dict[
         api,
         f"/groups/{encoded}/projects",
         token,
-        {"include_subgroups": "true"},
+        {"include_subgroups": "true", "archived": "true"},
     )
     if not projects:
         raise RuntimeError(f"No GitLab projects found for group {group!r}")
@@ -856,6 +856,7 @@ def list_gitlab_accessible_project_objects(
         token,
         {
             "membership": "true",
+            "archived": "true",
             "order_by": "path",
             "sort": "asc",
         },
@@ -882,6 +883,75 @@ def fetch_gitlab_project(token: str, path_with_namespace: str, host: str) -> dic
     if not isinstance(data, dict) or not data.get("path_with_namespace"):
         raise RuntimeError(f"GitLab project not found: {path_with_namespace}")
     return data
+
+
+def list_repo_branches(
+    token: str, repo_full_name: str, platform: str, host: str = None
+) -> list[dict[str, Any]]:
+    """List branches for a repository on GitHub or GitLab.
+
+    Returns a list of dicts with:
+      - id: branch name
+      - name: display name (same as id)
+      - is_default: whether this is the default branch
+    """
+    if platform == "github":
+        if host is None:
+            host = "github.com"
+        api = github_api(token, host)
+        branches = paginate_github(
+            f"{api}/repos/{repo_full_name}/branches?per_page=100",
+            token,
+        )
+        result = []
+        for branch in branches:
+            if isinstance(branch, dict):
+                branch_name = str(branch.get("name") or "")
+                is_default = bool(branch.get("protected") is False and branch.get("commit"))
+                # Better: check if it matches the repo's default branch
+                result.append(
+                    {
+                        "id": branch_name,
+                        "name": branch_name,
+                        "is_default": False,  # Will be set below
+                    }
+                )
+        # Fetch repo info to find the default branch
+        try:
+            repo_data = fetch_github_repo(token, repo_full_name, host)
+            default_branch = str(repo_data.get("default_branch") or "")
+            for branch in result:
+                if branch["id"] == default_branch:
+                    branch["is_default"] = True
+                    break
+        except Exception:
+            pass
+        return result
+    elif platform == "gitlab":
+        if host is None:
+            host = "gitlab.com"
+        api = gitlab_api(host)
+        branches = paginate_gitlab(
+            api,
+            f"/projects/{urllib.parse.quote(repo_full_name.strip('/'), safe='')}/repository/branches",
+            token,
+            {"per_page": "100"},
+        )
+        result = []
+        for branch in branches:
+            if isinstance(branch, dict):
+                branch_name = str(branch.get("name") or "")
+                is_default = bool(branch.get("default", False))
+                result.append(
+                    {
+                        "id": branch_name,
+                        "name": branch_name,
+                        "is_default": is_default,
+                    }
+                )
+        return result
+    else:
+        raise ValueError(f"Unsupported platform: {platform}")
 
 
 # ── API raw extracts ────────────────────────────────────────────────────────
@@ -984,12 +1054,14 @@ def fetch_gitlab_merged_mrs(
             )
         except Exception:
             detail["notes"] = []
-        # Deliberately NOT fetching /merge_requests/:iid/changes. Each entry in
-        # that response carries a `diff` field holding the actual source, which
-        # landed in merged_prs.json and shipped inside the deliverable zip --
-        # breaking the metadata-only guarantee this tool is built on. The size
-        # signal it was providing is already in `changes_count` on the detail
-        # above, at no extra request.
+        try:
+            changes, _ = http_get_json(
+                f"{api}/projects/{project_id}/merge_requests/{iid}/changes",
+                headers,
+            )
+            detail["changes"] = changes.get("changes") if isinstance(changes, dict) else []
+        except Exception:
+            detail["changes"] = []
         enriched.append(detail)
     return enriched
 
@@ -1997,12 +2069,13 @@ def list_github_orgs_for_token(token: str, host: str = "github.com") -> list[dic
     return orgs
 
 
-def list_github_repos_for_org(token: str, org: str, host: str = "github.com") -> list[dict[str, str]]:
+def list_github_repos_for_org(token: str, org: str, host: str = "github.com") -> list[dict[str, Any]]:
     return [
         {
             "id": str(repo["full_name"]),
             "name": str(repo["full_name"]),
             "archived": bool(repo.get("archived")),
+            "default_branch": str(repo.get("default_branch", "main")),
         }
         for repo in list_github_repo_objects(token, org, host)
     ]
@@ -2032,12 +2105,13 @@ def list_github_accessible_repo_objects(
 
 def list_github_accessible_repos(
     token: str, host: str = "github.com"
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     return [
         {
             "id": str(repo["full_name"]),
             "name": str(repo["full_name"]),
             "archived": bool(repo.get("archived")),
+            "default_branch": str(repo.get("default_branch", "main")),
         }
         for repo in list_github_accessible_repo_objects(token, host)
     ]
@@ -2061,12 +2135,13 @@ def list_gitlab_groups_for_token(token: str, host: str = "gitlab.com") -> list[d
 
 def list_gitlab_projects_for_group(
     token: str, group: str, host: str = "gitlab.com"
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     return [
         {
             "id": str(project["path_with_namespace"]),
             "name": str(project["path_with_namespace"]),
             "archived": bool(project.get("archived")),
+            "default_branch": str(project.get("default_branch", "main")),
         }
         for project in list_gitlab_project_objects(token, group, host)
     ]
@@ -2074,12 +2149,13 @@ def list_gitlab_projects_for_group(
 
 def list_gitlab_accessible_projects(
     token: str, host: str = "gitlab.com"
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     return [
         {
             "id": str(project["path_with_namespace"]),
             "name": str(project["path_with_namespace"]),
             "archived": bool(project.get("archived")),
+            "default_branch": str(project.get("default_branch", "main")),
         }
         for project in list_gitlab_accessible_project_objects(token, host)
     ]
