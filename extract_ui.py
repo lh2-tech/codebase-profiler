@@ -892,12 +892,12 @@ function updateRepoPickerCopy(){
   const manualHelp=document.querySelector('#manual-repos-help');
   if (mode==='hosted' && platform==='gitlab') {
     label.textContent='Projects to include';
-    help.textContent='Group mode: leave all unchecked to include every project in the selected group. All-projects mode: select the projects you want, or use Select all.';
+    help.textContent='Group mode: select the projects you want to analyze. All-projects mode: select the projects you want, or use Select all.';
     if (manualLabel) manualLabel.textContent='Manual project list';
     if (manualHelp) manualHelp.textContent='One group/project path per line. Use this when a project is missing from group discovery.';
   } else {
     label.textContent='Repositories to include';
-    help.textContent='Organisation mode: leave all unchecked to include every repository in the org. Accessible-repo mode: select the repos you want, or use Select all.';
+    help.textContent='Organisation mode: select the repositories you want to analyze. Accessible-repo mode: select the repos you want, or use Select all.';
     if (manualLabel) manualLabel.textContent='Manual repository list';
     if (manualHelp) manualHelp.textContent='One owner/repo per line. Use this for repos granted by direct invite that do not appear in the organisation picker.';
   }
@@ -1243,6 +1243,10 @@ function validateForm(){
       if (!isResume && !hasOrg && !hasSelected && !hasManual && !hasAccessible) {
         errors.push(['github-org-select','Choose an organisation, load/select accessible repos, paste a manual list, or enable “Analyse every accessible repository”.']);
       }
+      // Require at least one repo to be selected when org/accessible is used
+      if (!isResume && (hasOrg || hasAccessible) && !hasSelected && !hasManual) {
+        errors.push(['repo-picker', 'Select at least one repository to analyze. If none are checked, no repositories will be analyzed.']);
+      }
       // Validate branch selections if repos are selected
       if (hasSelected && !isResume) {
         const branchCheck=validateBranchSelections();
@@ -1262,6 +1266,10 @@ function validateForm(){
       const hasAccessible=!!data.gitlab_accessible;
       if (!isResume && !hasGroup && !hasSelected && !hasManual && !hasAccessible) {
         errors.push(['gitlab-group-select','Choose a group, load/select all projects, paste a manual list, or enable “Analyse every accessible project”.']);
+      }
+      // Require at least one project to be selected when group/accessible is used
+      if (!isResume && (hasGroup || hasAccessible) && !hasSelected && !hasManual) {
+        errors.push(['repo-picker', 'Select at least one project to analyze. If none are checked, no projects will be analyzed.']);
       }
       // Validate branch selections if repos are selected
       if (hasSelected && !isResume) {
