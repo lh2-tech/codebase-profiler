@@ -122,10 +122,11 @@ GITLAB_MR_RE = re.compile(r"See merge request (?:\S+)?!(\d+)")
 BITBUCKET_MERGE_RE = re.compile(r"^Merged in (.+) \(pull request #(\d+)\)$")
 
 GITHUB_MERGED_PRS_QUERY = """
-query MergedPRs($owner: String!, $name: String!, $cursor: String, $pageSize: Int!) {
+query MergedPRs($owner: String!, $name: String!, $cursor: String, $pageSize: Int!, $baseRefName: String) {
   repository(owner: $owner, name: $name) {
     pullRequests(
       states: MERGED,
+      baseRefName: $baseRefName,
       first: $pageSize,
       after: $cursor,
       orderBy: {field: UPDATED_AT, direction: DESC}
@@ -136,6 +137,8 @@ query MergedPRs($owner: String!, $name: String!, $cursor: String, $pageSize: Int
         title
         bodyText
         url
+        baseRefName
+        headRefName
         createdAt
         mergedAt
         changedFiles
@@ -1033,7 +1036,17 @@ def fetch_github_contributors(token: str, full_name: str, host: str) -> list[dic
     )
 
 
-def fetch_github_merged_prs(token: str, full_name: str, host: str) -> list[dict[str, Any]]:
+def fetch_github_merged_prs(
+    token: str, full_name: str, host: str, branch: str | None = None
+) -> list[dict[str, Any]]:
+    """Merged pull requests for ``full_name``.
+
+    When ``branch`` is given, only PRs whose *base* (target) branch is ``branch``
+    are returned, so a multi-branch run attributes each PR to the branch it was
+    actually merged into instead of repeating the repo-wide total on every row.
+    ``baseRefName: null`` is ignored by the GitHub GraphQL API, which keeps the
+    unfiltered repo-wide behaviour for single-branch runs.
+    """
     owner, name = full_name.split("/", 1)
     nodes: list[dict[str, Any]] = []
     cursor = None
@@ -1045,6 +1058,7 @@ def fetch_github_merged_prs(token: str, full_name: str, host: str) -> list[dict[
                 "name": name,
                 "cursor": cursor,
                 "pageSize": 25,
+                "baseRefName": branch or None,
             },
         }
         data = http_post_json(github_graphql(token, host), github_headers(token), payload)
@@ -1082,14 +1096,22 @@ def fetch_gitlab_members(token: str, project_id: int | str, host: str) -> list[d
 
 
 def fetch_gitlab_merged_mrs(
-    token: str, project_id: int | str, host: str
+    token: str, project_id: int | str, host: str, branch: str | None = None
 ) -> list[dict[str, Any]]:
+    """Merged merge requests for a project.
+
+    When ``branch`` is given, only MRs whose ``target_branch`` is ``branch`` are
+    returned, mirroring the GitHub ``baseRefName`` filter.
+    """
     api = gitlab_api(host)
+    params = {"state": "merged", "per_page": "100"}
+    if branch:
+        params["target_branch"] = branch
     mrs = paginate_gitlab(
         api,
         f"/projects/{project_id}/merge_requests",
         token,
-        {"state": "merged", "per_page": "100"},
+        params,
     )
     headers = {"PRIVATE-TOKEN": token, "User-Agent": "extract-org-raw-data"}
     enriched: list[dict[str, Any]] = []
@@ -1161,6 +1183,64 @@ def run_git(
             log.warning("git %s failed in %s: %s", " ".join(args), repo, detail)
         return ""
     return proc.stdout
+
+
+def resolve_branch_ref(repo: Path, branch: str) -> str:
+    """Return a ref that resolves to ``branch``'s tip, or "" when it is unknown."""
+    for candidate in (
+        f"refs/heads/{branch}",
+        f"refs/remotes/origin/{branch}",
+        branch,
+    ):
+        resolved = run_git(
+            repo,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{candidate}^{{commit}}",
+            timeout=60,
+        ).strip()
+        if resolved:
+            return candidate
+    return ""
+
+
+def remove_branch_worktree(repo: Path, dest: Path, log: logging.Logger) -> None:
+    """Tear down a throwaway worktree created by :func:`add_branch_worktree`."""
+    run_git(repo, "worktree", "remove", "--force", str(dest), timeout=120)
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    run_git(repo, "worktree", "prune", timeout=60)
+
+
+def add_branch_worktree(
+    repo: Path, branch: str, dest: Path, log: logging.Logger
+) -> bool:
+    """Materialise ``branch`` at ``dest`` as a detached linked worktree.
+
+    Used for local (offline) repos so a multi-branch run can analyse each branch
+    without ever checking out — and therefore mutating — the user's own working
+    tree. Returns True when ``dest`` is ready to analyse.
+    """
+    ref = resolve_branch_ref(repo, branch)
+    if not ref:
+        log.warning("Branch %s not found in local repo %s", branch, repo)
+        return False
+    if dest.exists():
+        remove_branch_worktree(repo, dest, log)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    run_git(
+        repo,
+        "worktree",
+        "add",
+        "--detach",
+        "--force",
+        str(dest),
+        ref,
+        timeout=600,
+        log=log,
+    )
+    return (dest / ".git").exists()
 
 
 def probe_local_git(repo: Path, log: logging.Logger) -> bool:
@@ -2311,6 +2391,10 @@ def process_repo(
     if target.platform != "local":
         write_json(api_dir / "repo.json", meta)
     clone_path = target.local_path or clones_dir / slug
+    # Set when a throwaway worktree is created for an offline branch analysis;
+    # torn down in the finally block below.
+    temp_worktree: Path | None = None
+    worktree_origin: Path | None = None
 
     try:
         if target.platform == "github":
@@ -2328,7 +2412,7 @@ def process_repo(
             write_json(api_dir / "contributors.json", contributors)
             row["contributor_count"] = len(contributors)
 
-            prs = fetch_github_merged_prs(token, target.full_name, github_host)
+            prs = fetch_github_merged_prs(token, target.full_name, github_host, branch)
             write_json(api_dir / "merged_prs.json", prs)
             row["merged_prs"] = len(prs)
 
@@ -2351,7 +2435,7 @@ def process_repo(
             write_json(api_dir / "contributors.json", members)
             row["contributor_count"] = len(members)
 
-            mrs = fetch_gitlab_merged_mrs(token, project_id, gitlab_host)
+            mrs = fetch_gitlab_merged_mrs(token, project_id, gitlab_host, branch)
             write_json(api_dir / "merged_prs.json", mrs)
             row["merged_prs"] = len(mrs)
 
@@ -2370,6 +2454,23 @@ def process_repo(
             row["merged_prs"] = 0
             row["contributor_count"] = 0
 
+            if branch:
+                # Analyse the branch in a throwaway linked worktree rather than
+                # checking it out in place — the local path is the user's own
+                # repo and must not be mutated. Without this, every branch row
+                # of an offline run reported whatever HEAD happened to be.
+                worktree_origin = clone_path
+                candidate = clones_dir / "_worktrees" / slug
+                if not add_branch_worktree(clone_path, branch, candidate, log):
+                    worktree_origin = None
+                    raise RuntimeError(
+                        f"Could not check out branch {branch!r} in a worktree of "
+                        f"{clone_path}; refusing to report another branch's metrics "
+                        f"under this branch name"
+                    )
+                temp_worktree = candidate
+                clone_path = candidate
+
         if target.platform != "local":
             clone_repo(
                 clone_url,
@@ -2378,12 +2479,19 @@ def process_repo(
                 retries=clone_retries,
                 log=log,
             )
-            # Checkout the specified branch if provided
+            # Checkout the specified branch if provided. run_git() swallows
+            # failures, so confirm HEAD actually moved rather than silently
+            # analysing the default branch under this branch's name.
             if branch:
-                try:
-                    run_git(clone_path, "checkout", branch, timeout=60, log=log)
-                except Exception as exc:
-                    log.warning("Failed to checkout branch %s: %s", branch, exc)
+                run_git(clone_path, "checkout", branch, timeout=120, log=log)
+                current = run_git(
+                    clone_path, "rev-parse", "--abbrev-ref", "HEAD", timeout=60
+                ).strip()
+                if current != branch:
+                    raise RuntimeError(
+                        f"Failed to check out branch {branch!r} "
+                        f"(HEAD is {current or 'unknown'!r})"
+                    )
 
         git_stats = aggregate_git_stats(clone_path)
         write_json(git_dir / "git_stats.json", git_stats)
@@ -2505,6 +2613,16 @@ def process_repo(
                 log.warning(
                     "Unexpected error deleting clone %s: %s",
                     target.full_name,
+                    exc,
+                )
+    finally:
+        if temp_worktree is not None and worktree_origin is not None:
+            try:
+                remove_branch_worktree(worktree_origin, temp_worktree, log)
+            except Exception as exc:
+                log.warning(
+                    "Failed to remove temporary worktree %s: %s",
+                    temp_worktree,
                     exc,
                 )
 
@@ -3452,7 +3570,8 @@ def main() -> int:
     if args.offline:
         manifest["offline_field_sources"] = {
             "merged_prs": (
-                "Detected from merge and squash markers in Git commit messages. "
+                "Detected from merge and squash markers in Git commit messages, "
+                "scoped to the history of the analysed branch. "
                 "Rebase merges and rewritten messages cannot be recovered."
             ),
             "contributor_count": "Unique Git author identities, including detected bots.",
