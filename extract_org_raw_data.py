@@ -967,6 +967,54 @@ def list_repo_branches(
     else:
         raise ValueError(f"Unsupported platform: {platform}")
 
+import subprocess
+from pathlib import Path
+from typing import Any
+
+def list_local_repo_branches(
+    local_repos_dir: str,
+    repo_id: str,
+) -> list[dict[str, Any]]:
+    repo_path = Path(local_repos_dir) / repo_id
+
+    if not repo_path.is_dir():
+        raise ValueError(f"Local repository not found: {repo_path}")
+
+    if not (repo_path / ".git").exists():
+        raise ValueError(f"Not a Git repository: {repo_path}")
+
+    # Query refs/remotes/origin/ instead of refs/heads/
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), "for-each-ref",
+         "--format=%(refname:short)|%(HEAD)", "refs/remotes/origin/"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    branches = []
+
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+
+        ref_name, head = line.split("|", 1)
+
+        # 1. Skip the symbolic reference pointer (e.g., 'origin/HEAD')
+        if "HEAD" in ref_name:
+            continue
+
+        # 2. Clean the name by stripping 'origin/' prefix (e.g., 'origin/feature-x' -> 'feature-x')
+        clean_name = ref_name.replace("origin/", "", 1) if ref_name.startswith("origin/") else ref_name
+
+        branches.append({
+            "id": clean_name,
+            "name": clean_name,
+            "is_default": head == "*",  # Marks the branch currently checked out by git clone
+        })
+
+    return branches
+
 
 # ── API raw extracts ────────────────────────────────────────────────────────
 

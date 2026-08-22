@@ -48,6 +48,7 @@ from extract_org_raw_data import (  # noqa: E402
     list_gitlab_groups_for_token,
     list_gitlab_projects_for_group,
     list_repo_branches,
+    list_local_repo_branches,
     parse_tokens_file,
     zip_run_dir,
 )
@@ -1060,6 +1061,7 @@ async function loadBranchesForRepo(repoId){
   try {
     const body=new URLSearchParams({
       csrf_token:'__CSRF_TOKEN__',
+      mode: document.querySelector('input[name="mode"]:checked')?.value || 'offline',
       hosted_platform:platform,
       repo_id:repoId,
       tokens_file:DEFAULT_TOKENS_FILE,
@@ -2143,8 +2145,10 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": items}))
             return
         if path == "/discover/branches":
-            platform = fields.get("hosted_platform", ["github"])[0]
+
+            mode = fields.get("mode", ["offline"])[0]
             repo_id = fields.get("repo_id", [""])[0].strip()
+
             if not repo_id:
                 self.respond(
                     HTTPStatus.BAD_REQUEST,
@@ -2152,31 +2156,51 @@ class Handler(BaseHTTPRequestHandler):
                     json.dumps({"error": "Missing repo_id parameter."}),
                 )
                 return
+
             try:
-                token = read_token_from_fields(fields, platform)
-            except ValueError as exc:
-                ui_log(f"Discover branches token error platform={platform}", exc=exc)
-                self.respond(
-                    HTTPStatus.BAD_REQUEST,
-                    "application/json",
-                    json.dumps({"error": str(exc)}),
-                )
-                return
-            try:
-                gitlab_host = None
-                if platform == "gitlab":
-                    gitlab_host = normalize_gitlab_host(
-                        fields.get("gitlab_host", [""])[0]
-                    ) or "gitlab.com"
-                branches = list_repo_branches(
-                    token, repo_id, platform, host=gitlab_host
-                )
+                if mode == "offline":
+                    # Discover branches directly from the local Git repository.
+                    local_repos_dir = default_local_repos_dir()
+
+                    branches = list_local_repo_branches(
+                        local_repos_dir,
+                        repo_id,
+                    )
+
+                elif mode == "hosted":
+                    platform = fields.get("hosted_platform", ["github"])[0]
+
+                    token = read_token_from_fields(fields, platform)
+
+                    gitlab_host = None
+                    if platform == "gitlab":
+                        gitlab_host = normalize_gitlab_host(
+                            fields.get("gitlab_host", [""])[0]
+                        ) or "gitlab.com"
+
+                    branches = list_repo_branches(
+                        token,
+                        repo_id,
+                        platform,
+                        host=gitlab_host,
+                    )
+
+                else:
+                    self.respond(
+                        HTTPStatus.BAD_REQUEST,
+                        "application/json",
+                        json.dumps({"error": "Unknown mode."}),
+                    )
+                    return
+
                 ui_log(
-                    f"Discover branches ok platform={platform} repo={repo_id!r} count={len(branches)}"
+                    f"Discover branches ok mode={mode} "
+                    f"repo={repo_id!r} count={len(branches)}"
                 )
+
             except Exception as exc:
                 ui_log(
-                    f"Discover branches failed platform={platform} repo={repo_id!r}",
+                    f"Discover branches failed mode={mode} repo={repo_id!r}",
                     exc=exc,
                 )
                 self.respond(
@@ -2185,6 +2209,13 @@ class Handler(BaseHTTPRequestHandler):
                     json.dumps({"error": str(exc)[:500]}),
                 )
                 return
+
+            self.respond(
+                HTTPStatus.OK,
+                "application/json",
+                json.dumps({"items": branches}),
+            )
+            return
             self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": branches}))
             return
         mode = fields.get("mode", ["offline"])[0]
