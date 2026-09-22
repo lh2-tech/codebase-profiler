@@ -1129,10 +1129,9 @@ def github_clone_url(full_name: str, token: str, host: str) -> str:
 
 def gitlab_clone_url(full_name: str, token: str, host: str) -> str:
     host = host.rstrip("/")
-    if not host.startswith("http"):
-        host = f"https://{host}"
+    scheme = "http://" if host.startswith("http://") else "https://"
     bare = host.replace("https://", "").replace("http://", "")
-    return f"https://oauth2:{token}@{bare}/{full_name}.git"
+    return f"{scheme}oauth2:{token}@{bare}/{full_name}.git"
 
 
 def aggregate_git_stats(repo: Path) -> dict[str, Any]:
