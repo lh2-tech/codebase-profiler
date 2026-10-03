@@ -7,10 +7,18 @@
 #   GitLab  — classic PAT, scopes: read_api AND read_repository,
 #             role Reporter or higher. Fine-grained GitLab tokens do NOT work:
 #             they return 200 with an empty project list instead of an error.
+#   Bitbucket Cloud — Atlassian scoped API token (ATAT...) with scopes
+#             read:repository:bitbucket and read:pullrequest:bitbucket, plus the
+#             Atlassian account email for REST Basic auth. Omit bitbucket_email
+#             for workspace/repository access tokens (sent as Bearer). git
+#             cloning always uses the x-token-auth username automatically.
+#             There is no account-wide discovery: a workspace slug is required.
 #   OpenAI  — only needed for --llm mode
 
 github-data-token=ghp_your_github_token_here
 gitlab_token=glpat_your_gitlab_token_here
+bitbucket_token=ATATT_your_bitbucket_token_here
+bitbucket_email=you@example.com
 openai_key=sk-your_openai_key_here
 
 # Optional — GitHub App auth for extract_org_raw_data.py --github-app

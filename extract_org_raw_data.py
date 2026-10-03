@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import json
 import logging
@@ -72,6 +73,9 @@ from github_app_auth import (
 CODING = Path(__file__).resolve().parent
 DEFAULT_GITHUB_TOKEN_NAME = "github-data-token"
 DEFAULT_GITLAB_TOKEN_NAME = "gitlab_token"
+DEFAULT_BITBUCKET_TOKEN_NAME = "bitbucket_token"
+DEFAULT_BITBUCKET_EMAIL_NAME = "bitbucket_email"
+BITBUCKET_API = "https://api.bitbucket.org/2.0"
 GITHUB_APP_TOKEN_KEY = "__github_app_installation_token__"
 DEFAULT_CLONE_TIMEOUT_SECONDS = 300
 DEFAULT_CLONE_RETRIES = 2
@@ -115,7 +119,7 @@ BOT_NAME_PATTERNS = [
     ]
 ]
 
-CLONE_CREDENTIAL_RE = re.compile(r"(https?://)(?:x-access-token|oauth2):[^@/\s]+@", re.I)
+CLONE_CREDENTIAL_RE = re.compile(r"(https?://)(?:x-access-token|oauth2|x-token-auth):[^@/\s]+@", re.I)
 GITHUB_MERGE_RE = re.compile(r"^Merge pull request #(\d+) from (\S+)")
 GITHUB_SQUASH_RE = re.compile(r"\(#(\d+)\)$")
 GITLAB_MR_RE = re.compile(r"See merge request (?:\S+)?!(\d+)")
@@ -239,7 +243,7 @@ SKIP_WALK_DIRS = {
     "obj",
     "packages",
 }
-LOCAL_PLATFORM_ROOTS = frozenset({"github", "gitlab", "local"})
+LOCAL_PLATFORM_ROOTS = frozenset({"github", "gitlab", "bitbucket", "local"})
 LLM_SEMAPHORE = threading.BoundedSemaphore(3)
 LLM_SOURCE_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb", ".php",
@@ -431,7 +435,7 @@ class LLMConfig:
 
 @dataclass
 class RepoTarget:
-    platform: str  # github | gitlab | local
+    platform: str  # github | gitlab | bitbucket | local
     org: str
     full_name: str
     meta: dict[str, Any]
@@ -531,6 +535,9 @@ def log_runtime_diagnostics(log: logging.Logger, args: argparse.Namespace) -> No
         log.info("github_accessible=%s", bool(args.github_accessible))
         log.info("gitlab_group=%s", args.gitlab_group or [])
         log.info("gitlab_accessible=%s", bool(args.gitlab_accessible))
+        log.info("bitbucket_token_name=%s", args.bitbucket_token_name)
+        log.info("bitbucket_workspace=%s", args.bitbucket_workspace or [])
+        log.info("bitbucket_repo_count=%s", len(args.bitbucket_repo or []))
         log.info(
             "github_repo_count=%s gitlab_repo_count=%s",
             len(args.github_repo or []),
@@ -994,6 +1001,89 @@ def fetch_gitlab_merged_mrs(
     return enriched
 
 
+# ── Bitbucket Cloud ─────────────────────────────────────────────────────────
+#
+# Bitbucket Cloud has no account-wide discovery (``/workspaces`` is gone and
+# ``/repositories`` without a workspace is 410), so a workspace slug is always
+# required. REST and git authenticate differently: REST takes ``email:token``
+# Basic auth (or a Bearer token when no email is configured, as for workspace
+# and repository access tokens); git over HTTPS needs the literal username
+# ``x-token-auth``.
+
+
+def bitbucket_headers(token: str, email: str = "") -> dict[str, str]:
+    if email:
+        raw = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
+        auth = f"Basic {raw}"
+    else:
+        auth = f"Bearer {token}"
+    return {
+        "Authorization": auth,
+        "Accept": "application/json",
+        "User-Agent": "extract-org-raw-data",
+    }
+
+
+def paginate_bitbucket(
+    url: str, token: str, email: str = "", *, max_pages: int = 500
+) -> list[Any]:
+    """Follow Bitbucket's ``next`` links and return every ``values`` item."""
+    items: list[Any] = []
+    headers = bitbucket_headers(token, email)
+    next_url: str | None = url
+    for _ in range(max_pages):
+        if not next_url:
+            break
+        data, _hdrs = http_get_json(next_url, headers)
+        if not isinstance(data, dict):
+            break
+        items.extend(data.get("values") or [])
+        next_url = data.get("next")
+    return items
+
+
+def list_bitbucket_repo_objects(
+    token: str, workspace: str, email: str = ""
+) -> list[dict[str, Any]]:
+    ws = urllib.parse.quote(workspace.strip("/"), safe="")
+    repos = paginate_bitbucket(
+        f"{BITBUCKET_API}/repositories/{ws}?pagelen=100&sort=slug", token, email
+    )
+    repos = [r for r in repos if isinstance(r, dict) and r.get("full_name")]
+    if not repos:
+        raise RuntimeError(
+            f"No Bitbucket repositories found for workspace {workspace!r} "
+            "(check the slug and that the token has repository:read)"
+        )
+    return repos
+
+
+def fetch_bitbucket_repo(token: str, full_name: str, email: str = "") -> dict[str, Any]:
+    data, _ = http_get_json(
+        f"{BITBUCKET_API}/repositories/{full_name.strip('/')}",
+        bitbucket_headers(token, email),
+    )
+    if not isinstance(data, dict) or not data.get("full_name"):
+        raise RuntimeError(f"Bitbucket repository not found: {full_name}")
+    return data
+
+
+def fetch_bitbucket_merged_prs(
+    token: str, full_name: str, email: str = ""
+) -> list[dict[str, Any]]:
+    prs = paginate_bitbucket(
+        f"{BITBUCKET_API}/repositories/{full_name}/pullrequests"
+        "?state=MERGED&pagelen=50",
+        token,
+        email,
+    )
+    for pr in prs:
+        author = pr.get("author") or {}
+        login = author.get("nickname") or author.get("display_name") or ""
+        pr["author_is_bot"] = is_bot_login(login)
+    return prs
+
+
 # ── git / scc ───────────────────────────────────────────────────────────────
 
 
@@ -1132,6 +1222,10 @@ def gitlab_clone_url(full_name: str, token: str, host: str) -> str:
     scheme = "http://" if host.startswith("http://") else "https://"
     bare = host.replace("https://", "").replace("http://", "")
     return f"{scheme}oauth2:{token}@{bare}/{full_name}.git"
+
+
+def bitbucket_clone_url(full_name: str, token: str) -> str:
+    return f"https://x-token-auth:{token}@bitbucket.org/{full_name}.git"
 
 
 def aggregate_git_stats(repo: Path) -> dict[str, Any]:
@@ -1392,7 +1486,54 @@ def detect_merged_prs_from_git(repo: Path) -> list[dict[str, str]]:
             "merged_by_email": author_email,
             "merge_commit": sha,
         }
-    return sorted(records.values(), key=lambda record: record["merged_at"])
+    # Numbered markers alone undercount: merge commits without a PR/MR number in
+    # the message (plain ``git merge``, Bitbucket UI merges with edited subjects)
+    # are still merged work, so add every merge commit not already counted.
+    counted = {record["merge_commit"] for record in records.values()}
+    extra = [
+        merge
+        for merge in unnumbered_merge_commits(repo)
+        if merge["merge_commit"] not in counted
+    ]
+    return sorted(
+        [*records.values(), *extra], key=lambda record: record["merged_at"]
+    )
+
+
+def unnumbered_merge_commits(repo: Path) -> list[dict[str, str]]:
+    """Merge commits without PR/MR numbers in their message.
+
+    Legacy GitLab repositories often merge branches directly, so the only
+    evidence of a review cycle is the merge commit itself.
+    """
+    text = run_git(
+        repo,
+        "log",
+        "--merges",
+        "--pretty=format:%H%x1f%aI%x1f%an%x1f%ae%x1f%s%x1e",
+        timeout=600,
+    )
+    records: list[dict[str, str]] = []
+    for raw_record in text.split("\x1e"):
+        fields = raw_record.strip("\n").split("\x1f")
+        if len(fields) < 5:
+            continue
+        sha, date, author_name, author_email, subject = fields[:5]
+        records.append(
+            {
+                "pr_number": "",
+                "method": "merge-commit-unnumbered",
+                "source_branch": "",
+                "title": subject,
+                "merged_at": date,
+                "merged_by_name": author_name,
+                "merged_by_email": author_email,
+                "merge_commit": sha,
+            }
+        )
+    return sorted(records, key=lambda record: record["merged_at"])
+
+
 
 
 def detect_tests(repo: Path) -> bool:
@@ -2084,6 +2225,15 @@ def list_gitlab_accessible_projects(
     ]
 
 
+def list_bitbucket_repos_for_workspace(
+    token: str, workspace: str, email: str = ""
+) -> list[dict[str, str]]:
+    return [
+        {"id": str(repo["full_name"]), "name": str(repo["full_name"]), "archived": False}
+        for repo in list_bitbucket_repo_objects(token, workspace, email)
+    ]
+
+
 def filter_local_targets(
     targets: list[RepoTarget], selectors: list[str]
 ) -> list[RepoTarget]:
@@ -2146,6 +2296,8 @@ def process_repo(
     github_token_name: str,
     gitlab_token_name: str,
     github_token_fn: Callable[[], str] | None,
+    bitbucket_token_name: str = DEFAULT_BITBUCKET_TOKEN_NAME,
+    bitbucket_email_name: str = DEFAULT_BITBUCKET_EMAIL_NAME,
     llm_config: LLMConfig | None,
     run_dir: Path,
     clones_dir: Path,
@@ -2213,6 +2365,21 @@ def process_repo(
             row["merged_prs"] = len(mrs)
 
             clone_url = gitlab_clone_url(target.full_name, token, gitlab_host)
+        elif target.platform == "bitbucket":
+            token = tokens[bitbucket_token_name]
+            email = tokens.get(bitbucket_email_name, "")
+            row["repo_created_at"] = meta.get("created_on") or ""
+            row["primary_language"] = meta.get("language") or ""
+            if meta.get("size") is not None:
+                row["size_kb"] = int(meta["size"] / 1024)
+
+            # Bitbucket exposes neither a language breakdown nor a contributor
+            # list; both are derived from the clone (SCC / git authors) below.
+            prs = fetch_bitbucket_merged_prs(token, target.full_name, email)
+            write_json(api_dir / "merged_prs.json", prs)
+            row["merged_prs"] = len(prs)
+
+            clone_url = bitbucket_clone_url(target.full_name, token)
         else:
             if target.local_path is None:
                 raise RuntimeError("Local repository path is missing")
@@ -2274,6 +2441,18 @@ def process_repo(
             row["contributor_count"] = (
                 git_stats["human_authors"] + git_stats["bot_authors"]
             )
+
+        if target.platform == "bitbucket":
+            row["contributor_count"] = (
+                git_stats["human_authors"] + git_stats["bot_authors"]
+            )
+
+        if target.platform != "local" and not row["merged_prs"]:
+            # The platform API reported no merged PRs/MRs; fall back to merge
+            # and squash markers recovered from git history.
+            detected_prs = detect_merged_prs_from_git(clone_path)
+            write_json(git_dir / "merged_prs_detected_from_git.json", detected_prs)
+            row["merged_prs"] = len(detected_prs)
 
         row["project_name"] = org
         row["total_files"] = count_total_files(clone_path)
@@ -2553,10 +2732,47 @@ def build_targets(
                 )
             )
 
+    bb_workspaces = getattr(args, "bitbucket_workspace", None) or []
+    bb_repos = getattr(args, "bitbucket_repo", None) or []
+    if bb_workspaces or bb_repos:
+        bb_token_name = getattr(args, "bitbucket_token_name", DEFAULT_BITBUCKET_TOKEN_NAME)
+        if bb_token_name not in tokens:
+            raise SystemExit(f"Missing {bb_token_name!r} in tokens file")
+        bb_token = tokens[bb_token_name]
+        bb_email = tokens.get(
+            getattr(args, "bitbucket_email_name", DEFAULT_BITBUCKET_EMAIL_NAME), ""
+        )
+        for workspace in bb_workspaces:
+            ws_targets = [
+                RepoTarget(
+                    platform="bitbucket",
+                    org=workspace,
+                    full_name=str(meta["full_name"]),
+                    meta=meta,
+                )
+                for meta in list_bitbucket_repo_objects(bb_token, workspace, bb_email)
+            ]
+            if bb_repos:
+                ws_targets = filter_local_targets(ws_targets, bb_repos)
+            targets.extend(ws_targets)
+        if bb_repos and not bb_workspaces:
+            for full_name in bb_repos:
+                meta = fetch_bitbucket_repo(bb_token, full_name.strip("/"), bb_email)
+                full = str(meta["full_name"])
+                targets.append(
+                    RepoTarget(
+                        platform="bitbucket",
+                        org=full.split("/", 1)[0],
+                        full_name=full,
+                        meta=meta,
+                    )
+                )
+
     if not targets:
         raise SystemExit(
             "Provide --github-org / --github-repo / --github-accessible / "
-            "--gitlab-group / --gitlab-repo / --gitlab-accessible"
+            "--gitlab-group / --gitlab-repo / --gitlab-accessible / "
+            "--bitbucket-workspace / --bitbucket-repo"
         )
     # De-duplicate by platform + full_name while preserving order.
     seen: set[tuple[str, str]] = set()
@@ -2706,6 +2922,20 @@ def main() -> int:
         help=f"Key in tokens file for GitLab (default: {DEFAULT_GITLAB_TOKEN_NAME})",
     )
     parser.add_argument(
+        "--bitbucket-token-name",
+        default=DEFAULT_BITBUCKET_TOKEN_NAME,
+        help=f"Key in tokens file for Bitbucket (default: {DEFAULT_BITBUCKET_TOKEN_NAME})",
+    )
+    parser.add_argument(
+        "--bitbucket-email-name",
+        default=DEFAULT_BITBUCKET_EMAIL_NAME,
+        help=(
+            "Key in tokens file holding the Atlassian email used for REST Basic auth "
+            f"(default: {DEFAULT_BITBUCKET_EMAIL_NAME}); pass an empty string to send "
+            "the token as a Bearer (workspace/repository access tokens)"
+        ),
+    )
+    parser.add_argument(
         "--github-app",
         action="store_true",
         help="Authenticate via GitHub App installation token instead of a PAT",
@@ -2793,6 +3023,21 @@ def main() -> int:
             "(any group or personal namespace)"
         ),
     )
+    parser.add_argument(
+        "--bitbucket-workspace",
+        action="append",
+        default=[],
+        help="Bitbucket Cloud workspace slug (repeatable). There is no account-wide discovery",
+    )
+    parser.add_argument(
+        "--bitbucket-repo",
+        action="append",
+        default=[],
+        help=(
+            "Bitbucket repository (workspace/repo). Alone: analyse these repositories. "
+            "With --bitbucket-workspace: include only matching names or paths"
+        ),
+    )
     args = parser.parse_args()
 
     if args.ui:
@@ -2827,8 +3072,12 @@ def main() -> int:
         or args.gitlab_group
         or args.gitlab_repo
         or args.gitlab_accessible
+        or args.bitbucket_workspace
+        or args.bitbucket_repo
     ):
-        raise SystemExit("--offline cannot be combined with GitHub or GitLab targets")
+        raise SystemExit(
+            "--offline cannot be combined with GitHub, GitLab or Bitbucket targets"
+        )
     if args.llm and not os.environ.get("OPENAI_API_KEY", "").strip():
         raise SystemExit(
             "--llm requires OPENAI_API_KEY in the environment. "
@@ -2841,6 +3090,8 @@ def main() -> int:
     # the same channel already used for OPENAI_API_KEY.
     ui_github_token = os.environ.get("EXTRACT_GITHUB_TOKEN", "").strip()
     ui_gitlab_token = os.environ.get("EXTRACT_GITLAB_TOKEN", "").strip()
+    ui_bitbucket_token = os.environ.get("EXTRACT_BITBUCKET_TOKEN", "").strip()
+    ui_bitbucket_email = os.environ.get("EXTRACT_BITBUCKET_EMAIL", "").strip()
     # Offline mode analyses local clones only and never uses API tokens.
     # Skip loading so a Docker bind-mount directory at the default path
     # (created when the host tokens file was missing) cannot abort the run.
@@ -2859,7 +3110,7 @@ def main() -> int:
         elif (
             not args.list_installations
             and not args.github_app
-            and not (ui_github_token or ui_gitlab_token)
+            and not (ui_github_token or ui_gitlab_token or ui_bitbucket_token)
         ):
             raise SystemExit(f"Tokens file not found: {args.tokens_file}")
         # A UI-pasted token overrides / creates the matching key so the rest of
@@ -2869,6 +3120,12 @@ def main() -> int:
             tokens[args.github_token_name] = ui_github_token
         if ui_gitlab_token:
             tokens[args.gitlab_token_name] = ui_gitlab_token
+        if ui_bitbucket_token:
+            tokens[args.bitbucket_token_name] = ui_bitbucket_token
+            # A pasted token carries its own email (blank means Bearer); never
+            # pair it with an email left over in the tokens file.
+            if args.bitbucket_email_name:
+                tokens[args.bitbucket_email_name] = ui_bitbucket_email
 
     if args.list_installations:
         return cmd_list_installations(args, tokens)
@@ -2928,6 +3185,8 @@ def main() -> int:
             label = args.github_org[0]
         elif args.gitlab_group:
             label = args.gitlab_group[0]
+        elif args.bitbucket_workspace:
+            label = args.bitbucket_workspace[0]
         elif args.github_accessible:
             label = "github-accessible"
         elif args.gitlab_accessible:
@@ -2936,6 +3195,8 @@ def main() -> int:
             label = args.github_repo[0].replace("/", "_")
         elif args.gitlab_repo:
             label = args.gitlab_repo[0].replace("/", "_")
+        elif args.bitbucket_repo:
+            label = args.bitbucket_repo[0].replace("/", "_")
         else:
             label = "repos"
         run_dir = args.output_dir / f"raw-extract-{safe_name(label)}-{stamp}"
@@ -3014,6 +3275,8 @@ def main() -> int:
                     tokens=tokens,
                     github_token_name=github_token_name,
                     gitlab_token_name=args.gitlab_token_name,
+                    bitbucket_token_name=args.bitbucket_token_name,
+                    bitbucket_email_name=args.bitbucket_email_name,
                     github_token_fn=github_token_fn,
                     llm_config=llm_config,
                     run_dir=run_dir,

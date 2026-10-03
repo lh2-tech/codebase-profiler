@@ -41,6 +41,7 @@ ZIP_LOCK = threading.Lock()
 
 from extract_org_raw_data import (  # noqa: E402
     discover_local_repositories,
+    list_bitbucket_repos_for_workspace,
     list_github_accessible_repos,
     list_github_orgs_for_token,
     list_github_repos_for_org,
@@ -125,6 +126,8 @@ def safe_form_settings_for_logs(settings: dict[str, Any] | None) -> dict[str, An
         "secret",
         "github_token",
         "gitlab_token",
+        "bitbucket_token",
+        "bitbucket_email",
     }
     return {
         key: value
@@ -241,6 +244,29 @@ def normalize_gitlab_host(raw: str) -> str:
     return value
 
 
+def read_bitbucket_credentials(fields: dict[str, list[str]]) -> tuple[str, str]:
+    """Return (token, email). The email is optional (Bearer access tokens).
+
+    A token pasted into the UI wins and takes its email from the pasted email
+    box (blank means Bearer); otherwise both come from the tokens file keys.
+    """
+    pasted = fields.get("bitbucket_token", [""])[0].strip()
+    if pasted:
+        return pasted, fields.get("bitbucket_email", [""])[0].strip()
+    tokens_file = Path(default_tokens_file())
+    if not tokens_file.is_file():
+        raise ValueError(
+            "Paste a token above, or add the mounted tokens file "
+            f"({tokens_file})."
+        )
+    tokens = parse_tokens_file(tokens_file)
+    token_name = fields.get("bitbucket_token_name", ["bitbucket_token"])[0].strip()
+    if token_name not in tokens:
+        raise ValueError(f"Missing {token_name!r} in tokens file")
+    email_name = fields.get("bitbucket_email_name", ["bitbucket_email"])[0].strip()
+    return tokens[token_name], (tokens.get(email_name, "") if email_name else "")
+
+
 def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
     llm_enabled = fields.get("llm_enabled", [""])[0] == "on"
     selected = extract_selected_repos(fields)
@@ -255,6 +281,10 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
         "gitlab_group": fields.get("gitlab_group", [""])[0].strip(),
         "gitlab_token_name": fields.get("gitlab_token_name", ["gitlab_token"])[0].strip()
         or "gitlab_token",
+        "bitbucket_workspace": fields.get("bitbucket_workspace", [""])[0].strip(),
+        "bitbucket_token_name": fields.get("bitbucket_token_name", ["bitbucket_token"])[0].strip()
+        or "bitbucket_token",
+        "bitbucket_email_name": fields.get("bitbucket_email_name", ["bitbucket_email"])[0].strip(),
         "workers": fields.get("workers", ["4"])[0].strip() or "4",
         "retry_failed": fields.get("retry_failed", [""])[0] == "on",
         "resume_run_dir": fields.get("resume_run_dir", [""])[0].strip(),
@@ -267,6 +297,8 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
 
 
 def read_token_from_fields(fields: dict[str, list[str]], platform: str) -> str:
+    if platform == "bitbucket":
+        return read_bitbucket_credentials(fields)[0]
     # A token pasted into the UI takes priority and is used as-is (in memory
     # only). An empty field falls back to the mounted tokens file + key name.
     pasted_field = "github_token" if platform == "github" else "gitlab_token"
@@ -816,7 +848,7 @@ __DOCKER_NOTICE__
 <div class="card"><strong>Where are the repositories?</strong>
 <div class="choices">
   <label class="choice"><input type="radio" name="mode" value="offline" checked> <strong>Already cloned here</strong><span class="small">Runs entirely offline. No internet connection is needed.</span></label>
-  <label class="choice"><input type="radio" name="mode" value="hosted"> <strong>Hosted platform</strong><span class="small">Connect to a GitHub or GitLab organisation with a token file.</span></label>
+  <label class="choice"><input type="radio" name="mode" value="hosted"> <strong>Hosted platform</strong><span class="small">Connect to a GitHub organisation, GitLab group or Bitbucket workspace with a token file.</span></label>
 </div></div>
 <div class="card">
   <div id="offline-fields">
@@ -824,10 +856,11 @@ __DOCKER_NOTICE__
     <p class="notice"><strong>Offline clones:</strong> place full git clones in the mounted repos folder on your computer (default <code>./repos</code>, or the path set by <code>LOCAL_REPOS_DIR</code>). Use a normal <code>git clone</code> without <code>--depth</code>.</p>
   </div>
   <div id="hosted-fields" class="hidden">
-    <label class="field">Platform</label><select id="hosted-platform" name="hosted_platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option></select>
+    <label class="field">Platform</label><select id="hosted-platform" name="hosted_platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option><option value="bitbucket">Bitbucket</option></select>
     <p class="notice">Paste a token below to use it for this run only — it is held in memory and never written to disk, logs, or the output archive. Leave the token box blank to read the credential from the mounted <code>tokens</code> file instead.</p>
     <div id="github-fields"><label class="field">GitHub token <span class="small">(PRIMARY METHOD)</span></label><input name="github_token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste token here (ghp_… / github_pat_…)"><div id="github-token-feedback" class="token-feedback"></div><label class="field">GitHub token key <span class="small">(FALLBACK: only used when the token box above is empty)</span></label><input name="github_token_name" value="data-lh2-github-token" placeholder="Key in the token file"><label class="field">Organisation</label><div class="inline-actions"><button type="button" id="load-github-orgs" class="secondary">Load organisations</button><button type="button" id="load-github-accessible" class="secondary">Load accessible repositories</button></div><select name="github_org" id="github-org-select"><option value="">Choose an organisation (optional if using accessible repos or manual list)</option></select><p class="notice">Organisation listing only shows orgs you belong to. Use <strong>Load accessible repositories</strong> for direct collaborator access, or paste <code>owner/repo</code> names below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="github-accessible" type="checkbox" name="github_accessible"><strong>Analyse every accessible repository</strong><span class="small">Runs against all repos this token can access (owner, collaborator, and org member).</span></label></div>
     <div id="gitlab-fields" class="hidden"><label class="field">GitLab token <span class="small">(PRIMARY METHOD)</span></label><input name="gitlab_token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste token here (glpat-…)"><div id="gitlab-token-feedback" class="token-feedback"></div><label class="field">GitLab token key <span class="small">(FALLBACK: only used when the token box above is empty)</span></label><input name="gitlab_token_name" value="gitlab_token" placeholder="Key in the token file"><label class="field">GitLab host / base URL</label><input name="gitlab_host" id="gitlab-host" value="" placeholder="https://gitlab.com"><p class="notice">Optional. Use a full URL for self-hosted GitLab (for example <code>https://gitlab.example.com</code>). Leave blank for gitlab.com.</p><label class="field">Group</label><div class="inline-actions"><button type="button" id="load-gitlab-groups" class="secondary">Load groups</button><button type="button" id="load-gitlab-accessible" class="secondary">Load all projects</button></div><select name="gitlab_group" id="gitlab-group-select"><option value="">Choose a group (optional if using all projects or manual list)</option></select><p class="notice">Group listing shows groups you belong to. Use <strong>Load all projects</strong> for every project this token can access via membership, or paste <code>group/project</code> paths below.</p><label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="gitlab-accessible" type="checkbox" name="gitlab_accessible"><strong>Analyse every accessible project</strong><span class="small">Runs against all GitLab projects this token can access (membership).</span></label></div>
+    <div id="bitbucket-fields" class="hidden"><label class="field">Bitbucket token <span class="small">(PRIMARY METHOD)</span></label><input name="bitbucket_token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste token here (ATATT… API token, or a workspace / repository access token)"><label class="field">Atlassian email <span class="small">(needed for API tokens; leave blank for workspace / repository access tokens)</span></label><input name="bitbucket_email" type="text" autocomplete="off" spellcheck="false" placeholder="you@example.com"><label class="field">Bitbucket token key <span class="small">(FALLBACK: only used when the token box above is empty)</span></label><input name="bitbucket_token_name" value="bitbucket_token" placeholder="Key in the token file"><label class="field">Bitbucket email key <span class="small">(FALLBACK: clear it to send the file token as a Bearer)</span></label><input name="bitbucket_email_name" value="bitbucket_email" placeholder="Key in the token file"><label class="field">Workspace<span class="req">*</span></label><input name="bitbucket_workspace" id="bitbucket-workspace" value="" placeholder="workspace-slug" autocomplete="off"><div class="inline-actions"><button type="button" id="load-bitbucket-repos" class="secondary">Load repositories</button></div><p class="notice">Bitbucket Cloud cannot list every workspace a token can reach, so enter the workspace slug (the part after <code>bitbucket.org/</code>), then load its repositories to pick a subset or paste <code>workspace/repo</code> paths below. Needs scopes <code>read:repository:bitbucket</code> and <code>read:pullrequest:bitbucket</code>. Git cloning uses <code>x-token-auth</code> automatically.</p></div>
   </div>
   <div id="manual-repos-wrap" class="hidden">
     <label class="field" id="manual-repos-label">Manual repository list</label>
@@ -887,6 +920,11 @@ function updateRepoPickerCopy(){
     help.textContent='Group mode: leave all unchecked to include every project in the selected group. All-projects mode: select the projects you want, or use Select all.';
     if (manualLabel) manualLabel.textContent='Manual project list';
     if (manualHelp) manualHelp.textContent='One group/project path per line. Use this when a project is missing from group discovery.';
+  } else if (mode==='hosted' && platform==='bitbucket') {
+    label.textContent='Repositories to include';
+    help.textContent='Leave all unchecked to include every repository in the workspace, or select the ones you want.';
+    if (manualLabel) manualLabel.textContent='Manual repository list';
+    if (manualHelp) manualHelp.textContent='One workspace/repo per line. Use this when a repository is missing from the workspace listing.';
   } else {
     label.textContent='Repositories to include';
     help.textContent='Organisation mode: leave all unchecked to include every repository in the org. Accessible-repo mode: select the repos you want, or use Select all.';
@@ -900,6 +938,7 @@ function choosePlatform(){
   const platform=document.querySelector('#hosted-platform').value;
   document.querySelector('#github-fields').classList.toggle('hidden', platform!=='github');
   document.querySelector('#gitlab-fields').classList.toggle('hidden', platform!=='gitlab');
+  document.querySelector('#bitbucket-fields').classList.toggle('hidden', platform!=='bitbucket');
   document.querySelector('#manual-repos-wrap').classList.toggle('hidden', mode!=='hosted');
   if (mode!=='hosted') document.querySelector('#repo-picker-wrap').classList.add('hidden');
   updateRepoPickerCopy();
@@ -1018,10 +1057,17 @@ async function loadHostedRepos(){
     github_token_name:document.querySelector('[name=github_token_name]').value,
     gitlab_token_name:document.querySelector('[name=gitlab_token_name]').value,
     gitlab_host:document.querySelector('[name=gitlab_host]')?.value||'',
+    bitbucket_token:document.querySelector('[name=bitbucket_token]')?.value||'',
+    bitbucket_email:document.querySelector('[name=bitbucket_email]')?.value||'',
+    bitbucket_token_name:document.querySelector('[name=bitbucket_token_name]').value,
+    bitbucket_email_name:document.querySelector('[name=bitbucket_email_name]').value,
   };
   if (platform==='github') {
     extra.github_org=document.querySelector('#github-org-select').value;
     if (!extra.github_org) return;
+  } else if (platform==='bitbucket') {
+    extra.bitbucket_workspace=document.querySelector('#bitbucket-workspace').value.trim();
+    if (!extra.bitbucket_workspace) { showFormError('Enter a Bitbucket workspace slug first.'); return; }
   } else {
     extra.gitlab_group=document.querySelector('#gitlab-group-select').value;
     if (!extra.gitlab_group) return;
@@ -1030,7 +1076,7 @@ async function loadHostedRepos(){
   try {
     const payload=await postDiscover('/discover/repos', extra);
     rememberRepoChecks();
-    renderRepoPicker(payload.items, platform==='gitlab' ? 'No projects found in this group.' : 'No repositories found for this selection.');
+    renderRepoPicker(payload.items, platform==='gitlab' ? 'No projects found in this group.' : (platform==='bitbucket' ? 'No repositories found in this workspace.' : 'No repositories found for this selection.'));
     noteFileSource(platform);
   } catch (error) {
     document.querySelector('#repo-picker-wrap').classList.add('hidden');
@@ -1111,6 +1157,15 @@ function validateForm(){
       if (!isResume && !hasOrg && !hasSelected && !hasManual && !hasAccessible) {
         errors.push(['github-org-select','Choose an organisation, load/select accessible repos, paste a manual list, or enable “Analyse every accessible repository”.']);
       }
+    } else if (data.hosted_platform==='bitbucket') {
+      const bbToken=(document.querySelector('[name=bitbucket_token]')?.value||'').trim();
+      if (!bbToken && !data.bitbucket_token_name.trim()) errors.push(['bitbucket_token','Paste a Bitbucket token, or enter the token key from your file.']);
+      const hasWorkspace=!!data.bitbucket_workspace.trim();
+      const hasSelected=getSelectedRepos().length>0;
+      const hasManual=getManualRepos().length>0;
+      if (!isResume && !hasWorkspace && !hasSelected && !hasManual) {
+        errors.push(['bitbucket-workspace','Enter a workspace slug, or paste workspace/repo paths in the manual list.']);
+      }
     } else {
       const glToken=(document.querySelector('[name=gitlab_token]')?.value||'').trim();
       if (!glToken && !data.gitlab_token_name.trim()) errors.push(['gitlab_token','Paste a GitLab token, or enter the token key from your file.']);
@@ -1144,6 +1199,9 @@ function readFormSettings(){
     gitlab_host:data.get('gitlab_host')||'',
     gitlab_group:data.get('gitlab_group')||'',
     gitlab_token_name:data.get('gitlab_token_name')||'gitlab_token',
+    bitbucket_workspace:data.get('bitbucket_workspace')||'',
+    bitbucket_token_name:data.get('bitbucket_token_name')||'bitbucket_token',
+    bitbucket_email_name:data.get('bitbucket_email_name')||'',
     workers:data.get('workers')||'4',
     resume_run_dir:data.get('resume_run_dir')||'',
     retry_failed:!!data.get('retry_failed'),
@@ -1165,6 +1223,9 @@ function restoreFormSettings(settings){
   setValue('gitlab_host', settings.gitlab_host||'');
   setValue('gitlab_group', settings.gitlab_group||'');
   setValue('gitlab_token_name', settings.gitlab_token_name||'gitlab_token');
+  setValue('bitbucket_workspace', settings.bitbucket_workspace||'');
+  setValue('bitbucket_token_name', settings.bitbucket_token_name||'bitbucket_token');
+  setValue('bitbucket_email_name', settings.bitbucket_email_name!=null ? settings.bitbucket_email_name : 'bitbucket_email');
   setValue('workers', settings.workers||'4');
   setValue('manual_repos', settings.manual_repos||'');
   document.querySelector('#llm-enabled').checked=!!settings.llm_enabled;
@@ -1218,7 +1279,7 @@ function toast(message, type, title){
   setTimeout(kill, type==='error' ? 7000 : 4500);
 }
 function tokenInField(platform){
-  const name = platform==='gitlab' ? 'gitlab_token' : 'github_token';
+  const name = platform==='gitlab' ? 'gitlab_token' : (platform==='bitbucket' ? 'bitbucket_token' : 'github_token');
   return (document.querySelector('[name='+name+']')?.value||'').trim();
 }
 // Validate token format and provide real-time feedback to user
@@ -1270,6 +1331,7 @@ document.querySelector('#load-local-repos').addEventListener('click', loadLocalR
 document.querySelector('#load-github-orgs').addEventListener('click', loadHostedOrgs);
 document.querySelector('#load-github-accessible').addEventListener('click', loadAccessibleGithubRepos);
 document.querySelector('#load-gitlab-groups').addEventListener('click', loadHostedOrgs);
+document.querySelector('#load-bitbucket-repos').addEventListener('click', loadHostedRepos);
 document.querySelector('#load-gitlab-accessible').addEventListener('click', loadAccessibleGitlabProjects);
 document.querySelector('#github-org-select').addEventListener('change', loadHostedRepos);
 document.querySelector('#gitlab-group-select').addEventListener('change', loadHostedRepos);
@@ -1278,12 +1340,13 @@ document.querySelector('#clear-repos').addEventListener('click', ()=>document.qu
 document.querySelector('#refresh-resumable').addEventListener('click', loadResumableRuns);
 // Editing a token invalidates any orgs/repos loaded with the previous one.
 // Also provide real-time token format validation feedback.
-['github_token','gitlab_token'].forEach(function(n){
+['github_token','gitlab_token','bitbucket_token'].forEach(function(n){
   const el=document.querySelector('[name='+n+']');
   if(el) {
     el.addEventListener('input', resetDiscoveryResults);
     // Add token format validation feedback
     el.addEventListener('input', ()=>{
+      if (n === 'bitbucket_token') return;
       const platform = n === 'github_token' ? 'github' : 'gitlab';
       validateTokenFormat(platform);
     });
@@ -1770,7 +1833,14 @@ class Handler(BaseHTTPRequestHandler):
                     self.respond(
                         HTTPStatus.BAD_REQUEST,
                         "application/json",
-                        json.dumps({"error": "Unknown hosted platform."}),
+                        json.dumps(
+                            {
+                                "error": "Bitbucket has no organisation listing; "
+                                "enter a workspace slug and load its repositories."
+                                if platform == "bitbucket"
+                                else "Unknown hosted platform."
+                            }
+                        ),
                     )
                     return
                 ui_log(
@@ -1803,6 +1873,9 @@ class Handler(BaseHTTPRequestHandler):
                     json.dumps({"error": str(exc)}),
                 )
                 return
+            bb_email = (
+                read_bitbucket_credentials(fields)[1] if platform == "bitbucket" else ""
+            )
             try:
                 if platform == "github":
                     org = fields.get("github_org", [""])[0].strip()
@@ -1828,6 +1901,18 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     items = list_gitlab_projects_for_group(
                         token, group, host=gitlab_host or "gitlab.com"
+                    )
+                elif platform == "bitbucket":
+                    workspace = fields.get("bitbucket_workspace", [""])[0].strip()
+                    if not workspace:
+                        self.respond(
+                            HTTPStatus.BAD_REQUEST,
+                            "application/json",
+                            json.dumps({"error": "Enter a Bitbucket workspace slug."}),
+                        )
+                        return
+                    items = list_bitbucket_repos_for_workspace(
+                        token, workspace, bb_email
                     )
                 else:
                     self.respond(
@@ -1967,7 +2052,10 @@ class Handler(BaseHTTPRequestHandler):
             platform = fields.get("hosted_platform", ["github"])[0]
             tokens_file = default_tokens_file()
             have_tokens_file = Path(tokens_file).is_file()
-            pasted_field = "github_token" if platform == "github" else "gitlab_token"
+            pasted_field = {
+                "github": "github_token",
+                "bitbucket": "bitbucket_token",
+            }.get(platform, "gitlab_token")
             pasted_token = fields.get(pasted_field, [""])[0].strip()
             if not pasted_token and not have_tokens_file:
                 self.respond(
@@ -2036,6 +2124,36 @@ class Handler(BaseHTTPRequestHandler):
                 command.extend(["--gitlab-token-name", token_name])
                 if gitlab_host:
                     command.extend(["--gitlab-host", gitlab_host])
+            elif platform == "bitbucket":
+                workspace = fields.get("bitbucket_workspace", [""])[0].strip()
+                token_name = (
+                    fields.get("bitbucket_token_name", [""])[0].strip()
+                    or "bitbucket_token"
+                )
+                email_name = fields.get("bitbucket_email_name", [""])[0].strip()
+                if pasted_token:
+                    env_overrides["EXTRACT_BITBUCKET_TOKEN"] = pasted_token
+                    env_overrides["EXTRACT_BITBUCKET_EMAIL"] = fields.get(
+                        "bitbucket_email", [""]
+                    )[0].strip()
+                if not resume_run_dir:
+                    if selected_repos:
+                        for repo_name in selected_repos:
+                            command.extend(["--bitbucket-repo", repo_name])
+                    elif workspace:
+                        command.extend(["--bitbucket-workspace", workspace])
+                    else:
+                        self.respond(
+                            HTTPStatus.BAD_REQUEST,
+                            "text/plain",
+                            "Enter a Bitbucket workspace slug or select/paste "
+                            "workspace/repo paths.",
+                        )
+                        return
+                command.extend(["--bitbucket-token-name", token_name])
+                # An empty key is passed through on purpose: it opts out of the
+                # CLI default so the token is sent as a Bearer (access tokens).
+                command.extend(["--bitbucket-email-name", email_name])
             else:
                 self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Unknown hosted platform.")
                 return
