@@ -1,6 +1,6 @@
 # Codebase Profiler
 
-Privacy-safe repository evidence extractor with a local browser UI. Analyses GitHub/GitLab organisations or folders of local clones and produces a metadata-only archive (no source code in the output zip).
+Privacy-safe repository evidence extractor with a local browser UI. Analyses GitHub/GitLab organisations, Bitbucket Cloud workspaces or folders of local clones and produces a metadata-only archive (no source code in the output zip).
 
 ## Quick start (Docker)
 
@@ -61,6 +61,22 @@ Reporter is the minimum useful role — Guest members can see that a private pro
 
 GitHub App auth is also supported via `--github-app` (see `tokens.example` for `github_app_id` / `github_app_pem`).
 
+### Bitbucket Cloud
+
+| | Required |
+|---|---|
+| Token type | Atlassian **scoped API token** (`ATATT…`), or a workspace / repository access token |
+| Scopes | `read:repository:bitbucket` and `read:pullrequest:bitbucket` (for a workspace / repository access token: **Repositories: Read** and **Pull requests: Read**) |
+| Email | The Atlassian account email, for scoped API tokens only. Not needed for access tokens |
+| Workspace | The **slug** (the part after `bitbucket.org/`) — always required |
+| Token-file keys | `bitbucket_token`, and `bitbucket_email` for scoped API tokens |
+
+The tool only reads. Every metadata call is accepted with the `repository` and `pullrequest` scopes, and `git clone` needs `read:repository:bitbucket`. A token that also carries `read:project:bitbucket` / `read:workspace:bitbucket` works too; they are not required. The token's account (or the access token's workspace) must be able to see the repositories you want — a token that can reach a workspace but no repositories returns an empty listing rather than an error.
+
+REST and git authenticate differently, and the tool handles both: REST uses `email:token` Basic auth (or a Bearer token when no email is set, as for access tokens), while `git clone` uses the literal username `x-token-auth`. A "You may not have access to this repository" clone error with a valid token usually means the wrong git username was used, not missing access. A `403` quoting `required` / `granted` scopes means authentication worked and only a scope is missing.
+
+Bitbucket Cloud has no account-wide discovery (`/workspaces` is gone and `/repositories` without a workspace returns `410`), so there is no "analyse everything this token can access" option — name the workspace. The API exposes neither a language breakdown nor a contributor list, so those come from the clone (SCC and git authors). Bitbucket Server / Data Center is not supported.
+
 ### OpenAI
 
 `openai_key` is only read when LLM mode is enabled (`--llm`, or the checkbox in the UI). Leave it out entirely if you do not use that mode.
@@ -78,6 +94,7 @@ cd ~/DataLabs/codebase-profiler && TOKEN=$(grep '^YOUR_KEY_NAME=' secrets/tokens
 Useful when a security team asks what the token is actually allowed to touch. All calls are `GET`; the tool never writes.
 
 - **GitLab** — `/groups`, `/groups/:id/projects`, `/projects`, `/projects/:id`, `/projects/:id/languages`, `/projects/:id/members/all`, `/projects/:id/merge_requests` (plus `/:iid`, `/notes`, `/changes`), and `git clone` over HTTPS
+- **Bitbucket** — `/2.0/repositories/:workspace`, `/2.0/repositories/:workspace/:repo`, `/2.0/repositories/:workspace/:repo/pullrequests?state=MERGED`, and `git clone` over HTTPS
 - **GitHub** — `/user`, `/user/orgs`, `/user/repos`, `/orgs/:org/repos`, `/repos/:full_name`, `/repos/:full_name/languages`, `/repos/:full_name/contributors`, `/repos/:owner/:name/pulls`, and `git clone` over HTTPS
 
 ## UI features
@@ -85,6 +102,7 @@ Useful when a security team asks what the token is actually allowed to touch. Al
 - **Run analysis** — starts the metadata extraction
 - **Progress bar** — shows repository completion while a run is active, including failure classes (timeout, rate_limit, network, …)
 - **Organisation / group discovery** — load orgs/groups the token belongs to
+- **Bitbucket workspace** — enter a workspace slug and load its repositories (Bitbucket cannot list workspaces)
 - **Accessible GitHub repositories** — load every repo the token can access (owner, collaborator, and org member), including direct invites outside org membership
 - **Manual repository list** — paste `owner/repo` lines when discovery still misses a target
 - **Repository selection** — optional picker to limit which repos/projects are processed
@@ -95,7 +113,7 @@ Useful when a security team asks what the token is actually allowed to touch. Al
 
 ## Modes
 
-### Hosted platform (GitHub / GitLab)
+### Hosted platform (GitHub / GitLab / Bitbucket)
 
 - Put credentials in the host `secrets/tokens` file (mounted into the container automatically)
 - In the UI, choose the token key name (for example `github-data-token`) — no path entry needed
@@ -109,6 +127,16 @@ python extract_org_raw_data.py --github-accessible --tokens-file tokens --github
 # or specific repos:
 python extract_org_raw_data.py --github-repo owner/repo-one --github-repo owner/repo-two --tokens-file tokens
 ```
+
+Bitbucket needs a workspace slug (pass `--bitbucket-email-name ""` for access tokens that have no email):
+
+```bash
+python extract_org_raw_data.py --bitbucket-workspace my-workspace --tokens-file tokens
+python extract_org_raw_data.py --bitbucket-repo my-workspace/repo-one --tokens-file tokens
+python clone_all_repos.py --bitbucket-workspace my-workspace   # clones into <repos-root>/bitbucket/<workspace>/
+```
+
+**Merged PRs.** When the platform API reports no merged PRs/MRs for a repository, the count falls back to git history: numbered markers (GitHub merges, Bitbucket "Merged in … (pull request #N)", GitLab "See merge request !N", `(#N)` squash commits) plus every other merge commit. Only the checked-out (default) branch is scanned, so merges made on other branches are not counted.
 
 ### Resume / retry (CLI)
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Clone all GitHub/GitLab repos locally, then offline analysis can run without API calls."""
+"""Clone all GitHub/GitLab/Bitbucket repos locally, then offline analysis can run without API calls."""
 
 from __future__ import annotations
 
@@ -11,9 +11,13 @@ import time
 from pathlib import Path
 
 from extract_org_raw_data import (
+    DEFAULT_BITBUCKET_EMAIL_NAME,
+    DEFAULT_BITBUCKET_TOKEN_NAME,
+    bitbucket_clone_url,
     clone_repo,
     github_clone_url,
     gitlab_clone_url,
+    list_bitbucket_repo_objects,
     list_github_orgs_for_token,
     list_github_repo_objects,
     list_gitlab_groups_for_token,
@@ -135,6 +139,54 @@ def clone_gitlab_group(
     return stats
 
 
+def clone_bitbucket_workspace(
+    token: str,
+    workspace: str,
+    dest_root: Path,
+    *,
+    email: str = "",
+    skip_existing: bool = True,
+) -> dict[str, int]:
+    ws_dir = dest_root / "bitbucket" / safe_name(workspace)
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    stats = {"listed": 0, "cloned": 0, "skipped": 0, "failed": 0}
+
+    try:
+        repos = list_repos_with_retry(list_bitbucket_repo_objects, token, workspace, email)
+    except RuntimeError as exc:
+        if "No Bitbucket repositories found" in str(exc):
+            log(f"[bitbucket] {workspace}: 0 repos (skipping)")
+            return stats
+        raise
+    stats["listed"] = len(repos)
+    log(f"[bitbucket] {workspace}: {len(repos)} repos")
+
+    for meta in repos:
+        full_name = str(meta["full_name"])
+        dest = ws_dir / safe_name(full_name.split("/", 1)[-1])
+        if skip_existing and is_cloned(dest):
+            stats["skipped"] += 1
+            continue
+        try:
+            log(f"  cloning {full_name}")
+            clone_repo(bitbucket_clone_url(full_name, token), dest)
+            # Keep the token out of .git/config of the retained clone.
+            subprocess.run(
+                [
+                    "git", "-C", str(dest), "remote", "set-url", "origin",
+                    f"https://bitbucket.org/{full_name}.git",
+                ],
+                capture_output=True,
+                check=False,
+            )
+            stats["cloned"] += 1
+        except Exception as exc:
+            stats["failed"] += 1
+            log(f"  FAIL {full_name}: {exc}")
+        time.sleep(2)
+    return stats
+
+
 def top_level_gitlab_groups(groups: list[dict[str, str]]) -> list[str]:
     ids = [g["id"] for g in groups]
     top = []
@@ -153,6 +205,14 @@ def main() -> int:
     parser.add_argument("--repos-root", type=Path, default=DEFAULT_REPOS_ROOT)
     parser.add_argument("--github-token-name", default="data-lh2-token-github")
     parser.add_argument("--gitlab-token-name", default="data-lh2-token-gitlab")
+    parser.add_argument("--bitbucket-token-name", default=DEFAULT_BITBUCKET_TOKEN_NAME)
+    parser.add_argument("--bitbucket-email-name", default=DEFAULT_BITBUCKET_EMAIL_NAME)
+    parser.add_argument(
+        "--bitbucket-workspace",
+        action="append",
+        default=[],
+        help="Bitbucket Cloud workspace slug (repeatable; also read from targets file)",
+    )
     parser.add_argument("--github-host", default="github.com")
     parser.add_argument("--gitlab-host", default="gitlab.com")
     parser.add_argument("--targets-file", type=Path, default=CODING / "discovered_targets.json")
@@ -201,6 +261,28 @@ def main() -> int:
             host=args.gitlab_host,
             skip_existing=skip_existing,
         )
+
+    bitbucket_workspaces = list(args.bitbucket_workspace)
+    if args.targets_file.exists():
+        bitbucket_workspaces += [
+            w
+            for w in (targets.get("bitbucket_workspaces") or [])
+            if w not in bitbucket_workspaces
+        ]
+    if bitbucket_workspaces:
+        bb_token = tokens.get(args.bitbucket_token_name)
+        if not bb_token:
+            raise SystemExit(f"Missing {args.bitbucket_token_name!r} in tokens file")
+        bb_email = tokens.get(args.bitbucket_email_name, "")
+        log(f"Bitbucket workspaces: {len(bitbucket_workspaces)}")
+        for workspace in bitbucket_workspaces:
+            summary[f"bitbucket:{workspace}"] = clone_bitbucket_workspace(
+                bb_token,
+                workspace,
+                args.repos_root,
+                email=bb_email,
+                skip_existing=skip_existing,
+            )
 
     log(json.dumps({"summary": summary}, indent=2))
     failed = sum(v["failed"] for v in summary.values())
