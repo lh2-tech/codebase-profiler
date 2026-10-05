@@ -188,9 +188,29 @@ The UI uses the mounted folder automatically — no path entry needed. Optionall
 
 Results are written to `./outputs/raw-extracts/` on your computer (mounted into the container). Each run produces:
 
-- `summary.csv` (+ `summary.xlsx` when generated)
+- `summary.csv` (+ `summary.xlsx` when `openpyxl` is installed)
+- `for-check.csv`, also the second sheet (`for-check`) of `summary.xlsx` — platform-side facts for the checker (see below)
 - metadata JSON under `api/` and `git/`
 - a timestamped zip beside the run folder
+
+### for-check.csv
+
+An extract cannot say what it *should* contain. For GitHub/GitLab repos the tool therefore asks the platform for facts
+that git history cannot give back, just before and just after each repo is processed, and records them in long format
+(`repo,section,key,value`):
+
+| Section | Content |
+|---|---|
+| `meta` | platform, host, started/finished timestamps |
+| `counts_before` / `counts_after` | PRs/MRs, issues, labels, milestones, releases, branches, tags, commits, comments, collaborators, size |
+| `ref_before` / `ref_after` | branches, tags, PR/MR head refs with sha (`git ls-remote`; the token travels in the environment, not argv) |
+| `captured` | what this tool recorded: commits, merged PRs, contributors, default branch, size |
+| `file` | every file written under `api/<repo>/` and `git/<repo>/`, with size |
+| `error` | anything that could not be collected |
+
+Unknown stays blank (e.g. collaborators need admin); collection never fails the extract. Bitbucket gets refs only, local
+clones get `captured` only. Skip it with `--no-for-check`. Per-repo facts live in `api/<repo>/for_check.json`, so
+`--resume` keeps them.
 
 ## Local development (without Docker)
 
@@ -222,6 +242,7 @@ python extract_org_raw_data.py --ui
 | `extract_org_raw_data.py` | CLI extractor |
 | `extract_ui.py` | Browser UI |
 | `count_merged_prs.py` | GitHub/GitLab API helpers |
+| `for_check.py` | for-check.csv: platform-side counts/refs + summary.xlsx writer |
 | `github_app_auth.py` | GitHub App authentication |
 | `docker-compose.yml` | One-command startup |
 | `Dockerfile` | Self-contained runtime image |

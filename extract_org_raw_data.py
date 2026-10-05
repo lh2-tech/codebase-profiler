@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from code_metrics import PR_FIELDS, STRUCTURE_FIELDS, pr_tier_metrics, structure_metrics
+import for_check
 from count_merged_prs import (
     GITHUB_RATE_LIMIT_WAIT_SECONDS,
     github_api,
@@ -2376,6 +2377,37 @@ def empty_summary_row(org: str, repo: str) -> dict[str, Any]:
     return row
 
 
+def _for_check_snapshot(
+    target: RepoTarget,
+    tokens: dict[str, str],
+    github_token_name: str,
+    gitlab_token_name: str,
+    bitbucket_token_name: str,
+    github_token_fn: Callable[[], str] | None,
+    github_host: str,
+    gitlab_host: str,
+) -> dict[str, Any]:
+    """Platform-side counts/refs for for-check.csv. Never raises: failures become error rows."""
+    if target.platform == "local":
+        return for_check.unavailable("local clone: no platform source, platform facts unknown")
+    try:
+        if target.platform == "github":
+            token = github_token_fn() if github_token_fn else tokens[github_token_name]
+            host = github_host
+        elif target.platform == "gitlab":
+            token = tokens[gitlab_token_name]
+            host = gitlab_host
+        else:
+            token = tokens[bitbucket_token_name]
+            host = "bitbucket.org"
+        return for_check.snapshot(
+            target.platform, target.full_name, token=token, host=host,
+            project_id=target.meta.get("id") if target.platform == "gitlab" else None,
+        )
+    except Exception as exc:
+        return for_check.unavailable(f"snapshot: {type(exc).__name__}: {exc}"[:300])
+
+
 def process_repo(
     target: RepoTarget,
     *,
@@ -2393,6 +2425,7 @@ def process_repo(
     log: logging.Logger,
     clone_timeout: int = DEFAULT_CLONE_TIMEOUT_SECONDS,
     clone_retries: int = DEFAULT_CLONE_RETRIES,
+    for_check_enabled: bool = True,
 ) -> dict[str, Any]:
     org = target.org
     repo = target.full_name.split("/")[-1]
@@ -2410,6 +2443,16 @@ def process_repo(
     # PR-tier percentages exist only when the platform API supplied PR detail;
     # git-history and local runs leave them blank rather than guessing.
     pr_tiers: tuple[dict[str, Any], list[dict[str, Any]]] | None = None
+
+    fc_started = for_check.now()
+    fc_before = (
+        _for_check_snapshot(
+            target, tokens, github_token_name, gitlab_token_name, bitbucket_token_name,
+            github_token_fn, github_host, gitlab_host,
+        )
+        if for_check_enabled
+        else None
+    )
 
     try:
         if target.platform == "github":
@@ -2640,6 +2683,31 @@ def process_repo(
                     target.full_name,
                     exc,
                 )
+
+    if fc_before is not None:
+        fc_after = _for_check_snapshot(
+            target, tokens, github_token_name, gitlab_token_name, bitbucket_token_name,
+            github_token_fn, github_host, gitlab_host,
+        )
+        for_check.save_repo(
+            api_dir,
+            platform=target.platform,
+            host={"github": github_host, "gitlab": gitlab_host, "bitbucket": "bitbucket.org"}.get(
+                target.platform, ""
+            ),
+            started_at=fc_started,
+            before=fc_before,
+            after=fc_after,
+            captured={
+                "repo": target.full_name,
+                "commits": row.get("total_commits", ""),
+                "merged_prs": row.get("merged_prs", ""),
+                "contributors": row.get("contributor_count", ""),
+                "default_branch": row.get("default_branch", ""),
+                "size_kb": row.get("size_kb", ""),
+                "extract_error": row.get("error", ""),
+            },
+        )
 
     return row
 
@@ -3087,6 +3155,11 @@ def main() -> int:
         help="Offline mode only: include matching local repo folder names (repeatable)",
     )
     parser.add_argument(
+        "--no-for-check",
+        action="store_true",
+        help="Skip for-check.csv (platform-side counts/refs recorded before and after each repo)",
+    )
+    parser.add_argument(
         "--offline",
         action="store_true",
         help="Analyze --local-repos-dir only; make no network/API requests",
@@ -3399,6 +3472,7 @@ def main() -> int:
                     log=log,
                     clone_timeout=args.clone_timeout,
                     clone_retries=args.clone_retries,
+                    for_check_enabled=not args.no_for_check,
                 ): t
                 for t in targets
             }
@@ -3426,6 +3500,9 @@ def main() -> int:
     checkpoint.replace_rows(rows)
 
     summary_path = checkpoint.summary_path
+    if not args.no_for_check:
+        for_check.write_run_csv(run_dir)
+    for_check.write_workbook(summary_path)
     failures = [
         {
             "org": row.get("org"),
