@@ -138,6 +138,24 @@ python clone_all_repos.py --bitbucket-workspace my-workspace   # clones into <re
 
 **Merged PRs.** When the platform API reports no merged PRs/MRs for a repository, the count falls back to git history: numbered markers (GitHub merges, Bitbucket "Merged in … (pull request #N)", GitLab "See merge request !N", `(#N)` squash commits) plus every other merge commit. Only the checked-out (default) branch is scanned, so merges made on other branches are not counted.
 
+### PR-shape and code-structure columns
+
+Aggregate-only columns added to `summary.csv` (implemented in `code_metrics.py`):
+
+| Column | Meaning |
+|--------|---------|
+| `pr_rich_pct` | Merged PRs with a linked issue **and** a substantive human review comment (inline review comment, or a review/note body of 20+ words) |
+| `pr_simple_pct` | 1-2 files changed, no human discussion (and not rich) |
+| `pr_standard_pct` | 3-10 files changed (and not rich) |
+| `pr_other_pct` | Everything else, so the four sum to 100 |
+| `pr_tiers_classified` | PRs that had enough API data to classify |
+| `function_count`, `class_count` | Named functions/methods and classes/interfaces/structs/enums/traits, via tree-sitter, production code only |
+| `docstring_coverage_pct` | Functions with a docstring (Python) or adjacent doc comment (other languages) |
+| `comment_docstring_ratio` | SCC comment lines / (comment + code); SCC counts docstrings as comments |
+| `untested_files`, `untested_files_pct` | Heuristic: production files with no same-named test file and no by-name reference from any test file. Not coverage |
+
+PR tiers need the platform API: GitHub and GitLab only (GitLab adds one `closes_issues` call per MR). Bitbucket, git-history-only and local runs leave them blank. Tiers are applied Rich > Simple > Standard. Per-PR tiers are written to `api/<repo>/pr_tiers.json`.
+
 ### Resume / retry (CLI)
 
 Progress is written after every repository to `summary.csv` and `job.json` inside the run folder.
