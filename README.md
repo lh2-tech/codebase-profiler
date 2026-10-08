@@ -151,8 +151,8 @@ Aggregate-only columns added to `summary.csv` (implemented in `code_metrics.py`)
 | `pr_tiers_classified` | PRs that had enough API data to classify |
 | `function_count`, `class_count` | Named functions/methods and classes/interfaces/structs/enums/traits, via tree-sitter, production code only |
 | `docstring_coverage_pct` | Functions with a docstring (Python) or adjacent doc comment (other languages) |
-| `comment_docstring_ratio` | SCC comment lines / (comment + code); SCC counts docstrings as comments |
-| `untested_files`, `untested_files_pct` | Heuristic: production files with no same-named test file and no by-name reference from any test file. Not coverage |
+| `comment_docstring_ratio` | SCC comment lines / (comment + code) over the same production source files as `function_count` (tests, vendored/generated code, Markdown/JSON/YAML excluded); SCC counts docstrings as comments |
+| `untested_files`, `untested_files_pct` | Heuristic: production files that no test imports (imports are parsed and resolved for Python, JS/TS, Java/Kotlin/Scala) and that have no same-named test in a mirrored directory (generic stems like `models`/`utils`/`index` need the directories to line up). Not coverage; other languages use name matching only |
 
 PR tiers need the platform API: GitHub and GitLab only (GitLab adds one `closes_issues` call per MR). Bitbucket, git-history-only and local runs leave them blank. Tiers are applied Rich > Simple > Standard. Per-PR tiers are written to `api/<repo>/pr_tiers.json`.
 
