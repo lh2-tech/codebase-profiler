@@ -28,7 +28,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY extract_org_raw_data.py extract_ui.py count_merged_prs.py github_app_auth.py clone_all_repos.py LH2-DataLabs.svg ./
+COPY extract_org_raw_data.py code_metrics.py extract_ui.py count_merged_prs.py github_app_auth.py clone_all_repos.py LH2-DataLabs.svg ./
 COPY tokens.example .
 
 RUN mkdir -p /app/outputs/raw-extracts /data/repos

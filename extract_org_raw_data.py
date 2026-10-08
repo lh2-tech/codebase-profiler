@@ -51,6 +51,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from code_metrics import PR_FIELDS, STRUCTURE_FIELDS, pr_tier_metrics, structure_metrics
 from count_merged_prs import (
     GITHUB_RATE_LIMIT_WAIT_SECONDS,
     github_api,
@@ -213,6 +214,8 @@ SUMMARY_FIELDS = [
     "has_library_code",
     "open_source_loc_pct",
     "library_modules_loc_pct",
+    *PR_FIELDS,
+    *STRUCTURE_FIELDS,
     "company_period",
     "codebase_description",
     "industry_domain",
@@ -991,6 +994,20 @@ def fetch_gitlab_merged_mrs(
             )
         except Exception:
             detail["notes"] = []
+        # Linked issues feed the "rich" PR tier. Keep only identifiers: issue
+        # titles and bodies are not needed and do not belong in the archive.
+        try:
+            closes = paginate_gitlab(
+                api,
+                f"/projects/{project_id}/merge_requests/{iid}/closes_issues",
+                token,
+                {"per_page": "100"},
+            )
+            detail["closes_issues"] = [
+                {"iid": i.get("iid"), "web_url": i.get("web_url")} for i in closes
+            ]
+        except Exception:
+            detail["closes_issues"] = []
         # Deliberately NOT fetching /merge_requests/:iid/changes. Each entry in
         # that response carries a `diff` field holding the actual source, which
         # landed in merged_prs.json and shipped inside the deliverable zip --
@@ -2320,6 +2337,9 @@ def process_repo(
     if target.platform != "local":
         write_json(api_dir / "repo.json", meta)
     clone_path = target.local_path or clones_dir / slug
+    # PR-tier percentages exist only when the platform API supplied PR detail;
+    # git-history and local runs leave them blank rather than guessing.
+    pr_tiers: tuple[dict[str, Any], list[dict[str, Any]]] | None = None
 
     try:
         if target.platform == "github":
@@ -2340,6 +2360,7 @@ def process_repo(
             prs = fetch_github_merged_prs(token, target.full_name, github_host)
             write_json(api_dir / "merged_prs.json", prs)
             row["merged_prs"] = len(prs)
+            pr_tiers = pr_tier_metrics("github", prs)
 
             clone_url = github_clone_url(target.full_name, token, github_host)
         elif target.platform == "gitlab":
@@ -2363,6 +2384,7 @@ def process_repo(
             mrs = fetch_gitlab_merged_mrs(token, project_id, gitlab_host)
             write_json(api_dir / "merged_prs.json", mrs)
             row["merged_prs"] = len(mrs)
+            pr_tiers = pr_tier_metrics("gitlab", mrs)
 
             clone_url = gitlab_clone_url(target.full_name, token, gitlab_host)
         elif target.platform == "bitbucket":
@@ -2378,6 +2400,7 @@ def process_repo(
             prs = fetch_bitbucket_merged_prs(token, target.full_name, email)
             write_json(api_dir / "merged_prs.json", prs)
             row["merged_prs"] = len(prs)
+            pr_tiers = pr_tier_metrics("bitbucket", prs)
 
             clone_url = bitbucket_clone_url(target.full_name, token)
         else:
@@ -2465,6 +2488,17 @@ def process_repo(
         row["open_source_loc_pct"] = path_pcts["open_source_loc_pct"]
         row["library_modules_loc_pct"] = path_pcts["library_modules_loc_pct"]
         write_json(git_dir / "loc_path_pcts.json", path_pcts)
+        row.update(
+            structure_metrics(
+                clone_path,
+                is_test=_path_is_test,
+                skip_dirs=SKIP_WALK_DIRS,
+                scc_raw=scc.get("raw"),
+            )
+        )
+        if pr_tiers is not None:
+            row.update(pr_tiers[0])
+            write_json(api_dir / "pr_tiers.json", pr_tiers[1])
         if llm_config is not None:
             try:
                 row.update(run_llm_analysis(clone_path, row, llm_config))
@@ -3442,6 +3476,12 @@ def main() -> int:
                 "Share of code LOC under library/framework/module path segments "
                 "(node_modules, lib, modules, frameworks, …)."
             ),
+            "function_count": "Named functions/methods found by tree-sitter in production source files.",
+            "class_count": "Classes, interfaces, structs, enums and traits found by tree-sitter in production source files.",
+            "docstring_coverage_pct": "Share of functions with a docstring (Python) or an adjacent doc comment (other languages).",
+            "comment_docstring_ratio": "SCC comment lines / (comment + code lines); SCC counts docstrings as comments.",
+            "untested_files": "Production source files with no same-named test file and not referenced by name in any test file (static heuristic, not coverage).",
+            "untested_files_pct": "untested_files as a share of production source files.",
             "company_period": (
                 "Earliest first_commit year through latest last_commit year "
                 "across all repos in the same org/group."
