@@ -2493,7 +2493,6 @@ def process_repo(
                 clone_path,
                 is_test=_path_is_test,
                 skip_dirs=SKIP_WALK_DIRS,
-                scc_raw=scc.get("raw"),
             )
         )
         if pr_tiers is not None:
@@ -3479,8 +3478,8 @@ def main() -> int:
             "function_count": "Named functions/methods found by tree-sitter in production source files.",
             "class_count": "Classes, interfaces, structs, enums and traits found by tree-sitter in production source files.",
             "docstring_coverage_pct": "Share of functions with a docstring (Python) or an adjacent doc comment (other languages).",
-            "comment_docstring_ratio": "SCC comment lines / (comment + code lines); SCC counts docstrings as comments.",
-            "untested_files": "Production source files with no same-named test file and not referenced by name in any test file (static heuristic, not coverage).",
+            "comment_docstring_ratio": "SCC comment lines / (comment + code lines) over production source files only (same file set as function_count); SCC counts docstrings as comments.",
+            "untested_files": "Production source files not imported by any test (import resolution for Python, JS/TS, Java/Kotlin/Scala) and without a same-named test in a mirrored directory (static heuristic, not coverage).",
             "untested_files_pct": "untested_files as a share of production source files.",
             "company_period": (
                 "Earliest first_commit year through latest last_commit year "

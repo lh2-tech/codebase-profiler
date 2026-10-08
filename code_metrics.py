@@ -23,8 +23,12 @@ for a property of the repository.
 """
 from __future__ import annotations
 
+import json
 import os
+import posixpath
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -219,6 +223,11 @@ _SKIP_FILE = re.compile(
     r"|(^|/)(package-lock|yarn\.lock)$)"
 )
 _TEST_STEM_AFFIX = re.compile(r"^(test_|Test(?=[A-Z]))|(_tests?|_spec|Tests?|Specs?)$")
+_TEST_DIRS = {"test", "tests", "__tests__", "spec", "specs", "unit", "integration", "e2e",
+              "functional", "testing"}
+# Directory names that carry no package meaning, dropped before comparing a test's
+# directory with the file it might cover (src/test/java/x vs src/main/java/x).
+_LAYOUT_DIRS = _TEST_DIRS | {"src", "main", "java", "kotlin", "scala", "python", "lib", "app"}
 _GENERIC_STEMS = {
     "index", "main", "utils", "util", "init", "__init__", "app", "mod", "lib", "types",
     "common", "config", "base", "helpers", "helper", "constants", "models", "model",
@@ -301,18 +310,175 @@ def _test_stem(name: str) -> str:
     return _norm(_TEST_STEM_AFFIX.sub("", stem, count=2))
 
 
-def comment_docstring_ratio(scc_raw: Any) -> float | str:
-    """Comment lines / (comment + code lines) from scc output.
+def _mirrors(test_dir: tuple[str, ...], prod_dir: tuple[str, ...]) -> bool:
+    """True when a test's directory lines up with the directory of the file it names.
 
-    scc counts Python docstrings and block-comment documentation as comment
-    lines, so this is the combined comment + docstring ratio.
+    Colocated tests (foo.test.ts beside foo.ts, foo_test.go beside foo.go) and mirrored
+    trees (tests/billing/test_models.py for billing/models.py, src/test/java/x for
+    src/main/java/x) both pass. A flat tests/ directory only mirrors the repo root.
     """
-    if not isinstance(scc_raw, list):
+    if test_dir == prod_dir:
+        return True
+    t = tuple(d for d in test_dir if d.lower() not in _LAYOUT_DIRS)
+    q = tuple(d for d in prod_dir if d.lower() not in _LAYOUT_DIRS)
+    if not t:
+        return not q
+    return q[-len(t):] == t
+
+
+# --------------------------------------------------------------------------
+# Import resolution: map each test file's imports to the production files it uses
+# --------------------------------------------------------------------------
+
+_JS_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
+_JS_SPEC = re.compile(
+    r"""(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*|\bjest\.(?:mock|requireActual)\s*\(\s*"""
+    r"""|\bvi\.mock\s*\(\s*|\bimport\s+)['"]([^'"\n]+)['"]"""
+)
+_JVM_IMPORT = re.compile(r"^\s*import\s+(static\s+)?([\w.]+?)(\.\*)?\s*;?\s*$", re.M)
+
+
+class _ProdIndex:
+    """Suffix index over production files: ('pkg','mod') -> files whose path ends that way."""
+
+    def __init__(self, prod: list[tuple[str, Path]]) -> None:
+        self.by_suffix: dict[tuple[str, ...], list[str]] = {}
+        self.by_rel: dict[str, str] = {}
+        for rel, _ in prod:
+            segs = tuple(rel.split("/"))
+            stem = segs[-1].rsplit(".", 1)[0]
+            parts = segs[:-1] + ((stem,) if stem != "__init__" else ())
+            ext = os.path.splitext(rel)[1].lower()
+            no_ext = rel.rsplit(".", 1)[0]
+            self.by_rel[no_ext] = rel
+            if ext in _JS_EXTS and stem == "index":
+                self.by_rel.setdefault("/".join(segs[:-1]), rel)
+            for i in range(len(parts)):
+                self.by_suffix.setdefault(parts[i:], []).append(rel)
+
+    def lookup(self, segs: tuple[str, ...], near: tuple[str, ...]) -> list[str]:
+        found = self.by_suffix.get(segs, [])
+        if len(found) <= 1:
+            return list(found)
+
+        def shared(rel: str) -> int:
+            n = 0
+            for a, b in zip(rel.split("/")[:-1], near):
+                if a != b:
+                    break
+                n += 1
+            return n
+
+        best = max(shared(r) for r in found)
+        return [r for r in found if shared(r) == best]
+
+
+def _python_imports(text: str, test_dir: tuple[str, ...]) -> list[tuple[tuple[str, ...], bool]]:
+    """(segments, exact). exact segments are repo-relative; others are matched by suffix."""
+    import ast
+
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return []
+    out: list[tuple[tuple[str, ...], bool]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                out.append((tuple(alias.name.split(".")), False))
+        elif isinstance(node, ast.ImportFrom):
+            mod = tuple((node.module or "").split(".")) if node.module else ()
+            if node.level:
+                base = test_dir[: max(len(test_dir) - (node.level - 1), 0)]
+                out.append((base + mod, True))
+                out.extend((base + mod + (a.name,), True) for a in node.names)
+            else:
+                out.append((mod, False))
+                out.extend((mod + (a.name,), False) for a in node.names)
+    return [(segs, exact) for segs, exact in out if segs]
+
+
+def _js_imports(text: str, test_dir: tuple[str, ...]) -> list[tuple[tuple[str, ...], bool]]:
+    out: list[tuple[tuple[str, ...], bool]] = []
+    for spec in _JS_SPEC.findall(text):
+        if spec.startswith("."):
+            joined = posixpath.normpath(posixpath.join("/".join(test_dir), spec))
+            if not joined.startswith(".."):
+                out.append((tuple(joined.split("/")), True))
+            continue
+        for alias in ("@/", "~/", "#/"):
+            if spec.startswith(alias):
+                spec = spec[len(alias):]
+                break
+        segs = tuple(x for x in spec.split("/") if x)
+        if len(segs) >= 2:  # a bare name is almost always an npm package
+            out.append((segs, False))
+    return out
+
+
+def _jvm_imports(text: str) -> list[tuple[tuple[str, ...], bool]]:
+    out = []
+    for static, name, wildcard in _JVM_IMPORT.findall(text):
+        if wildcard:
+            continue
+        segs = tuple(name.split("."))
+        out.append((segs[:-1] if static else segs, False))
+    return out
+
+
+def _resolve_imports(
+    index: _ProdIndex, test_rel: str, text: str, lang: str
+) -> set[str]:
+    test_dir = tuple(test_rel.split("/")[:-1])
+    if lang == "python":
+        imports = _python_imports(text, test_dir)
+    elif lang in _JS_LIKE:
+        imports = _js_imports(text, test_dir)
+    elif lang in {"java", "kotlin", "scala"}:
+        imports = _jvm_imports(text)
+    else:
+        return set()
+    hit: set[str] = set()
+    for segs, exact in imports:
+        if exact:
+            rel = "/".join(segs)
+            if rel in index.by_rel:
+                hit.add(index.by_rel[rel])
+            if lang == "python" and (init := rel + "/__init__") in index.by_rel:
+                hit.add(index.by_rel[init])
+        else:
+            hit.update(index.lookup(segs, test_dir))
+    return hit
+
+
+def production_comment_ratio(
+    repo: Path, prod: list[tuple[str, Path]], skip_dirs: Iterable[str], timeout: int = 600
+) -> float | str:
+    """Comment lines / (comment + code lines) over the production source files only.
+
+    scc counts docstrings as comment lines, so this is the combined comment + docstring
+    ratio. It is computed per file and restricted to the same file set and languages as
+    the other structure metrics, so Markdown, JSON, YAML, tests and vendored code cannot
+    dilute it.
+    """
+    if not shutil.which("scc") or not prod:
+        return ""
+    wanted = {str((repo / rel).resolve()) for rel, _ in prod}
+    try:
+        proc = subprocess.run(
+            ["scc", "--by-file", "--format", "json",
+             "--exclude-dir", ",".join(sorted({".git", *skip_dirs})), str(repo.resolve())],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        data = json.loads(proc.stdout or "[]")
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
         return ""
     comment = code = 0
-    for row in scc_raw:
-        comment += int(row.get("Comment") or row.get("comment") or 0)
-        code += int(row.get("Code") or row.get("code") or 0)
+    for lang_row in data if isinstance(data, list) else []:
+        for f in lang_row.get("Files") or []:
+            if str(Path(f.get("Location", "")).resolve()) in wanted:
+                comment += int(f.get("Comment") or 0)
+                code += int(f.get("Code") or 0)
     if comment + code == 0:
         return ""
     return round(comment / (comment + code), 4)
@@ -323,29 +489,29 @@ def structure_metrics(
     *,
     is_test: Callable[[str], bool],
     skip_dirs: Iterable[str],
-    scc_raw: Any = None,
 ) -> dict[str, Any]:
-    """Function/class counts, docstring coverage and the untested-file heuristic.
+    """Function/class counts, docstring coverage, comment ratio and untested files.
 
-    Untested files: a production source file with no test file of the same
-    normalised stem (test_foo.py, foo_test.go, foo.spec.ts, FooTests.cs ...), and
-    whose stem does not appear as a word in any test file. Generic stems such as
-    ``index`` or ``utils`` only count via the first rule. Static name matching,
-    not execution coverage.
+    Untested files: a production source file is tested when either
+      1. a test file imports it (imports are parsed and resolved to files for Python,
+         JS/TS and Java/Kotlin/Scala), or
+      2. a test file has the same normalised stem (test_foo.py, foo_test.go, foo.spec.ts,
+         FooTests.cs) AND the directories line up. Generic stems (models, utils, index ...)
+         need the directories to line up; a flat tests/test_models.py covers only a
+         root-level models.py.
+    Static analysis, not execution coverage. Languages without an import resolver rely on
+    rule 2 alone.
     """
     out: dict[str, Any] = {k: "" for k in STRUCTURE_FIELDS}
-    out["comment_docstring_ratio"] = comment_docstring_ratio(scc_raw)
     skip = set(skip_dirs)
 
     prod: list[tuple[str, Path]] = []
-    test_stems: set[str] = set()
-    test_paths: list[Path] = []
+    tests: list[tuple[str, Path]] = []
     seen = 0
     for root, dirs, files in os.walk(repo):
         dirs[:] = [d for d in dirs if d not in skip]
         for name in files:
-            ext = os.path.splitext(name)[1].lower()
-            if ext not in EXT_LANG:
+            if os.path.splitext(name)[1].lower() not in EXT_LANG:
                 continue
             path = Path(root) / name
             rel = path.relative_to(repo).as_posix()
@@ -354,41 +520,37 @@ def structure_metrics(
             seen += 1
             if seen > MAX_FILES:
                 break
-            if is_test(rel):
-                test_stems.add(_test_stem(name))
-                test_paths.append(path)
-            else:
-                prod.append((rel, path))
+            (tests if is_test(rel) else prod).append((rel, path))
         if seen > MAX_FILES:
             break
 
-    # Untested-file heuristic needs no parser.
-    if prod:
-        test_words: set[str] = set()
-        for path in test_paths:
+    out["comment_docstring_ratio"] = production_comment_ratio(repo, prod, skip)
+
+    considered = [(rel, path) for rel, path in prod if path.stem != "__init__"]
+    if considered:
+        tested: set[str] = set()
+        index = _ProdIndex(prod)
+        by_stem: dict[str, list[tuple[str, ...]]] = {}
+        for rel, path in tests:
+            parts = rel.split("/")
+            by_stem.setdefault(_test_stem(parts[-1]), []).append(tuple(parts[:-1]))
+            lang = EXT_LANG[path.suffix.lower()]
             try:
                 if path.stat().st_size > MAX_BYTES:
                     continue
-                test_words.update(
-                    w.lower() for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", path.read_text(errors="ignore"))
-                )
+                tested |= _resolve_imports(index, rel, path.read_text(errors="ignore"), lang)
             except OSError:
                 continue
         untested = 0
-        considered = 0
-        for rel, path in prod:
-            stem = _norm(path.stem)
-            if path.stem == "__init__":
+        for rel, path in considered:
+            if rel in tested:
                 continue
-            considered += 1
-            if stem in test_stems:
-                continue
-            if stem not in _GENERIC_STEMS and len(stem) >= 4 and stem in test_words:
+            prod_dir = tuple(rel.split("/")[:-1])
+            if any(_mirrors(t, prod_dir) for t in by_stem.get(_norm(path.stem), [])):
                 continue
             untested += 1
-        if considered:
-            out["untested_files"] = untested
-            out["untested_files_pct"] = round(100 * untested / considered, 1)
+        out["untested_files"] = untested
+        out["untested_files_pct"] = round(100 * untested / len(considered), 1)
 
     get_parser = _load_parsers()
     if get_parser is None:
