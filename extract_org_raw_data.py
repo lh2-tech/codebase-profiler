@@ -102,6 +102,14 @@ def _env_int(name: str, default: int) -> int:
 COMMIT_DETAIL_LIMIT = _env_int("EXTRACT_COMMIT_DETAIL_LIMIT", 0)
 GIT_LOG_TIMEOUT_SECONDS = _env_int("EXTRACT_GIT_LOG_TIMEOUT", 900)
 SCC_TIMEOUT_SECONDS = _env_int("EXTRACT_SCC_TIMEOUT", 600)
+# Cloned repos are measured on the branch with the most recent commit, not the
+# platform default (which is often a stale README-only stub while the work
+# lives on develop/staging). EXTRACT_USE_DEFAULT_BRANCH=1 restores the old behaviour.
+USE_DEFAULT_BRANCH = os.environ.get("EXTRACT_USE_DEFAULT_BRANCH", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 RETRYABLE_ERROR_CLASSES = frozenset({"timeout", "rate_limit", "network"})
 
 BOT_NAME_PATTERNS = [
@@ -198,6 +206,7 @@ SUMMARY_FIELDS = [
     "primary_language",
     "size_kb",
     "default_branch",
+    "measured_branch",
     "total_commits",
     "first_commit",
     "span_days",
@@ -1243,6 +1252,67 @@ def gitlab_clone_url(full_name: str, token: str, host: str) -> str:
 
 def bitbucket_clone_url(full_name: str, token: str) -> str:
     return f"https://x-token-auth:{token}@bitbucket.org/{full_name}.git"
+
+
+def select_latest_branch(
+    repo: Path, default_branch: str = "", log: logging.Logger | None = None
+) -> str:
+    """Check out the remote branch with the newest commit; return its name.
+
+    The clone checks out only the platform default, which can be a stale stub
+    while the real history sits on other branches. LOC, language, commit and
+    author stats are all read from HEAD, so moving HEAD fixes them together.
+    Ties go to the default branch. Returns "" if nothing could be selected, in
+    which case HEAD is left untouched.
+    """
+    prefix = "refs/remotes/origin/"
+    try:
+        out = run_git(
+            repo,
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname)\t%(committerdate:unix)",
+            prefix,
+        )
+    except Exception as exc:  # noqa: BLE001 - never fail a repo over branch choice
+        if log is not None:
+            log.warning("branch selection skipped (for-each-ref failed): %s", exc)
+        return ""
+    candidates: list[tuple[int, str]] = []
+    for line in out.splitlines():
+        ref, _, ts = line.partition("\t")
+        name = ref[len(prefix):] if ref.startswith(prefix) else ""
+        if not name or name == "HEAD" or not ts.strip().isdigit():
+            continue
+        candidates.append((int(ts), name))
+    if not candidates:
+        return ""
+    newest = max(ts for ts, _ in candidates)
+    tied = [name for ts, name in candidates if ts == newest]
+    chosen = default_branch if default_branch in tied else tied[0]
+    try:
+        current = run_git(repo, "symbolic-ref", "--short", "HEAD").strip()
+    except Exception:  # noqa: BLE001 - detached HEAD
+        current = ""
+    if chosen != current:
+        try:
+            proc = subprocess.run(
+                ["git", "-c", "safe.directory=*", "-C", str(repo), "checkout", "-q",
+                 "-B", chosen, f"origin/{chosen}"],
+                capture_output=True,
+                text=True,
+                timeout=GIT_LOG_TIMEOUT_SECONDS,
+                env={**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"},
+            )
+            if proc.returncode != 0:
+                raise RuntimeError((proc.stderr or proc.stdout or "checkout failed")[-300:])
+        except Exception as exc:  # noqa: BLE001
+            if log is not None:
+                log.warning("could not check out %s, staying on %s: %s", chosen, current, exc)
+            return current
+        if log is not None:
+            log.info("measuring branch %s (default %s)", chosen, default_branch or current)
+    return chosen
 
 
 def aggregate_git_stats(repo: Path) -> dict[str, Any]:
@@ -2425,6 +2495,16 @@ def process_repo(
                 retries=clone_retries,
                 log=log,
             )
+
+        if target.platform != "local":
+            row["measured_branch"] = (
+                row["default_branch"]
+                if USE_DEFAULT_BRANCH
+                else select_latest_branch(clone_path, row["default_branch"], log)
+                or row["default_branch"]
+            )
+        else:
+            row["measured_branch"] = row["default_branch"]
 
         git_stats = aggregate_git_stats(clone_path)
         write_json(git_dir / "git_stats.json", git_stats)

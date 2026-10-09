@@ -136,6 +136,8 @@ python extract_org_raw_data.py --bitbucket-repo my-workspace/repo-one --tokens-f
 python clone_all_repos.py --bitbucket-workspace my-workspace   # clones into <repos-root>/bitbucket/<workspace>/
 ```
 
+**Measured branch.** For cloned repos (GitHub, GitLab, Bitbucket) every git/LOC/language metric is read from the remote branch with the newest commit, not the platform default, and the choice is recorded in the `measured_branch` column (`default_branch` stays as the API reports it). Ties go to the default branch. Set `EXTRACT_USE_DEFAULT_BRANCH=1` to restore the old default-branch behaviour. Local-path targets are measured as checked out.
+
 **Merged PRs.** When the platform API reports no merged PRs/MRs for a repository, the count falls back to git history: numbered markers (GitHub merges, Bitbucket "Merged in … (pull request #N)", GitLab "See merge request !N", `(#N)` squash commits) plus every other merge commit. Only the checked-out (default) branch is scanned, so merges made on other branches are not counted.
 
 ### PR-shape and code-structure columns
