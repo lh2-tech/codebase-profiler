@@ -1114,6 +1114,28 @@ def fetch_bitbucket_merged_prs(
 # ── git / scc ───────────────────────────────────────────────────────────────
 
 
+# A client repo (local archive or fresh clone) is untrusted input: a shipped
+# .git/hooks/post-checkout or core.fsmonitor in its config would run code on our host.
+GIT_HARDEN_ARGS = (
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.fsmonitor=",
+    "-c", "core.pager=cat",
+    "-c", "core.askPass=",
+    "-c", "safe.directory=*",
+)
+
+
+def git_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    return {
+        **os.environ,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_PAGER": "cat",
+        "GIT_ASKPASS": "",
+        **(extra or {}),
+    }
+
+
 def run_git(
     repo: Path,
     *args: str,
@@ -1126,17 +1148,11 @@ def run_git(
     Docker when UID/GID ownership does not match the container user.
     """
     proc = subprocess.run(
-        [
-            "git",
-            "-c",
-            "safe.directory=*",
-            "-C",
-            str(repo),
-            *args,
-        ],
+        ["git", *GIT_HARDEN_ARGS, "-C", str(repo), *args],
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=git_env(),
     )
     if proc.returncode != 0:
         if log is not None:
@@ -1149,19 +1165,11 @@ def run_git(
 def probe_local_git(repo: Path, log: logging.Logger) -> bool:
     """Return True when git history is readable; log a clear warning otherwise."""
     proc = subprocess.run(
-        [
-            "git",
-            "-c",
-            "safe.directory=*",
-            "-C",
-            str(repo),
-            "rev-list",
-            "--count",
-            "HEAD",
-        ],
+        ["git", *GIT_HARDEN_ARGS, "-C", str(repo), "rev-list", "--count", "HEAD"],
         capture_output=True,
         text=True,
         timeout=60,
+        env=git_env(),
     )
     if proc.returncode == 0 and proc.stdout.strip().isdigit():
         return True
@@ -1191,10 +1199,10 @@ def clone_repo(
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+        env = git_env({"GIT_LFS_SKIP_SMUDGE": "1"})
         try:
             proc = subprocess.run(
-                ["git", "clone", "--recurse-submodules=0", url, str(dest)],
+                ["git", *GIT_HARDEN_ARGS, "clone", "--recurse-submodules=0", url, str(dest)],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -1298,12 +1306,12 @@ def select_latest_branch(
     if chosen != current:
         try:
             proc = subprocess.run(
-                ["git", "-c", "safe.directory=*", "-C", str(repo), "checkout", "-q",
+                ["git", *GIT_HARDEN_ARGS, "-C", str(repo), "checkout", "-q",
                  "-B", chosen, f"origin/{chosen}"],
                 capture_output=True,
                 text=True,
                 timeout=GIT_LOG_TIMEOUT_SECONDS,
-                env={**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"},
+                env=git_env({"GIT_LFS_SKIP_SMUDGE": "1"}),
             )
             if proc.returncode != 0:
                 raise RuntimeError((proc.stderr or proc.stdout or "checkout failed")[-300:])
