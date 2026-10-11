@@ -95,8 +95,26 @@ def redact(text: str, *secrets: str) -> str:
 
 
 def _err(exc: BaseException) -> str:
+    """One-line failure description for the deliverable. Response bodies and server messages are dropped: they can
+    carry names, ids or credentials that the metadata-only output must not contain."""
     text = str(exc).splitlines()[0] if str(exc) else ""
+    http = re.match(r"HTTP (\d{3}) for ", text)
+    if http:
+        return f"{type(exc).__name__}: HTTP {http.group(1)}"
+    if text.startswith("Network error for "):
+        return f"{type(exc).__name__}: network error"
     return f"{type(exc).__name__}: {text}"[:300]
+
+
+def _git_failure(stderr: str, code: int) -> str:
+    """Category of an `ls-remote` failure instead of git's own words, which echo server-side messages."""
+    low = stderr.lower()
+    for needle, label in (("authentication", "auth"), ("could not read username", "auth"), ("403", "auth"),
+                          ("401", "auth"), ("not found", "not found"), ("404", "not found"),
+                          ("could not resolve", "dns"), ("timed out", "timeout")):
+        if needle in low:
+            return label
+    return f"exit {code}"
 
 
 def row(repo: str, section: str, key: Any, value: Any = "") -> dict[str, str]:
@@ -239,20 +257,18 @@ def mask_refs(refs: dict[str, str], mode: str) -> dict[str, str]:
     return masked
 
 
-def ls_remote_refs(url: str, user: str, token: str, run: Callable = subprocess.run) -> dict[str, str]:
+def ls_remote_refs(url: str, user: str, token: str, run: Callable | None = None) -> dict[str, str]:
     """Branches, tags and PR/MR head refs on the source. The token travels in the environment, never on argv."""
     auth = base64.b64encode(f"{user}:{token}".encode()).decode()
     env = {
         **os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
         "GIT_CONFIG_KEY_0": "http.extraHeader", "GIT_CONFIG_VALUE_0": f"Authorization: Basic {auth}",
     }
+    run = run or subprocess.run  # looked up at call time so tests can swap it
     res = run(["git", "ls-remote", "--refs", url], capture_output=True, text=True, env=env,
               timeout=LS_REMOTE_TIMEOUT_SECONDS)
     if res.returncode != 0:
-        msg = (res.stderr or "").strip().splitlines()
-        raise RuntimeError(
-            "git ls-remote failed: " + (redact(msg[0], token, auth) if msg else f"exit {res.returncode}")
-        )
+        raise RuntimeError("git ls-remote failed: " + _git_failure(res.stderr or "", res.returncode))
     refs: dict[str, str] = {}
     for line in res.stdout.splitlines():
         sha, _, ref = line.partition("\t")
