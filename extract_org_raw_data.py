@@ -2394,10 +2394,14 @@ def _for_check_snapshot(
     github_token_fn: Callable[[], str] | None,
     github_host: str,
     gitlab_host: str,
+    *,
+    bitbucket_email_name: str = DEFAULT_BITBUCKET_EMAIL_NAME,
+    light: bool = False,
+    ref_mode: str = for_check.DEFAULT_REF_MODE,
 ) -> dict[str, Any]:
     """Platform-side counts/refs for for-check.csv. Never raises: failures become error rows."""
     if target.platform == "local":
-        return for_check.unavailable("local clone: no platform source, platform facts unknown")
+        return for_check.skipped("local clone: no platform source, platform facts not collected")
     try:
         if target.platform == "github":
             token = github_token_fn() if github_token_fn else tokens[github_token_name]
@@ -2411,6 +2415,8 @@ def _for_check_snapshot(
         return for_check.snapshot(
             target.platform, target.full_name, token=token, host=host,
             project_id=target.meta.get("id") if target.platform == "gitlab" else None,
+            email=tokens.get(bitbucket_email_name, "") if target.platform == "bitbucket" else "",
+            light=light, ref_mode=ref_mode,
         )
     except Exception as exc:
         return for_check.unavailable(f"snapshot: {type(exc).__name__}: {exc}"[:300])
@@ -2434,6 +2440,7 @@ def process_repo(
     clone_timeout: int = DEFAULT_CLONE_TIMEOUT_SECONDS,
     clone_retries: int = DEFAULT_CLONE_RETRIES,
     for_check_enabled: bool = True,
+    for_check_ref_mode: str = for_check.DEFAULT_REF_MODE,
 ) -> dict[str, Any]:
     org = target.org
     repo = target.full_name.split("/")[-1]
@@ -2451,12 +2458,17 @@ def process_repo(
     # PR-tier percentages exist only when the platform API supplied PR detail;
     # git-history and local runs leave them blank rather than guessing.
     pr_tiers: tuple[dict[str, Any], list[dict[str, Any]]] | None = None
+    # for-check needs to know which merged_prs count the checker is looking at: the platform API, or the
+    # merge/squash markers recovered from git history (which undercount squash-and-rebase workflows).
+    merged_source = "git" if target.platform == "local" else "api"
+    commits_default_branch: Any = ""
 
     fc_started = for_check.now()
     fc_before = (
         _for_check_snapshot(
             target, tokens, github_token_name, gitlab_token_name, bitbucket_token_name,
-            github_token_fn, github_host, gitlab_host,
+            github_token_fn, github_host, gitlab_host, light=True, ref_mode=for_check_ref_mode,
+            bitbucket_email_name=bitbucket_email_name,
         )
         if for_check_enabled
         else None
@@ -2560,6 +2572,15 @@ def process_repo(
         git_stats = aggregate_git_stats(clone_path)
         write_json(git_dir / "git_stats.json", git_stats)
         row["total_commits"] = git_stats["total_commits"]
+        if target.platform == "local":
+            commits_default_branch = git_stats["total_commits"]
+        elif row["default_branch"]:
+            # counts_*.commits is the platform's default-branch history, while total_commits is the measured
+            # branch: this is the same-basis number for the checker to compare against.
+            counted = run_git(
+                clone_path, "rev-list", "--count", f"refs/remotes/origin/{row['default_branch']}"
+            ).strip()
+            commits_default_branch = int(counted) if counted.isdigit() else ""
         row["first_commit"] = git_stats["first_commit"] or ""
         row["last_commit_date"] = git_stats["last_commit"] or ""
         row["span_days"] = (
@@ -2607,6 +2628,7 @@ def process_repo(
             detected_prs = detect_merged_prs_from_git(clone_path)
             write_json(git_dir / "merged_prs_detected_from_git.json", detected_prs)
             row["merged_prs"] = len(detected_prs)
+            merged_source = "git"
 
         row["project_name"] = org
         row["total_files"] = count_total_files(clone_path)
@@ -2695,7 +2717,8 @@ def process_repo(
     if fc_before is not None:
         fc_after = _for_check_snapshot(
             target, tokens, github_token_name, gitlab_token_name, bitbucket_token_name,
-            github_token_fn, github_host, gitlab_host,
+            github_token_fn, github_host, gitlab_host, ref_mode=for_check_ref_mode,
+            bitbucket_email_name=bitbucket_email_name,
         )
         for_check.save_repo(
             api_dir,
@@ -2709,12 +2732,16 @@ def process_repo(
             captured={
                 "repo": target.full_name,
                 "commits": row.get("total_commits", ""),
+                "measured_branch": row.get("measured_branch", ""),
+                "commits_default_branch": commits_default_branch,
                 "merged_prs": row.get("merged_prs", ""),
+                "merged_prs_source": merged_source,
                 "contributors": row.get("contributor_count", ""),
                 "default_branch": row.get("default_branch", ""),
                 "size_kb": row.get("size_kb", ""),
                 "extract_error": row.get("error", ""),
             },
+            log=log,
         )
 
     return row
@@ -3168,6 +3195,13 @@ def main() -> int:
         help="Skip for-check.csv (platform-side counts/refs recorded before and after each repo)",
     )
     parser.add_argument(
+        "--for-check-refs",
+        choices=for_check.REF_MODES,
+        default=for_check.DEFAULT_REF_MODE,
+        help="Branch/tag names in for-check.csv: 'hash' (default; sha and ref type kept, name replaced by a "
+        "digest), 'names' (verbatim; may expose client names or ticket ids) or 'none' (no ref rows)",
+    )
+    parser.add_argument(
         "--offline",
         action="store_true",
         help="Analyze --local-repos-dir only; make no network/API requests",
@@ -3481,6 +3515,7 @@ def main() -> int:
                     clone_timeout=args.clone_timeout,
                     clone_retries=args.clone_retries,
                     for_check_enabled=not args.no_for_check,
+                    for_check_ref_mode=args.for_check_refs,
                 ): t
                 for t in targets
             }
@@ -3508,9 +3543,14 @@ def main() -> int:
     checkpoint.replace_rows(rows)
 
     summary_path = checkpoint.summary_path
-    if not args.no_for_check:
-        for_check.write_run_csv(run_dir)
-    for_check.write_workbook(summary_path)
+    if not args.no_for_check and for_check.write_run_csv(run_dir) is None:
+        log.warning("for-check.csv could not be written")
+    try:
+        for_check.write_workbook(summary_path, include_for_check=not args.no_for_check)
+    except Exception:
+        # The workbook is a convenience copy of summary.csv; it must not stop failures.json and the zip.
+        log.exception("summary.xlsx could not be written; summary.csv%s is unaffected",
+                      "" if args.no_for_check else " and for-check.csv are")
     failures = [
         {
             "org": row.get("org"),
