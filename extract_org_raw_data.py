@@ -63,6 +63,7 @@ from count_merged_prs import (
     http_post_json,
     paginate_github,
     paginate_gitlab,
+    validate_host,
 )
 from github_app_auth import (
     DEFAULT_GITHUB_APP_ID,
@@ -3273,6 +3274,12 @@ def main() -> int:
 
         serve(host=args.ui_host, port=args.ui_port)
         return 0
+
+    try:
+        args.github_host = validate_host(args.github_host, name="--github-host")
+        args.gitlab_host = validate_host(args.gitlab_host, name="--gitlab-host", allow_scheme=True)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 
     if args.retry_failed and not args.resume:
         raise SystemExit("--retry-failed requires --resume")
