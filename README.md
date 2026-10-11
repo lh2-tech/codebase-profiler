@@ -203,14 +203,45 @@ that git history cannot give back, just before and just after each repo is proce
 |---|---|
 | `meta` | platform, host, started/finished timestamps |
 | `counts_before` / `counts_after` | PRs/MRs, issues, labels, milestones, releases, branches, tags, commits, comments, collaborators, size |
-| `ref_before` / `ref_after` | branches, tags, PR/MR head refs with sha (`git ls-remote`; the token travels in the environment, not argv) |
-| `captured` | what this tool recorded: commits, merged PRs, contributors, default branch, size |
+| `ref_before` / `ref_after` | branches, tags, PR/MR head refs with sha (`git ls-remote`; the token travels in the environment, not argv). `ref_after` lists only refs that changed since `ref_before` (`deleted` = gone) |
+| `captured` | what this tool recorded: commits, `measured_branch`, `commits_default_branch`, merged PRs and `merged_prs_source`, contributors, default branch, size |
 | `file` | every file written under `api/<repo>/` and `git/<repo>/`, with size |
-| `error` | anything that could not be collected |
+| `error` | anything that could not be collected (status or category only, never response bodies) |
 
-Unknown stays blank (e.g. collaborators need admin); collection never fails the extract. Bitbucket gets refs only, local
-clones get `captured` only. Skip it with `--no-for-check`. Per-repo facts live in `api/<repo>/for_check.json`, so
-`--resume` keeps them.
+Unknown stays blank (e.g. collaborators need admin, or GitLab hides a count above 10,000 items); collection never fails
+the extract. Bitbucket gets refs only; local/offline clones get `captured` only (the skip is noted in `meta`). Skip the
+whole thing with `--no-for-check`. Per-repo facts live in `api/<repo>/for_check.json`, so `--resume` keeps them; repos
+that are not part of the current run are left out of the CSV.
+
+Reading the numbers (what is and is not comparable):
+
+- **Commits.** `counts_*.commits` is the platform's default-branch history. `captured.commits` is the *measured* branch
+  (the most recently committed one), so compare `counts_*.commits` with `captured.commits_default_branch`; the two
+  `captured` commit numbers only match when `measured_branch` equals `default_branch`.
+- **Merged PRs.** `counts_*.prs` is every PR/MR; `counts_*.merged_prs` is merged only and is the one to compare with
+  `captured.merged_prs`. When `merged_prs_source` is `git`, the figure came from merge/squash markers in history
+  (platform API returned zero, or local run) and will undercount squash/rebase workflows.
+- **People.** `collaborators` (platform members, needs admin) and `contributors` (authors recorded by the tool) are
+  different populations: do not expect them to be equal.
+- **Before snapshot.** To halve the API budget, `counts_before` is a light snapshot (`counts_before_scope=light`):
+  comment counts, collaborators and (GitLab) labels/milestones/releases are only taken in `counts_after`.
+
+Privacy: branch and tag names can carry client names, ticket ids or secrets, so by default they are replaced by a
+digest (`refs/heads/h-<12 hex>`; sha and ref type are kept, PR/MR head refs are only numbers). `--for-check-refs names`
+writes them verbatim, `--for-check-refs none` writes no ref rows. The digest is unsalted: it hides names from a reader
+but a short guessable name (`main`, `develop`) can be recomputed. `summary.xlsx` holds at most 1,000,000 for-check rows
+(the CSV keeps everything); cells starting with `= + - @` are stored as text.
+
+Every git command run against a client repo disables repo-supplied hooks and `core.fsmonitor`, so a hook shipped in an
+archive cannot execute. `--github-host` / `--gitlab-host` must be a bare host (`host[:port]`; GitLab also accepts
+`http(s)://`), `http://` logs a cleartext warning, and credentials are dropped if an API redirect leaves the host.
+
+### Compatibility with Squirrel
+
+Squirrel (`stages.py`) reads `summary.csv` by header name (`loc`, `commits`, `merged_prs`) and passes `--no-for-check`.
+Neither changed: `summary.csv` columns are untouched and `--no-for-check` skips both `for-check.csv` and the xlsx sheet.
+`--no-for-check` and `--for-check-refs` exist only in profilers that include for-check; an older profiler rejects the
+flag (argparse "unrecognized arguments"), so pin Squirrel to a profiler version that has it.
 
 ## Local development (without Docker)
 
