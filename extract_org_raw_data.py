@@ -3561,6 +3561,7 @@ def main() -> int:
             "comment_docstring_ratio": "SCC comment lines / (comment + code lines) over production source files only (same file set as function_count); SCC counts docstrings as comments.",
             "untested_files": "Production source files not imported by any test (import resolution for Python, JS/TS, Java/Kotlin/Scala) and without a same-named test in a mirrored directory (static heuristic, not coverage).",
             "untested_files_pct": "untested_files as a share of production source files.",
+            "structure_parse_gaps": "Languages whose tree-sitter grammar failed to load (language:files). Counts are blanked when 5% or more of parseable files were skipped.",
             "company_period": (
                 "Earliest first_commit year through latest last_commit year "
                 "across all repos in the same org/group."
