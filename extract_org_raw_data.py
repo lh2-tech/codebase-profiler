@@ -198,6 +198,7 @@ SUMMARY_FIELDS = [
     "org",
     "project_name",
     "repo",
+    "full_name",
     "merged_prs",
     "languages_breakdown",
     "repo_created_at",
@@ -620,8 +621,15 @@ def is_retryable_error_class(error_class: str) -> bool:
     return error_class in RETRYABLE_ERROR_CLASSES
 
 
-def repo_row_key(org: str, repo: str) -> str:
-    return f"{org}/{repo}".strip("/")
+def repo_row_key(org: str, repo: str, full_name: str = "") -> str:
+    """Identity of a summary row.
+
+    org + repo name is not unique: GitLab subgroups can hold two projects with the same
+    name (group/airflow and group/backend-core/airflow), and keying on that pair merged
+    them into one row. The full project path is unique, so it wins when present. Older
+    summary.csv files have no full_name column and fall back to the old key.
+    """
+    return (full_name or f"{org}/{repo}").strip("/")
 
 
 @dataclass
@@ -670,7 +678,7 @@ class JobCheckpoint:
                     repo = str(row.get("repo") or "")
                     if not org or not repo:
                         continue
-                    key = repo_row_key(org, repo)
+                    key = repo_row_key(org, repo, str(row.get("full_name") or ""))
                     job.rows_by_key[key] = dict(row)
                     if key not in job.status_by_key:
                         error = str(row.get("error") or "").strip()
@@ -723,7 +731,7 @@ class JobCheckpoint:
     def rows(self) -> list[dict[str, Any]]:
         with self._lock:
             values = list(self.rows_by_key.values())
-        values.sort(key=lambda r: (str(r.get("org")), str(r.get("repo"))))
+        values.sort(key=lambda r: (str(r.get("org")), str(r.get("repo")), str(r.get("full_name"))))
         return values
 
     def persist(self) -> None:
@@ -738,7 +746,11 @@ class JobCheckpoint:
         with self._lock:
             self.rows_by_key = {}
             for row in rows:
-                key = repo_row_key(str(row.get("org") or ""), str(row.get("repo") or ""))
+                key = repo_row_key(
+                    str(row.get("org") or ""),
+                    str(row.get("repo") or ""),
+                    str(row.get("full_name") or ""),
+                )
                 if key:
                     self.rows_by_key[key] = dict(row)
             self.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -2353,13 +2365,14 @@ def filter_local_targets(
 # ── per-repo orchestration ──────────────────────────────────────────────────
 
 
-def empty_summary_row(org: str, repo: str) -> dict[str, Any]:
+def empty_summary_row(org: str, repo: str, full_name: str = "") -> dict[str, Any]:
     row: dict[str, Any] = {k: "" for k in SUMMARY_FIELDS}
     row.update(
         {
             "org": org,
             "project_name": org,
             "repo": repo,
+            "full_name": full_name,
             "merged_prs": 0,
             "loc": 0,
             "total_files": 0,
@@ -2402,7 +2415,7 @@ def process_repo(
     api_dir.mkdir(parents=True, exist_ok=True)
     git_dir.mkdir(parents=True, exist_ok=True)
 
-    row = empty_summary_row(org, repo)
+    row = empty_summary_row(org, repo, target.full_name)
     meta = target.meta
     if target.platform != "local":
         write_json(api_dir / "repo.json", meta)
@@ -3408,7 +3421,7 @@ def main() -> int:
                     row = fut.result()
                 except Exception as exc:
                     log.exception("Worker crashed while collecting a repository result")
-                    row = empty_summary_row(target.org, target.full_name.split("/")[-1])
+                    row = empty_summary_row(target.org, target.full_name.split("/")[-1], target.full_name)
                     row["error"] = f"worker crash: {exc}"[:500]
                     row["error_class"] = classify_error(exc)
                 checkpoint.record(target.full_name, row)
