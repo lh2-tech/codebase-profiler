@@ -4,6 +4,7 @@ throwaway clones); a user's own working copy is never moved otherwise."""
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -64,6 +65,46 @@ class LocalLatestBranchTests(unittest.TestCase):
             _git(repo, "commit", "-qm", "x", date="2022-01-01T00:00:00")
             _git(repo, "branch", "other")
             self.assertEqual(ex.select_latest_branch(repo, "main", None, local=True), "main")
+
+    def _map(self, root: Path, data) -> None:
+        import json
+        (root / "map.json").write_text(data if isinstance(data, str) else json.dumps(data))
+        os.environ["EXTRACT_LOCAL_BRANCH_MAP"] = str(root / "map.json")
+        self.addCleanup(os.environ.pop, "EXTRACT_LOCAL_BRANCH_MAP", None)
+
+    def test_the_client_branch_is_found_by_directory_name_case_insensitive(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._map(root, {"MyRepo": "dev"})
+            self.assertEqual(ex.client_branch_for(root / "myrepo"), "dev")
+            self.assertEqual(ex.client_branch_for(root / "other"), "")
+
+    def test_a_missing_bad_or_unset_map_names_no_branch(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self.assertEqual(ex.client_branch_for(root / "r"), "")
+            for bad in ("not json", "[1]", '{"r": 5}'):
+                self._map(root, bad)
+                self.assertEqual(ex.client_branch_for(root / "r"), "", bad)
+            os.environ["EXTRACT_LOCAL_BRANCH_MAP"] = str(root / "missing.json")
+            self.assertEqual(ex.client_branch_for(root / "r"), "")
+
+    def test_checkout_client_branch_uses_own_branch_then_origin(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            origin = _origin_with_newer_branch(root)          # main (old), newer
+            self.assertEqual(ex.checkout_client_branch(origin, "main"), "main")
+            self.assertEqual(_head(origin), "main")
+            clone = root / "clone"
+            subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True, capture_output=True)
+            self.assertEqual(ex.checkout_client_branch(clone, "newer"), "newer")   # only refs/remotes/origin/newer
+            self.assertEqual(_head(clone), "newer")
+
+    def test_checkout_client_branch_with_unknown_branch_leaves_head(self):
+        with tempfile.TemporaryDirectory() as d:
+            origin = _origin_with_newer_branch(Path(d))
+            self.assertEqual(ex.checkout_client_branch(origin, "nope"), "")
+            self.assertEqual(_head(origin), "main")
 
     def test_the_setting_is_off_by_default(self):
         self.assertFalse(ex.LOCAL_LATEST_BRANCH)

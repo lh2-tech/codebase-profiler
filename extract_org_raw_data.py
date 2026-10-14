@@ -1271,6 +1271,50 @@ def bitbucket_clone_url(full_name: str, token: str) -> str:
     return f"https://x-token-auth:{token}@bitbucket.org/{full_name}.git"
 
 
+def client_branch_for(repo: Path) -> str:
+    """The branch the client's summary names for this local repo: EXTRACT_LOCAL_BRANCH_MAP is a JSON file {repo dir name: branch}
+    (names case-insensitive). Unreadable or malformed files are ignored."""
+    path = os.environ.get("EXTRACT_LOCAL_BRANCH_MAP", "").strip()
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    want = {str(k).lower(): v for k, v in data.items() if isinstance(v, str)}.get(repo.name.lower(), "")
+    return want.strip()
+
+
+def checkout_client_branch(repo: Path, branch: str, log: logging.Logger | None = None) -> str:
+    """Check out the client's branch if this repo has it (own branch, else origin's); return its name, "" if it cannot."""
+    for ref, args in (
+        (f"refs/heads/{branch}", [branch]),
+        (f"refs/remotes/origin/{branch}", ["-B", branch, f"origin/{branch}"]),
+    ):
+        try:
+            run_git(repo, "show-ref", "--verify", "--quiet", ref)
+        except Exception:  # noqa: BLE001 - that ref does not exist here
+            continue
+        proc = subprocess.run(
+            ["git", *GIT_HARDEN_ARGS, "-C", str(repo), "checkout", "-q", *args],
+            capture_output=True,
+            text=True,
+            timeout=GIT_LOG_TIMEOUT_SECONDS,
+            env=git_env({"GIT_LFS_SKIP_SMUDGE": "1"}),
+        )
+        if proc.returncode == 0:
+            if log is not None:
+                log.info("measuring the client's branch %s", branch)
+            return branch
+        if log is not None:
+            log.warning("could not check out the client's branch %s: %s", branch, (proc.stderr or "")[-200:])
+        return ""
+    return ""
+
+
 def select_latest_branch(
     repo: Path, default_branch: str = "", log: logging.Logger | None = None, local: bool = False
 ) -> str:
@@ -2587,7 +2631,9 @@ def process_repo(
                 or row["default_branch"]
             )
         else:
-            row["measured_branch"] = (
+            wanted = client_branch_for(clone_path)
+            client_pick = checkout_client_branch(clone_path, wanted, log) if wanted else ""
+            row["measured_branch"] = client_pick or (
                 select_latest_branch(clone_path, row["default_branch"], log, local=True) or row["default_branch"]
                 if LOCAL_LATEST_BRANCH and not USE_DEFAULT_BRANCH
                 else row["default_branch"]
