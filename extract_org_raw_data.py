@@ -112,6 +112,13 @@ USE_DEFAULT_BRANCH = os.environ.get("EXTRACT_USE_DEFAULT_BRANCH", "").strip().lo
     "true",
     "yes",
 }
+# --local-repos-dir runs measure whatever is checked out. Moving HEAD of someone's own working copy would be intrusive, so the
+# same newest-branch rule applies to local repos only when asked (Squirrel measures its own throwaway clones and sets this).
+LOCAL_LATEST_BRANCH = os.environ.get("EXTRACT_LOCAL_LATEST_BRANCH", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 RETRYABLE_ERROR_CLASSES = frozenset({"timeout", "rate_limit", "network"})
 
 BOT_NAME_PATTERNS = [
@@ -1265,7 +1272,7 @@ def bitbucket_clone_url(full_name: str, token: str) -> str:
 
 
 def select_latest_branch(
-    repo: Path, default_branch: str = "", log: logging.Logger | None = None
+    repo: Path, default_branch: str = "", log: logging.Logger | None = None, local: bool = False
 ) -> str:
     """Check out the remote branch with the newest commit; return its name.
 
@@ -1274,6 +1281,9 @@ def select_latest_branch(
     author stats are all read from HEAD, so moving HEAD fixes them together.
     Ties go to the default branch. Returns "" if nothing could be selected, in
     which case HEAD is left untouched.
+
+    `local`: a --local-repos-dir repo. A clone of an export has refs/remotes/origin/* and is handled as above; a repo with no
+    remote-tracking refs falls back to its own branches (refs/heads/*).
     """
     prefix = "refs/remotes/origin/"
     try:
@@ -1284,6 +1294,15 @@ def select_latest_branch(
             "--format=%(refname)\t%(committerdate:unix)",
             prefix,
         )
+        if local and not out.strip():
+            prefix = "refs/heads/"
+            out = run_git(
+                repo,
+                "for-each-ref",
+                "--sort=-committerdate",
+                "--format=%(refname)\t%(committerdate:unix)",
+                prefix,
+            )
     except Exception as exc:  # noqa: BLE001 - never fail a repo over branch choice
         if log is not None:
             log.warning("branch selection skipped (for-each-ref failed): %s", exc)
@@ -1308,7 +1327,7 @@ def select_latest_branch(
         try:
             proc = subprocess.run(
                 ["git", *GIT_HARDEN_ARGS, "-C", str(repo), "checkout", "-q",
-                 "-B", chosen, f"origin/{chosen}"],
+                 *(["-B", chosen, f"origin/{chosen}"] if prefix.startswith("refs/remotes/") else [chosen])],
                 capture_output=True,
                 text=True,
                 timeout=GIT_LOG_TIMEOUT_SECONDS,
@@ -2568,13 +2587,28 @@ def process_repo(
                 or row["default_branch"]
             )
         else:
-            row["measured_branch"] = row["default_branch"]
+            row["measured_branch"] = (
+                select_latest_branch(clone_path, row["default_branch"], log, local=True) or row["default_branch"]
+                if LOCAL_LATEST_BRANCH and not USE_DEFAULT_BRANCH
+                else row["default_branch"]
+            )
 
         git_stats = aggregate_git_stats(clone_path)
         write_json(git_dir / "git_stats.json", git_stats)
         row["total_commits"] = git_stats["total_commits"]
         if target.platform == "local":
             commits_default_branch = git_stats["total_commits"]
+            if row["measured_branch"] != row["default_branch"]:
+                # the default branch's own history, so the checker can still compare like with like
+                commits_default_branch = ""
+                for ref in (f"refs/heads/{row['default_branch']}", f"refs/remotes/origin/{row['default_branch']}"):
+                    try:
+                        counted = run_git(clone_path, "rev-list", "--count", ref).strip()
+                    except Exception:  # noqa: BLE001 - that ref does not exist in this clone
+                        continue
+                    if counted.isdigit():
+                        commits_default_branch = int(counted)
+                        break
         elif row["default_branch"]:
             # counts_*.commits is the platform's default-branch history, while total_commits is the measured
             # branch: this is the same-basis number for the checker to compare against.
