@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from code_metrics import PR_FIELDS, STRUCTURE_FIELDS, pr_tier_metrics, structure_metrics
+import for_check
 from count_merged_prs import (
     GITHUB_RATE_LIMIT_WAIT_SECONDS,
     github_api,
@@ -62,6 +63,7 @@ from count_merged_prs import (
     http_post_json,
     paginate_github,
     paginate_gitlab,
+    validate_host,
 )
 from github_app_auth import (
     DEFAULT_GITHUB_APP_ID,
@@ -106,6 +108,13 @@ SCC_TIMEOUT_SECONDS = _env_int("EXTRACT_SCC_TIMEOUT", 600)
 # platform default (which is often a stale README-only stub while the work
 # lives on develop/staging). EXTRACT_USE_DEFAULT_BRANCH=1 restores the old behaviour.
 USE_DEFAULT_BRANCH = os.environ.get("EXTRACT_USE_DEFAULT_BRANCH", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+# --local-repos-dir runs measure whatever is checked out. Moving HEAD of someone's own working copy would be intrusive, so the
+# same newest-branch rule applies to local repos only when asked (Squirrel measures its own throwaway clones and sets this).
+LOCAL_LATEST_BRANCH = os.environ.get("EXTRACT_LOCAL_LATEST_BRANCH", "").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -1113,6 +1122,28 @@ def fetch_bitbucket_merged_prs(
 # ── git / scc ───────────────────────────────────────────────────────────────
 
 
+# A client repo (local archive or fresh clone) is untrusted input: a shipped
+# .git/hooks/post-checkout or core.fsmonitor in its config would run code on our host.
+GIT_HARDEN_ARGS = (
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.fsmonitor=",
+    "-c", "core.pager=cat",
+    "-c", "core.askPass=",
+    "-c", "safe.directory=*",
+)
+
+
+def git_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    return {
+        **os.environ,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_PAGER": "cat",
+        "GIT_ASKPASS": "",
+        **(extra or {}),
+    }
+
+
 def run_git(
     repo: Path,
     *args: str,
@@ -1125,17 +1156,11 @@ def run_git(
     Docker when UID/GID ownership does not match the container user.
     """
     proc = subprocess.run(
-        [
-            "git",
-            "-c",
-            "safe.directory=*",
-            "-C",
-            str(repo),
-            *args,
-        ],
+        ["git", *GIT_HARDEN_ARGS, "-C", str(repo), *args],
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=git_env(),
     )
     if proc.returncode != 0:
         if log is not None:
@@ -1148,19 +1173,11 @@ def run_git(
 def probe_local_git(repo: Path, log: logging.Logger) -> bool:
     """Return True when git history is readable; log a clear warning otherwise."""
     proc = subprocess.run(
-        [
-            "git",
-            "-c",
-            "safe.directory=*",
-            "-C",
-            str(repo),
-            "rev-list",
-            "--count",
-            "HEAD",
-        ],
+        ["git", *GIT_HARDEN_ARGS, "-C", str(repo), "rev-list", "--count", "HEAD"],
         capture_output=True,
         text=True,
         timeout=60,
+        env=git_env(),
     )
     if proc.returncode == 0 and proc.stdout.strip().isdigit():
         return True
@@ -1190,10 +1207,10 @@ def clone_repo(
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+        env = git_env({"GIT_LFS_SKIP_SMUDGE": "1"})
         try:
             proc = subprocess.run(
-                ["git", "clone", "--recurse-submodules=0", url, str(dest)],
+                ["git", *GIT_HARDEN_ARGS, "clone", "--recurse-submodules=0", url, str(dest)],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -1254,8 +1271,52 @@ def bitbucket_clone_url(full_name: str, token: str) -> str:
     return f"https://x-token-auth:{token}@bitbucket.org/{full_name}.git"
 
 
+def client_branch_for(repo: Path) -> str:
+    """The branch the client's summary names for this local repo: EXTRACT_LOCAL_BRANCH_MAP is a JSON file {repo dir name: branch}
+    (names case-insensitive). Unreadable or malformed files are ignored."""
+    path = os.environ.get("EXTRACT_LOCAL_BRANCH_MAP", "").strip()
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    want = {str(k).lower(): v for k, v in data.items() if isinstance(v, str)}.get(repo.name.lower(), "")
+    return want.strip()
+
+
+def checkout_client_branch(repo: Path, branch: str, log: logging.Logger | None = None) -> str:
+    """Check out the client's branch if this repo has it (own branch, else origin's); return its name, "" if it cannot."""
+    for ref, args in (
+        (f"refs/heads/{branch}", [branch]),
+        (f"refs/remotes/origin/{branch}", ["-B", branch, f"origin/{branch}"]),
+    ):
+        try:
+            run_git(repo, "show-ref", "--verify", "--quiet", ref)
+        except Exception:  # noqa: BLE001 - that ref does not exist here
+            continue
+        proc = subprocess.run(
+            ["git", *GIT_HARDEN_ARGS, "-C", str(repo), "checkout", "-q", *args],
+            capture_output=True,
+            text=True,
+            timeout=GIT_LOG_TIMEOUT_SECONDS,
+            env=git_env({"GIT_LFS_SKIP_SMUDGE": "1"}),
+        )
+        if proc.returncode == 0:
+            if log is not None:
+                log.info("measuring the client's branch %s", branch)
+            return branch
+        if log is not None:
+            log.warning("could not check out the client's branch %s: %s", branch, (proc.stderr or "")[-200:])
+        return ""
+    return ""
+
+
 def select_latest_branch(
-    repo: Path, default_branch: str = "", log: logging.Logger | None = None
+    repo: Path, default_branch: str = "", log: logging.Logger | None = None, local: bool = False
 ) -> str:
     """Check out the remote branch with the newest commit; return its name.
 
@@ -1264,6 +1325,9 @@ def select_latest_branch(
     author stats are all read from HEAD, so moving HEAD fixes them together.
     Ties go to the default branch. Returns "" if nothing could be selected, in
     which case HEAD is left untouched.
+
+    `local`: a --local-repos-dir repo. A clone of an export has refs/remotes/origin/* and is handled as above; a repo with no
+    remote-tracking refs falls back to its own branches (refs/heads/*).
     """
     prefix = "refs/remotes/origin/"
     try:
@@ -1274,6 +1338,15 @@ def select_latest_branch(
             "--format=%(refname)\t%(committerdate:unix)",
             prefix,
         )
+        if local and not out.strip():
+            prefix = "refs/heads/"
+            out = run_git(
+                repo,
+                "for-each-ref",
+                "--sort=-committerdate",
+                "--format=%(refname)\t%(committerdate:unix)",
+                prefix,
+            )
     except Exception as exc:  # noqa: BLE001 - never fail a repo over branch choice
         if log is not None:
             log.warning("branch selection skipped (for-each-ref failed): %s", exc)
@@ -1297,12 +1370,12 @@ def select_latest_branch(
     if chosen != current:
         try:
             proc = subprocess.run(
-                ["git", "-c", "safe.directory=*", "-C", str(repo), "checkout", "-q",
-                 "-B", chosen, f"origin/{chosen}"],
+                ["git", *GIT_HARDEN_ARGS, "-C", str(repo), "checkout", "-q",
+                 *(["-B", chosen, f"origin/{chosen}"] if prefix.startswith("refs/remotes/") else [chosen])],
                 capture_output=True,
                 text=True,
                 timeout=GIT_LOG_TIMEOUT_SECONDS,
-                env={**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"},
+                env=git_env({"GIT_LFS_SKIP_SMUDGE": "1"}),
             )
             if proc.returncode != 0:
                 raise RuntimeError((proc.stderr or proc.stdout or "checkout failed")[-300:])
@@ -2376,6 +2449,43 @@ def empty_summary_row(org: str, repo: str) -> dict[str, Any]:
     return row
 
 
+def _for_check_snapshot(
+    target: RepoTarget,
+    tokens: dict[str, str],
+    github_token_name: str,
+    gitlab_token_name: str,
+    bitbucket_token_name: str,
+    github_token_fn: Callable[[], str] | None,
+    github_host: str,
+    gitlab_host: str,
+    *,
+    bitbucket_email_name: str = DEFAULT_BITBUCKET_EMAIL_NAME,
+    light: bool = False,
+    ref_mode: str = for_check.DEFAULT_REF_MODE,
+) -> dict[str, Any]:
+    """Platform-side counts/refs for for-check.csv. Never raises: failures become error rows."""
+    if target.platform == "local":
+        return for_check.skipped("local clone: no platform source, platform facts not collected")
+    try:
+        if target.platform == "github":
+            token = github_token_fn() if github_token_fn else tokens[github_token_name]
+            host = github_host
+        elif target.platform == "gitlab":
+            token = tokens[gitlab_token_name]
+            host = gitlab_host
+        else:
+            token = tokens[bitbucket_token_name]
+            host = "bitbucket.org"
+        return for_check.snapshot(
+            target.platform, target.full_name, token=token, host=host,
+            project_id=target.meta.get("id") if target.platform == "gitlab" else None,
+            email=tokens.get(bitbucket_email_name, "") if target.platform == "bitbucket" else "",
+            light=light, ref_mode=ref_mode,
+        )
+    except Exception as exc:
+        return for_check.unavailable(f"snapshot: {type(exc).__name__}: {exc}"[:300])
+
+
 def process_repo(
     target: RepoTarget,
     *,
@@ -2393,6 +2503,8 @@ def process_repo(
     log: logging.Logger,
     clone_timeout: int = DEFAULT_CLONE_TIMEOUT_SECONDS,
     clone_retries: int = DEFAULT_CLONE_RETRIES,
+    for_check_enabled: bool = True,
+    for_check_ref_mode: str = for_check.DEFAULT_REF_MODE,
 ) -> dict[str, Any]:
     org = target.org
     repo = target.full_name.split("/")[-1]
@@ -2410,6 +2522,21 @@ def process_repo(
     # PR-tier percentages exist only when the platform API supplied PR detail;
     # git-history and local runs leave them blank rather than guessing.
     pr_tiers: tuple[dict[str, Any], list[dict[str, Any]]] | None = None
+    # for-check needs to know which merged_prs count the checker is looking at: the platform API, or the
+    # merge/squash markers recovered from git history (which undercount squash-and-rebase workflows).
+    merged_source = "git" if target.platform == "local" else "api"
+    commits_default_branch: Any = ""
+
+    fc_started = for_check.now()
+    fc_before = (
+        _for_check_snapshot(
+            target, tokens, github_token_name, gitlab_token_name, bitbucket_token_name,
+            github_token_fn, github_host, gitlab_host, light=True, ref_mode=for_check_ref_mode,
+            bitbucket_email_name=bitbucket_email_name,
+        )
+        if for_check_enabled
+        else None
+    )
 
     try:
         if target.platform == "github":
@@ -2504,11 +2631,37 @@ def process_repo(
                 or row["default_branch"]
             )
         else:
-            row["measured_branch"] = row["default_branch"]
+            wanted = client_branch_for(clone_path)
+            client_pick = checkout_client_branch(clone_path, wanted, log) if wanted else ""
+            row["measured_branch"] = client_pick or (
+                select_latest_branch(clone_path, row["default_branch"], log, local=True) or row["default_branch"]
+                if LOCAL_LATEST_BRANCH and not USE_DEFAULT_BRANCH
+                else row["default_branch"]
+            )
 
         git_stats = aggregate_git_stats(clone_path)
         write_json(git_dir / "git_stats.json", git_stats)
         row["total_commits"] = git_stats["total_commits"]
+        if target.platform == "local":
+            commits_default_branch = git_stats["total_commits"]
+            if row["measured_branch"] != row["default_branch"]:
+                # the default branch's own history, so the checker can still compare like with like
+                commits_default_branch = ""
+                for ref in (f"refs/heads/{row['default_branch']}", f"refs/remotes/origin/{row['default_branch']}"):
+                    try:
+                        counted = run_git(clone_path, "rev-list", "--count", ref).strip()
+                    except Exception:  # noqa: BLE001 - that ref does not exist in this clone
+                        continue
+                    if counted.isdigit():
+                        commits_default_branch = int(counted)
+                        break
+        elif row["default_branch"]:
+            # counts_*.commits is the platform's default-branch history, while total_commits is the measured
+            # branch: this is the same-basis number for the checker to compare against.
+            counted = run_git(
+                clone_path, "rev-list", "--count", f"refs/remotes/origin/{row['default_branch']}"
+            ).strip()
+            commits_default_branch = int(counted) if counted.isdigit() else ""
         row["first_commit"] = git_stats["first_commit"] or ""
         row["last_commit_date"] = git_stats["last_commit"] or ""
         row["span_days"] = (
@@ -2556,6 +2709,7 @@ def process_repo(
             detected_prs = detect_merged_prs_from_git(clone_path)
             write_json(git_dir / "merged_prs_detected_from_git.json", detected_prs)
             row["merged_prs"] = len(detected_prs)
+            merged_source = "git"
 
         row["project_name"] = org
         row["total_files"] = count_total_files(clone_path)
@@ -2640,6 +2794,36 @@ def process_repo(
                     target.full_name,
                     exc,
                 )
+
+    if fc_before is not None:
+        fc_after = _for_check_snapshot(
+            target, tokens, github_token_name, gitlab_token_name, bitbucket_token_name,
+            github_token_fn, github_host, gitlab_host, ref_mode=for_check_ref_mode,
+            bitbucket_email_name=bitbucket_email_name,
+        )
+        for_check.save_repo(
+            api_dir,
+            platform=target.platform,
+            host={"github": github_host, "gitlab": gitlab_host, "bitbucket": "bitbucket.org"}.get(
+                target.platform, ""
+            ),
+            started_at=fc_started,
+            before=fc_before,
+            after=fc_after,
+            captured={
+                "repo": target.full_name,
+                "commits": row.get("total_commits", ""),
+                "measured_branch": row.get("measured_branch", ""),
+                "commits_default_branch": commits_default_branch,
+                "merged_prs": row.get("merged_prs", ""),
+                "merged_prs_source": merged_source,
+                "contributors": row.get("contributor_count", ""),
+                "default_branch": row.get("default_branch", ""),
+                "size_kb": row.get("size_kb", ""),
+                "extract_error": row.get("error", ""),
+            },
+            log=log,
+        )
 
     return row
 
@@ -3087,6 +3271,18 @@ def main() -> int:
         help="Offline mode only: include matching local repo folder names (repeatable)",
     )
     parser.add_argument(
+        "--no-for-check",
+        action="store_true",
+        help="Skip for-check.csv (platform-side counts/refs recorded before and after each repo)",
+    )
+    parser.add_argument(
+        "--for-check-refs",
+        choices=for_check.REF_MODES,
+        default=for_check.DEFAULT_REF_MODE,
+        help="Branch/tag names in for-check.csv: 'hash' (default; sha and ref type kept, name replaced by a "
+        "digest), 'names' (verbatim; may expose client names or ticket ids) or 'none' (no ref rows)",
+    )
+    parser.add_argument(
         "--offline",
         action="store_true",
         help="Analyze --local-repos-dir only; make no network/API requests",
@@ -3158,6 +3354,12 @@ def main() -> int:
 
         serve(host=args.ui_host, port=args.ui_port)
         return 0
+
+    try:
+        args.github_host = validate_host(args.github_host, name="--github-host")
+        args.gitlab_host = validate_host(args.gitlab_host, name="--gitlab-host", allow_scheme=True)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 
     if args.retry_failed and not args.resume:
         raise SystemExit("--retry-failed requires --resume")
@@ -3399,6 +3601,8 @@ def main() -> int:
                     log=log,
                     clone_timeout=args.clone_timeout,
                     clone_retries=args.clone_retries,
+                    for_check_enabled=not args.no_for_check,
+                    for_check_ref_mode=args.for_check_refs,
                 ): t
                 for t in targets
             }
@@ -3426,6 +3630,14 @@ def main() -> int:
     checkpoint.replace_rows(rows)
 
     summary_path = checkpoint.summary_path
+    if not args.no_for_check and for_check.write_run_csv(run_dir) is None:
+        log.warning("for-check.csv could not be written")
+    try:
+        for_check.write_workbook(summary_path, include_for_check=not args.no_for_check)
+    except Exception:
+        # The workbook is a convenience copy of summary.csv; it must not stop failures.json and the zip.
+        log.exception("summary.xlsx could not be written; summary.csv%s is unaffected",
+                      "" if args.no_for_check else " and for-check.csv are")
     failures = [
         {
             "org": row.get("org"),

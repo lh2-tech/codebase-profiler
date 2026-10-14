@@ -39,6 +39,7 @@ UI_LOG_LOCK = threading.Lock()
 # half-written (U2).
 ZIP_LOCK = threading.Lock()
 
+import for_check  # noqa: E402
 from extract_org_raw_data import (  # noqa: E402
     discover_local_repositories,
     list_bitbucket_repos_for_workspace,
@@ -526,19 +527,8 @@ def set_state(**updates: Any) -> None:
 
 
 def csv_to_xlsx(csv_path: Path) -> Path | None:
-    try:
-        import openpyxl
-    except ImportError:
-        return None
-    workbook = openpyxl.Workbook()
-    sheet = workbook.active
-    sheet.title = "summary"
-    with csv_path.open(newline="", encoding="utf-8") as handle:
-        for row in reader(handle):
-            sheet.append(row)
-    xlsx_path = csv_path.with_suffix(".xlsx")
-    workbook.save(xlsx_path)
-    return xlsx_path
+    """summary.xlsx with a "summary" sheet and, when for-check.csv sits beside it, a "for-check" sheet."""
+    return for_check.write_workbook(csv_path)
 
 
 def parse_manifest_from_log(log_lines: list[str]) -> dict[str, Any]:

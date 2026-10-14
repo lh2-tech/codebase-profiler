@@ -136,7 +136,7 @@ python extract_org_raw_data.py --bitbucket-repo my-workspace/repo-one --tokens-f
 python clone_all_repos.py --bitbucket-workspace my-workspace   # clones into <repos-root>/bitbucket/<workspace>/
 ```
 
-**Measured branch.** For cloned repos (GitHub, GitLab, Bitbucket) every git/LOC/language metric is read from the remote branch with the newest commit, not the platform default, and the choice is recorded in the `measured_branch` column (`default_branch` stays as the API reports it). Ties go to the default branch. Set `EXTRACT_USE_DEFAULT_BRANCH=1` to restore the old default-branch behaviour. Local-path targets are measured as checked out.
+**Measured branch.** For cloned repos (GitHub, GitLab, Bitbucket) every git/LOC/language metric is read from the remote branch with the newest commit, not the platform default, and the choice is recorded in the `measured_branch` column (`default_branch` stays as the API reports it). Ties go to the default branch. Set `EXTRACT_USE_DEFAULT_BRANCH=1` to restore the old default-branch behaviour. Local-path targets (`--local-repos-dir`) are measured as checked out, unless `EXTRACT_LOCAL_LATEST_BRANCH=1` is set: then the same newest-branch rule applies to them (a clone of an export uses its remote-tracking branches, a repo without a remote its own branches) and the repo's HEAD is moved to that branch, which is why it is opt-in. `commits_default_branch` then counts the default branch's own history. `EXTRACT_LOCAL_BRANCH_MAP=<file>` (JSON `{local repo directory name: branch}`, names case-insensitive) makes a local repo be measured on the branch the client named: it is checked out if it exists (own branch, else `origin/`), wins over the newest-branch rule, and is recorded in `measured_branch`. A missing branch, unreadable or malformed file falls back to the normal rule.
 
 **Merged PRs.** When the platform API reports no merged PRs/MRs for a repository, the count falls back to git history: numbered markers (GitHub merges, Bitbucket "Merged in … (pull request #N)", GitLab "See merge request !N", `(#N)` squash commits) plus every other merge commit. Only the checked-out (default) branch is scanned, so merges made on other branches are not counted.
 
@@ -188,9 +188,60 @@ The UI uses the mounted folder automatically — no path entry needed. Optionall
 
 Results are written to `./outputs/raw-extracts/` on your computer (mounted into the container). Each run produces:
 
-- `summary.csv` (+ `summary.xlsx` when generated)
+- `summary.csv` (+ `summary.xlsx` when `openpyxl` is installed)
+- `for-check.csv`, also the second sheet (`for-check`) of `summary.xlsx` — platform-side facts for the checker (see below)
 - metadata JSON under `api/` and `git/`
 - a timestamped zip beside the run folder
+
+### for-check.csv
+
+An extract cannot say what it *should* contain. For GitHub/GitLab repos the tool therefore asks the platform for facts
+that git history cannot give back, just before and just after each repo is processed, and records them in long format
+(`repo,section,key,value`):
+
+| Section | Content |
+|---|---|
+| `meta` | platform, host, started/finished timestamps |
+| `counts_before` / `counts_after` | PRs/MRs, issues, labels, milestones, releases, branches, tags, commits, comments, collaborators, size |
+| `ref_before` / `ref_after` | branches, tags, PR/MR head refs with sha (`git ls-remote`; the token travels in the environment, not argv). `ref_after` lists only refs that changed since `ref_before` (`deleted` = gone) |
+| `captured` | what this tool recorded: commits, `measured_branch`, `commits_default_branch`, merged PRs and `merged_prs_source`, contributors, default branch, size |
+| `file` | every file written under `api/<repo>/` and `git/<repo>/`, with size |
+| `error` | anything that could not be collected (status or category only, never response bodies) |
+
+Unknown stays blank (e.g. collaborators need admin, or GitLab hides a count above 10,000 items); collection never fails
+the extract. Bitbucket gets refs only; local/offline clones get `captured` only (the skip is noted in `meta`). Skip the
+whole thing with `--no-for-check`. Per-repo facts live in `api/<repo>/for_check.json`, so `--resume` keeps them; repos
+that are not part of the current run are left out of the CSV.
+
+Reading the numbers (what is and is not comparable):
+
+- **Commits.** `counts_*.commits` is the platform's default-branch history. `captured.commits` is the *measured* branch
+  (the most recently committed one), so compare `counts_*.commits` with `captured.commits_default_branch`; the two
+  `captured` commit numbers only match when `measured_branch` equals `default_branch`.
+- **Merged PRs.** `counts_*.prs` is every PR/MR; `counts_*.merged_prs` is merged only and is the one to compare with
+  `captured.merged_prs`. When `merged_prs_source` is `git`, the figure came from merge/squash markers in history
+  (platform API returned zero, or local run) and will undercount squash/rebase workflows.
+- **People.** `collaborators` (platform members, needs admin) and `contributors` (authors recorded by the tool) are
+  different populations: do not expect them to be equal.
+- **Before snapshot.** To halve the API budget, `counts_before` is a light snapshot (`counts_before_scope=light`):
+  comment counts, collaborators and (GitLab) labels/milestones/releases are only taken in `counts_after`.
+
+Privacy: branch and tag names can carry client names, ticket ids or secrets, so by default they are replaced by a
+digest (`refs/heads/h-<12 hex>`; sha and ref type are kept, PR/MR head refs are only numbers). `--for-check-refs names`
+writes them verbatim, `--for-check-refs none` writes no ref rows. The digest is unsalted: it hides names from a reader
+but a short guessable name (`main`, `develop`) can be recomputed. `summary.xlsx` holds at most 1,000,000 for-check rows
+(the CSV keeps everything); cells starting with `= + - @` are stored as text.
+
+Every git command run against a client repo disables repo-supplied hooks and `core.fsmonitor`, so a hook shipped in an
+archive cannot execute. `--github-host` / `--gitlab-host` must be a bare host (`host[:port]`; GitLab also accepts
+`http(s)://`), `http://` logs a cleartext warning, and credentials are dropped if an API redirect leaves the host.
+
+### Compatibility with Squirrel
+
+Squirrel (`stages.py`) reads `summary.csv` by header name (`loc`, `commits`, `merged_prs`) and passes `--no-for-check`.
+Neither changed: `summary.csv` columns are untouched and `--no-for-check` skips both `for-check.csv` and the xlsx sheet.
+`--no-for-check` and `--for-check-refs` exist only in profilers that include for-check; an older profiler rejects the
+flag (argparse "unrecognized arguments"), so pin Squirrel to a profiler version that has it.
 
 ## Local development (without Docker)
 
@@ -222,6 +273,7 @@ python extract_org_raw_data.py --ui
 | `extract_org_raw_data.py` | CLI extractor |
 | `extract_ui.py` | Browser UI |
 | `count_merged_prs.py` | GitHub/GitLab API helpers |
+| `for_check.py` | for-check.csv: platform-side counts/refs + summary.xlsx writer |
 | `github_app_auth.py` | GitHub App authentication |
 | `docker-compose.yml` | One-command startup |
 | `Dockerfile` | Self-contained runtime image |

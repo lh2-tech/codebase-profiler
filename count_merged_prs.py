@@ -17,6 +17,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -35,6 +36,43 @@ GITHUB_RATE_LIMIT_WAIT_SECONDS = 30 * 60
 
 _GITHUB_RATE_LIMIT_LOCK = threading.Lock()
 _GITHUB_RATE_LIMIT_RESUME_AT = 0.0
+
+
+_AUTH_HEADERS = ("authorization", "private-token")
+
+
+class _DropAuthOnCrossHostRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib re-sends every header to the redirect target; a token must not follow a redirect to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
+            for name in _AUTH_HEADERS:
+                for store in (new.headers, new.unredirected_hdrs):
+                    for key in [k for k in store if k.lower() == name]:
+                        del store[key]
+        return new
+
+
+urllib.request.install_opener(urllib.request.build_opener(_DropAuthOnCrossHostRedirect))
+
+
+def validate_host(host: str, *, name: str = "host", allow_scheme: bool = False) -> str:
+    """Hosts are spliced into API/GraphQL/git URLs that receive the token: refuse anything that is not a bare
+    host[:port] (a stray `/`, `@` or space would send the token to a different server)."""
+    value = (host or "").strip()
+    bare = value
+    if allow_scheme:
+        for scheme in ("https://", "http://"):
+            if bare.lower().startswith(scheme):
+                bare = bare[len(scheme):]
+                break
+    bare = bare.rstrip("/")
+    if not bare or re.search(r"[\s/@\\?#]", bare) or not re.fullmatch(r"[A-Za-z0-9.\-]+(:\d{1,5})?", bare):
+        raise ValueError(f"invalid {name} {host!r}: expected a bare host such as github.example.com[:port]")
+    if value.lower().startswith("http://"):
+        log.warning("%s uses http://: the token is sent unencrypted", name)
+    return value.rstrip("/")
 
 
 def _is_rate_limit_text(text: str) -> bool:
