@@ -268,14 +268,6 @@ def read_bitbucket_credentials(fields: dict[str, list[str]]) -> tuple[str, str]:
     return tokens[token_name], (tokens.get(email_name, "") if email_name else "")
 
 
-def compare_commits_from_fields(fields: dict[str, list[str]]) -> bool:
-    """The duplicate-% checkbox is ticked by default, but an unticked box is simply absent from the posted form.
-    The hidden `compare_commits_shown` marker tells "the user unticked it" apart from "this POST never had the box"."""
-    if fields.get("compare_commits_shown", [""])[0] != "1":
-        return True
-    return fields.get("compare_commits", [""])[0] == "on"
-
-
 def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
     llm_enabled = fields.get("llm_enabled", [""])[0] == "on"
     selected = extract_selected_repos(fields)
@@ -295,10 +287,8 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
         or "bitbucket_token",
         "bitbucket_email_name": fields.get("bitbucket_email_name", ["bitbucket_email"])[0].strip(),
         "workers": fields.get("workers", ["4"])[0].strip() or "4",
-        "retry_failed": fields.get("retry_failed", [""])[0] == "on",
         "resume_run_dir": fields.get("resume_run_dir", [""])[0].strip(),
         "llm_enabled": llm_enabled,
-        "compare_commits": compare_commits_from_fields(fields),
         "selected_repos": "\n".join(selected),
         "manual_repos": "\n".join(manual),
         "github_accessible": fields.get("github_accessible", [""])[0] == "on",
@@ -877,10 +867,8 @@ __DOCKER_NOTICE__
     <label class="field">Resume previous run</label>
     <select name="resume_run_dir" id="resume-run-dir"><option value="">Start a new run</option></select>
     <div class="inline-actions"><button type="button" id="refresh-resumable" class="secondary">Refresh resumable runs</button></div>
-    <label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="retry-failed" type="checkbox" name="retry_failed"><strong>Retry failed repositories</strong><span class="small">Re-attempts timeout / network / rate-limit failures from the selected run.</span></label>
-    <p class="notice">Interrupted runs save progress after every repository. Pick a run above to continue from where it left off.</p>
+    <p class="notice">Interrupted runs save progress after every repository. Pick a run above to continue from where it left off. Repos that fail on a timeout or network error are retried automatically at the end of every run.</p>
   </div>
-  <label class="choice" style="margin-top:18px;display:flex;align-items:center"><input type="hidden" name="compare_commits_shown" value="1"><input id="compare-commits" type="checkbox" name="compare_commits" checked><strong>Compare commit hashes between repos (duplicate %)</strong><span class="small">Adds duplicate_pct, duplicate_commits and duplicates_with to summary.csv and a duplicates.csv. Only commit hashes are kept, never messages or code. Needs 2 or more repos.</span></label>
   <label class="choice" style="margin-top:18px;display:flex;align-items:center"><input id="llm-enabled" type="checkbox" name="llm_enabled"><strong>Enable LLM analysis</strong><span class="small">Adds codebase description, industry/domain, vibe-code signals, and repository type.</span></label>
   <div id="llm-fields" class="hidden"><label class="field">OpenAI API key<span class="req">*</span></label><input name="openai_key" type="password" autocomplete="off" placeholder="sk-..."><p id="offline-llm-warning" class="warning hidden">LLM mode requires an internet connection in offline mode.</p></div>
   <button id="start">Create output</button>
@@ -1204,9 +1192,7 @@ function readFormSettings(){
     bitbucket_email_name:data.get('bitbucket_email_name')||'',
     workers:data.get('workers')||'4',
     resume_run_dir:data.get('resume_run_dir')||'',
-    retry_failed:!!data.get('retry_failed'),
     llm_enabled:!!data.get('llm_enabled'),
-    compare_commits:!!data.get('compare_commits'),
     github_accessible:!!data.get('github_accessible'),
     gitlab_accessible:!!data.get('gitlab_accessible'),
     selected_repos:getSelectedRepos().join('\\n'),
@@ -1230,8 +1216,6 @@ function restoreFormSettings(settings){
   setValue('workers', settings.workers||'4');
   setValue('manual_repos', settings.manual_repos||'');
   document.querySelector('#llm-enabled').checked=!!settings.llm_enabled;
-  document.querySelector('#compare-commits').checked=settings.compare_commits!==false;
-  document.querySelector('#retry-failed').checked=!!settings.retry_failed;
   const accessible=document.querySelector('#github-accessible');
   if (accessible) accessible.checked=!!settings.github_accessible;
   const gitlabAccessible=document.querySelector('#gitlab-accessible');
@@ -1490,7 +1474,7 @@ async function refresh(){
     if (data.zip_path) parts.push('<strong>Archive zip:</strong> <code>'+data.zip_path+'</code>');
     if (data.run_dir) parts.push('<strong>Run folder:</strong> <code>'+data.run_dir+'</code>');
     if (data.host_output_hint) parts.push('<strong>Host folder:</strong> <code>'+data.host_output_hint+'</code>');
-    if (data.repos_failed>0) parts.push('Some repositories failed. Select this run under <strong>Resume previous run</strong> and enable <strong>Retry failed repositories</strong>.');
+    if (data.repos_failed>0) parts.push('Some repositories failed even after the automatic retry (not found, no permission, or still timing out). See <strong>failures.json</strong> in the support logs.');
     paths.innerHTML=parts.join('<br>');
     paths.classList.toggle('hidden', parts.length===0);
     const summaryLink=document.querySelector('#download-summary');
@@ -1992,7 +1976,6 @@ class Handler(BaseHTTPRequestHandler):
         selected_repos = merge_repo_selectors(selected_repos, manual_repos)
         workers = fields.get("workers", ["4"])[0].strip()
         resume_run_dir = fields.get("resume_run_dir", [""])[0].strip()
-        retry_failed = fields.get("retry_failed", [""])[0] == "on"
         try:
             workers_number = int(workers)
         except ValueError:
@@ -2000,13 +1983,6 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not 1 <= workers_number <= 20:
             self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Workers must be between 1 and 20.")
-            return
-        if retry_failed and not resume_run_dir:
-            self.respond(
-                HTTPStatus.BAD_REQUEST,
-                "text/plain",
-                "Select a previous run before enabling Retry failed repositories.",
-            )
             return
         if resume_run_dir:
             resume_path = Path(resume_run_dir)
@@ -2027,8 +2003,6 @@ class Handler(BaseHTTPRequestHandler):
         ]
         if resume_run_dir:
             command.extend(["--resume", resume_run_dir])
-            if retry_failed:
-                command.append("--retry-failed")
 
         # Secrets (pasted tokens, OpenAI key) travel to the child via the
         # environment only — never argv — so they stay out of logs and archives.
@@ -2175,9 +2149,6 @@ class Handler(BaseHTTPRequestHandler):
             command.append("--llm")
             # Keep the key out of command arguments, logs, and output archives.
             env_overrides["OPENAI_API_KEY"] = openai_key
-
-        if not compare_commits_from_fields(fields):
-            command.append("--no-dedup")
 
         # Atomically claim the single run slot: check *and* set running under one
         # lock hold so two concurrent /start requests can't both pass the guard

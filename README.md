@@ -107,10 +107,10 @@ Useful when a security team asks what the token is actually allowed to touch. Al
 - **Manual repository list** — paste `owner/repo` lines when discovery still misses a target
 - **Repository selection** — optional picker to limit which repos/projects are processed
 - **Resume previous run** — continue an interrupted job from `job.json` / `summary.csv` without redoing completed repos
-- **Retry failed repositories** — re-attempt timeout / network / rate-limit failures only
+- **Automatic retry of failed repositories** — no button: repos that failed on a timeout, network or rate-limit error are retried at the end of every run, and the run only finishes after that (see [Clone timeouts and automatic retry](#clone-timeouts-and-automatic-retry))
 - **Partial summary / archive download** — download `summary.csv` or a partial archive zip while a run is still in progress
 - **Download summary / archive zip** — browser downloads for the completed (or partial) run
-- **Compare commit hashes between repos (duplicate %)** — ticked by default; see [Duplicate commits](#duplicate-commits-duplicatescsv)
+- **Duplicate commits (duplicate %)** — always on for runs of 2 or more repos, no checkbox; see [Duplicate commits](#duplicate-commits-duplicatescsv)
 
 ## Modes
 
@@ -167,13 +167,15 @@ Progress is written after every repository to `summary.csv` and `job.json` insid
 # Continue pending repos from an interrupted run
 python extract_org_raw_data.py --resume outputs/raw-extracts/raw-extract-ORG-STAMP --tokens-file tokens
 
-# Retry only timeout / network / rate-limit failures
-python extract_org_raw_data.py --resume outputs/raw-extracts/raw-extract-ORG-STAMP --tokens-file tokens --retry-failed
-
 # Shorter clone timeout (default 300s) and fewer retries
 python extract_org_raw_data.py --github-org MyOrg --tokens-file tokens \
   --clone-timeout 180 --clone-retries 1 --workers 4
 ```
+
+### Clone timeouts and automatic retry
+
+- **Clone attempts.** Each clone gets `--clone-timeout` seconds (default 300) and `--clone-retries` extra attempts (default 2, so 3 tries). If the last try ends in a timeout or network error, one final **extended** try runs with `--clone-extended-timeout` seconds (default 1200; `0` turns it off). If that fails too, the repo is recorded as failed and the run moves on. Not-found, permission and disk-full errors end at the first attempt.
+- **Retry at the end of the run.** After all repos were processed, every repo that failed on a `timeout`, `network` or `rate_limit` error is processed again (`--end-retry-passes`, default 1; `0` turns it off), and the run only finishes, writes `summary.csv` and the zip after that. `not_found`, `auth` and unclassified errors are not retried. A resumed run also retries such failures it carried over. `--resume --retry-failed` still exists for the CLI to retry them at the start instead.
 
 ### Already cloned here (offline)
 
@@ -218,7 +220,7 @@ For one run, the tool compares the **commit hashes** of the repos it processed a
   The three are **blank** (unknown, never 0) for a repo with no commits, a repo whose hashes could not be collected (failed repo, `git rev-list` error or timeout, a SHA-256 repository), and for every repo when fewer than two repos have commits. They are blank while the run is in progress and are filled once, at the end.
 - `duplicates.csv` (run folder root, also in the zip): `repo_a,repo_b,shared_commits,pct_of_a,pct_of_b`, one row per unordered pair that shares at least one commit, sorted by `shared_commits` descending then `repo_a`, `repo_b` (`repo_a` sorts before `repo_b`). Header only when nothing is shared. A pair is two repos that share history; it does not say which one is the original.
 - One log line closes the comparison: `Duplicate commits: N of M repos share commits with another repo (duplicates.csv)` (M = repos with commits that were compared) or `Duplicate commits: none found`.
-- **On/off.** On by default when the run has 2 or more repos. `--no-dedup` (or unticking *Compare commit hashes between repos (duplicate %)* in the UI) skips it: no `duplicates.csv`, no hash files, and the three columns stay in `summary.csv` but blank, so the column layout never changes. On `--resume` the same flag clears values written by an earlier run.
+- **On/off.** On by default when the run has 2 or more repos. `--no-dedup` (CLI only; the UI always compares) skips it: no `duplicates.csv`, no hash files, and the three columns stay in `summary.csv` but blank, so the column layout never changes. On `--resume` the same flag clears values written by an earlier run.
 - **Resume.** The clone is deleted after each repo, so each repo's hashes are saved while it exists, in `git/<org__repo>/commit_hashes.txt.gz` (one 40-hex hash per line, sorted, gzip). The comparison runs once at the end over every repo of the run that has such a file, so `--resume` / `--retry-failed` produce the full result, not only the repos that were re-run. A repo that fails loses its hash file and is blank.
 - **Privacy.** `commit_hashes.txt.gz` holds hashes and nothing else: no messages, authors, paths or content (`test_no_source_in_archive.py` asserts every line is 40 lowercase hex characters). A hash is not secret, but it does let someone who already has a repository check whether it is a copy of yours.
 - **Limits and cost.** Memory is about 100 bytes per distinct commit hash across the whole run (an index of 20-byte keys), so 1M distinct commits is roughly 100 MB and 10M roughly 1 GB; the work is linear in the total number of commits, not quadratic in the number of repos. `rev-list --all` follows the existing `EXTRACT_GIT_LOG_TIMEOUT` and git hardening. Hosted-platform clones carry branches and tags, not PR/MR refs (`refs/pull/*`), so a commit that only exists in a PR is not counted. Two repos that independently made a commit with identical content, author, date and parent get the same hash and so count as sharing it. A corrupt `commit_hashes.txt.gz` makes the whole comparison fail: it is logged, the columns stay blank and `duplicates.csv` is not written.
@@ -269,7 +271,7 @@ archive cannot execute. `--github-host` / `--gitlab-host` must be a bare host (`
 ### Compatibility with Squirrel
 
 Squirrel (`stages.py`) reads `summary.csv` by header name (`loc`, `commits`, `merged_prs`) and passes `--no-for-check`.
-Neither changed: existing `summary.csv` columns are untouched (the three duplicate columns are only appended at the end) and `--no-for-check` skips both `for-check.csv` and the xlsx sheet.
+`summary.csv` gains a `subgroup` column right after `org` (GitLab: the path between group and repo, e.g. `mobile-apps` or `a/b`; Bitbucket: the project name; GitHub: blank), so same-named repos in different subgroups keep separate rows. Squirrel reads by header name, so this does not affect it. Existing columns are otherwise untouched (the three duplicate columns are only appended at the end) and `--no-for-check` skips both `for-check.csv` and the xlsx sheet.
 `--no-for-check` and `--for-check-refs` exist only in profilers that include for-check; an older profiler rejects the
 flag (argparse "unrecognized arguments"), so pin Squirrel to a profiler version that has it.
 

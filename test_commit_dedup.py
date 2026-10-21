@@ -364,7 +364,7 @@ class RunTests(unittest.TestCase):
         run = self._run()
         # Simulate an interrupted run: B has no result yet and no hash file.
         job = json.loads((run / "job.json").read_text())
-        job["repos"].pop("B")
+        job["repos"].pop(next(key for key in job["repos"] if key.endswith("/B")))
         (run / "job.json").write_text(json.dumps(job))
         rows = list(csv.DictReader((run / "summary.csv").open(newline="")))
         with (run / "summary.csv").open("w", newline="") as handle:
@@ -469,20 +469,6 @@ class UiCouplingTests(unittest.TestCase):
             for line in self.LINES:
                 extract_ui.maybe_capture_job_dir(line)
         set_state.assert_not_called()
-
-    def test_the_form_flag_defaults_on_and_can_be_switched_off(self):
-        import extract_ui
-
-        self.assertTrue(extract_ui.extract_form_settings({})["compare_commits"])
-        self.assertTrue(extract_ui.extract_form_settings({"compare_commits_shown": ["1"], "compare_commits": ["on"]})["compare_commits"])
-        self.assertFalse(extract_ui.extract_form_settings({"compare_commits_shown": ["1"]})["compare_commits"])
-
-    def test_the_page_offers_the_checkbox_ticked_by_default(self):
-        import extract_ui
-
-        page = extract_ui.page()
-        self.assertIn("Compare commit hashes between repos (duplicate %)", page)
-        self.assertRegex(page, r'<input[^>]*name="compare_commits"[^>]*\bchecked\b')
 
 
 if __name__ == "__main__":

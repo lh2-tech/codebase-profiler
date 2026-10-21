@@ -83,6 +83,10 @@ BITBUCKET_API = "https://api.bitbucket.org/2.0"
 GITHUB_APP_TOKEN_KEY = "__github_app_installation_token__"
 DEFAULT_CLONE_TIMEOUT_SECONDS = 300
 DEFAULT_CLONE_RETRIES = 2
+# One last, longer clone try once every normal attempt has timed out or hit a network error; 0 turns it off.
+DEFAULT_CLONE_EXTENDED_TIMEOUT_SECONDS = 1200
+# Extra whole-pipeline passes at the end of a run over repos that failed with a retryable error.
+DEFAULT_END_RETRY_PASSES = 1
 
 # ── large-repo cost controls ────────────────────────────────────────────────
 # The per-commit file-churn export (commits.jsonl) is the single most expensive
@@ -206,6 +210,8 @@ query MergedPRs($owner: String!, $name: String!, $cursor: String, $pageSize: Int
 
 SUMMARY_FIELDS = [
     "org",
+    # GitLab: the path between the group and the repo ("a/b"). Bitbucket: the project name. Blank on GitHub.
+    "subgroup",
     "project_name",
     "repo",
     "merged_prs",
@@ -544,6 +550,10 @@ def log_runtime_diagnostics(log: logging.Logger, args: argparse.Namespace) -> No
     log.info("workers=%s", args.workers)
     log.info("clone_timeout=%s", getattr(args, "clone_timeout", DEFAULT_CLONE_TIMEOUT_SECONDS))
     log.info("clone_retries=%s", getattr(args, "clone_retries", DEFAULT_CLONE_RETRIES))
+    log.info(
+        "clone_extended_timeout=%s", getattr(args, "clone_extended_timeout", DEFAULT_CLONE_EXTENDED_TIMEOUT_SECONDS)
+    )
+    log.info("end_retry_passes=%s", getattr(args, "end_retry_passes", DEFAULT_END_RETRY_PASSES))
     log.info("github_rate_limit_wait_seconds=%s", GITHUB_RATE_LIMIT_WAIT_SECONDS)
     log.info("resume=%s", getattr(args, "resume", None))
     log.info("offline=%s", bool(args.offline))
@@ -632,8 +642,31 @@ def is_retryable_error_class(error_class: str) -> bool:
     return error_class in RETRYABLE_ERROR_CLASSES
 
 
-def repo_row_key(org: str, repo: str) -> str:
-    return f"{org}/{repo}".strip("/")
+def repo_row_key(org: str, repo: str, subgroup: str = "") -> str:
+    """Identity of a summary row. The subgroup is part of it: two GitLab subgroups can hold a repo of the same name."""
+    return "/".join(part for part in (org, subgroup, repo) if part).strip("/")
+
+
+def target_subgroup(target: "RepoTarget") -> str:
+    if target.platform == "gitlab":
+        return "/".join(target.full_name.strip("/").split("/")[1:-1])
+    if target.platform == "bitbucket":
+        project = (target.meta or {}).get("project")
+        if isinstance(project, dict):
+            return str(project.get("name") or project.get("key") or "")
+    return ""
+
+
+def target_row_key(target: "RepoTarget") -> str:
+    return repo_row_key(target.org, target.full_name.split("/")[-1], target_subgroup(target))
+
+
+def row_key(row: dict[str, Any]) -> str:
+    return repo_row_key(str(row.get("org") or ""), str(row.get("repo") or ""), str(row.get("subgroup") or ""))
+
+
+def _row_sort_key(row: dict[str, Any]) -> tuple[str, str, str]:
+    return (str(row.get("org")), str(row.get("subgroup") or ""), str(row.get("repo")))
 
 
 @dataclass
@@ -682,7 +715,7 @@ class JobCheckpoint:
                     repo = str(row.get("repo") or "")
                     if not org or not repo:
                         continue
-                    key = repo_row_key(org, repo)
+                    key = row_key(row)
                     job.rows_by_key[key] = dict(row)
                     # The percentages describe the whole run, which is about to change: never show the old ones.
                     commit_dedup.blank_rows([job.rows_by_key[key]])
@@ -717,8 +750,8 @@ class JobCheckpoint:
             failed.add(key)
         return failed
 
-    def record(self, full_name: str, row: dict[str, Any]) -> None:
-        key = full_name.strip("/")
+    def record(self, row: dict[str, Any]) -> None:
+        key = row_key(row)
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         error = str(row.get("error") or "").strip()
         error_class = str(row.get("error_class") or "").strip()
@@ -737,7 +770,7 @@ class JobCheckpoint:
     def rows(self) -> list[dict[str, Any]]:
         with self._lock:
             values = list(self.rows_by_key.values())
-        values.sort(key=lambda r: (str(r.get("org")), str(r.get("repo"))))
+        values.sort(key=_row_sort_key)
         return values
 
     def persist(self) -> None:
@@ -752,7 +785,7 @@ class JobCheckpoint:
         with self._lock:
             self.rows_by_key = {}
             for row in rows:
-                key = repo_row_key(str(row.get("org") or ""), str(row.get("repo") or ""))
+                key = row_key(row)
                 if key:
                     self.rows_by_key[key] = dict(row)
             self.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -801,7 +834,7 @@ class JobCheckpoint:
 
     def _write_summary_unlocked(self) -> None:
         rows = list(self.rows_by_key.values())
-        rows.sort(key=lambda r: (str(r.get("org")), str(r.get("repo"))))
+        rows.sort(key=_row_sort_key)
         with self.summary_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
             writer.writeheader()
@@ -1204,49 +1237,68 @@ def clone_repo(
     timeout: int = DEFAULT_CLONE_TIMEOUT_SECONDS,
     retries: int = DEFAULT_CLONE_RETRIES,
     log: logging.Logger | None = None,
+    extended_timeout: int = DEFAULT_CLONE_EXTENDED_TIMEOUT_SECONDS,
 ) -> None:
-    """Clone with a short timeout and a few retries, then move on to the next repo."""
+    """Clone with a short timeout and a few retries. When the last of those fails on a timeout or network error,
+    one more try runs with ``extended_timeout``; if that fails too the error is raised and the run moves on."""
     attempts = max(1, retries + 1)
-    last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
+    attempt = 0
+    attempt_timeout = timeout
+    extended_used = False
+    while True:
+        attempt += 1
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
         dest.parent.mkdir(parents=True, exist_ok=True)
         env = git_env({"GIT_LFS_SKIP_SMUDGE": "1"})
+        timed_out: subprocess.TimeoutExpired | None = None
         try:
             proc = subprocess.run(
                 ["git", *GIT_HARDEN_ARGS, "clone", "--recurse-submodules=0", url, str(dest)],
                 capture_output=True,
                 text=True,
-                timeout=timeout,
+                timeout=attempt_timeout,
                 env=env,
             )
         except subprocess.TimeoutExpired as exc:
+            timed_out = exc
+        if timed_out is None and proc.returncode == 0:
+            return
+        if timed_out is not None:
             shutil.rmtree(dest, ignore_errors=True)
             last_error = RuntimeError(
-                f"clone timed out after {timeout}s (attempt {attempt}/{attempts})"
+                f"clone timed out after {attempt_timeout}s (attempt {attempt}/{attempts + int(extended_used)})"
             )
-            if log is not None:
-                log.warning("%s", last_error)
-            if attempt >= attempts:
-                raise last_error from exc
-            time.sleep(min(2**attempt, 20))
-            continue
-        if proc.returncode == 0:
-            return
-        detail = proc.stderr or proc.stdout or "clone failed"
-        detail = CLONE_CREDENTIAL_RE.sub(r"\1***:***@", detail)
-        try:
-            shutil.rmtree(dest)
-        except OSError as exc:
-            # Log cleanup failure but don't suppress - will be caught in process_repo()
-            log.warning("Cleanup failed after clone error (disk may be full): %s", exc)
-        last_error = RuntimeError(detail[-800:])
+        else:
+            detail = proc.stderr or proc.stdout or "clone failed"
+            detail = CLONE_CREDENTIAL_RE.sub(r"\1***:***@", detail)
+            try:
+                shutil.rmtree(dest)
+            except FileNotFoundError:
+                pass  # git already removed the half-made directory
+            except OSError as exc:
+                # Not fatal here: process_repo() reports a leftover clone dir if the disk really is full.
+                if log is not None:
+                    log.warning("Cleanup failed after clone error (disk may be full): %s", exc)
+            last_error = RuntimeError(detail[-800:])
         error_class = classify_error(last_error)
         # Auth / not-found will not improve with retries.
-        if error_class in {"auth", "not_found", "disk_full"} or attempt >= attempts:
-            raise last_error
-        if log is not None:
+        if error_class in {"auth", "not_found", "disk_full"}:
+            raise last_error from timed_out
+        if attempt >= attempts:
+            if extended_used or extended_timeout <= 0 or not is_retryable_error_class(error_class):
+                raise last_error from timed_out
+            extended_used = True
+            attempt_timeout = extended_timeout
+            if log is not None:
+                log.warning(
+                    "clone failed %s times (%s); one last try with a %ss timeout: %s",
+                    attempts,
+                    error_class,
+                    extended_timeout,
+                    str(last_error)[:200],
+                )
+        elif log is not None:
             log.warning(
                 "clone failed (%s) attempt %s/%s; retrying: %s",
                 error_class,
@@ -1255,8 +1307,6 @@ def clone_repo(
                 str(last_error)[:200],
             )
         time.sleep(min(2**attempt, 20))
-    assert last_error is not None
-    raise last_error
 
 
 def github_clone_url(full_name: str, token: str, host: str) -> str:
@@ -2431,11 +2481,12 @@ def filter_local_targets(
 # ── per-repo orchestration ──────────────────────────────────────────────────
 
 
-def empty_summary_row(org: str, repo: str) -> dict[str, Any]:
+def empty_summary_row(org: str, repo: str, subgroup: str = "") -> dict[str, Any]:
     row: dict[str, Any] = {k: "" for k in SUMMARY_FIELDS}
     row.update(
         {
             "org": org,
+            "subgroup": subgroup,
             "project_name": org,
             "repo": repo,
             "merged_prs": 0,
@@ -2530,10 +2581,10 @@ def run_commit_dedup(
     Never raises: on failure the columns stay blank and the problem is logged."""
     commit_dedup.blank_rows(rows)
     names_by_slug: dict[str, str] = {}
-    name_by_row: dict[tuple[str, str], str] = {}
-    failed_rows = {(str(r.get("org") or ""), str(r.get("repo") or "")) for r in rows if r.get("error")}
+    name_by_row: dict[str, str] = {}
+    failed_rows = {row_key(r) for r in rows if r.get("error")}
     for target in targets:
-        row_id = (target.org, target.full_name.split("/")[-1])
+        row_id = target_row_key(target)
         if row_id in failed_rows:
             continue  # a failed repo is unknown, even if an earlier attempt left a hash file
         names_by_slug[safe_name(target.full_name.replace("/", "__"))] = target.full_name
@@ -2541,7 +2592,7 @@ def run_commit_dedup(
     try:
         result = commit_dedup.compute(commit_dedup.hash_sources(run_dir, names_by_slug))
         commit_dedup.apply_to_rows(
-            rows, result, lambda row: name_by_row.get((str(row.get("org") or ""), str(row.get("repo") or "")))
+            rows, result, lambda row: name_by_row.get(row_key(row))
         )
         commit_dedup.write_duplicates_csv(run_dir / commit_dedup.DUPLICATES_FILE_NAME, result.pairs)
     except Exception:  # noqa: BLE001 - the comparison is an extra; it must not cost the run its other results
@@ -2584,6 +2635,7 @@ def process_repo(
     log: logging.Logger,
     clone_timeout: int = DEFAULT_CLONE_TIMEOUT_SECONDS,
     clone_retries: int = DEFAULT_CLONE_RETRIES,
+    clone_extended_timeout: int = DEFAULT_CLONE_EXTENDED_TIMEOUT_SECONDS,
     for_check_enabled: bool = True,
     for_check_ref_mode: str = for_check.DEFAULT_REF_MODE,
     commit_hashes_enabled: bool = True,
@@ -2596,7 +2648,7 @@ def process_repo(
     api_dir.mkdir(parents=True, exist_ok=True)
     git_dir.mkdir(parents=True, exist_ok=True)
 
-    row = empty_summary_row(org, repo)
+    row = empty_summary_row(org, repo, target_subgroup(target))
     meta = target.meta
     if target.platform != "local":
         write_json(api_dir / "repo.json", meta)
@@ -2707,6 +2759,7 @@ def process_repo(
                 timeout=clone_timeout,
                 retries=clone_retries,
                 log=log,
+                extended_timeout=clone_extended_timeout,
             )
 
         if target.platform != "local":
@@ -2994,7 +3047,7 @@ def filter_targets_for_resume(
     skipped_ok = 0
     skipped_failed = 0
     for target in targets:
-        key = target.full_name.strip("/")
+        key = target_row_key(target)
         if key in ok_keys:
             skipped_ok += 1
             continue
@@ -3006,6 +3059,76 @@ def filter_targets_for_resume(
             continue
         to_process.append(target)
     return to_process, skipped_ok, skipped_failed
+
+
+def retryable_failed_targets(targets: list[RepoTarget], checkpoint: JobCheckpoint) -> list[RepoTarget]:
+    """Targets whose latest result failed on a timeout / network / rate-limit error. Not-found, auth and the like
+    would fail the same way again, so they stay failed."""
+    failed = checkpoint.failed_keys(retryable_only=True)
+    return [target for target in targets if target_row_key(target) in failed]
+
+
+def run_pass(
+    targets: list[RepoTarget],
+    checkpoint: JobCheckpoint,
+    *,
+    workers: int,
+    log: logging.Logger,
+    process_kwargs: dict[str, Any],
+    label: str = "",
+) -> None:
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(process_repo, target, **process_kwargs): target for target in targets}
+        for fut in as_completed(futures):
+            target = futures[fut]
+            try:
+                row = fut.result()
+            except Exception as exc:
+                log.exception("Worker crashed while collecting a repository result")
+                row = empty_summary_row(target.org, target.full_name.split("/")[-1], target_subgroup(target))
+                row["error"] = f"worker crash: {exc}"[:500]
+                row["error_class"] = classify_error(exc)
+            checkpoint.record(row)
+            progress = checkpoint.progress_snapshot()
+            log.info(
+                "%sProgress %s/%s ok=%s failed=%s",
+                label,
+                progress["done"],
+                progress["total"],
+                progress["ok"],
+                progress["failed"],
+            )
+
+
+def run_passes(
+    targets: list[RepoTarget],
+    checkpoint: JobCheckpoint,
+    *,
+    workers: int,
+    retry_passes: int,
+    log: logging.Logger,
+    process_kwargs: dict[str, Any],
+    retry_pool: list[RepoTarget] | None = None,
+) -> None:
+    """Process ``targets``, then re-process the repos that failed on a retryable error, up to ``retry_passes`` times.
+    The run is only finished once those retries are in. ``retry_pool`` is every target of the run (default: ``targets``),
+    so failures kept from an earlier, resumed pass of the same run are retried as well."""
+    if targets:
+        run_pass(targets, checkpoint, workers=workers, log=log, process_kwargs=process_kwargs)
+    pool = targets if retry_pool is None else retry_pool
+    for number in range(1, max(0, retry_passes) + 1):
+        again = retryable_failed_targets(pool, checkpoint)
+        if not again:
+            return
+        log.info("Retry pass %s/%s: %s repos failed on a timeout or network error", number, retry_passes, len(again))
+        run_pass(
+            again,
+            checkpoint,
+            workers=workers,
+            log=log,
+            process_kwargs=process_kwargs,
+            label=f"Retry {number}/{retry_passes} ",
+        )
 
 
 def resolve_github_token(
@@ -3282,6 +3405,24 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--clone-extended-timeout",
+        type=int,
+        default=DEFAULT_CLONE_EXTENDED_TIMEOUT_SECONDS,
+        help=(
+            "Seconds for one last clone try after the normal attempts timed out or hit a network error "
+            f"(default: {DEFAULT_CLONE_EXTENDED_TIMEOUT_SECONDS}; 0 disables it)."
+        ),
+    )
+    parser.add_argument(
+        "--end-retry-passes",
+        type=int,
+        default=DEFAULT_END_RETRY_PASSES,
+        help=(
+            "Passes at the end of the run that re-process repos which failed on a timeout, network or rate-limit "
+            f"error (default: {DEFAULT_END_RETRY_PASSES}; 0 disables). Not-found and permission failures are never retried."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         type=Path,
         default=None,
@@ -3464,6 +3605,10 @@ def main() -> int:
         raise SystemExit("--clone-timeout must be at least 30 seconds")
     if args.clone_retries < 0:
         raise SystemExit("--clone-retries must be >= 0")
+    if args.clone_extended_timeout < 0:
+        raise SystemExit("--clone-extended-timeout must be >= 0")
+    if args.end_retry_passes < 0:
+        raise SystemExit("--end-retry-passes must be >= 0")
 
     resume_dir: Path | None = None
     resumed_targets: list[RepoTarget] | None = None
@@ -3644,10 +3789,11 @@ def main() -> int:
 
     log.info("Extracting %s repos → %s", len(all_targets), run_dir)
     log.info(
-        "This pass will process %s repos (clone_timeout=%ss clone_retries=%s workers=%s)",
+        "This pass will process %s repos (clone_timeout=%ss clone_retries=%s extended=%ss workers=%s)",
         len(targets),
         args.clone_timeout,
         args.clone_retries,
+        args.clone_extended_timeout,
         args.workers,
     )
     log_runtime_diagnostics(log, args)
@@ -3681,50 +3827,34 @@ def main() -> int:
 
     if not targets:
         log.info("Nothing left to process; refreshing final artifacts from checkpoint")
-    else:
-        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-            futures = {
-                pool.submit(
-                    process_repo,
-                    t,
-                    tokens=tokens,
-                    github_token_name=github_token_name,
-                    gitlab_token_name=args.gitlab_token_name,
-                    bitbucket_token_name=args.bitbucket_token_name,
-                    bitbucket_email_name=args.bitbucket_email_name,
-                    github_token_fn=github_token_fn,
-                    llm_config=llm_config,
-                    run_dir=run_dir,
-                    clones_dir=clones_dir,
-                    github_host=args.github_host,
-                    gitlab_host=args.gitlab_host,
-                    log=log,
-                    clone_timeout=args.clone_timeout,
-                    clone_retries=args.clone_retries,
-                    for_check_enabled=not args.no_for_check,
-                    for_check_ref_mode=args.for_check_refs,
-                    commit_hashes_enabled=dedup_enabled,
-                ): t
-                for t in targets
-            }
-            for fut in as_completed(futures):
-                target = futures[fut]
-                try:
-                    row = fut.result()
-                except Exception as exc:
-                    log.exception("Worker crashed while collecting a repository result")
-                    row = empty_summary_row(target.org, target.full_name.split("/")[-1])
-                    row["error"] = f"worker crash: {exc}"[:500]
-                    row["error_class"] = classify_error(exc)
-                checkpoint.record(target.full_name, row)
-                progress = checkpoint.progress_snapshot()
-                log.info(
-                    "Progress %s/%s ok=%s failed=%s",
-                    progress["done"],
-                    progress["total"],
-                    progress["ok"],
-                    progress["failed"],
-                )
+    run_passes(
+        targets,
+        checkpoint,
+        workers=args.workers,
+        retry_passes=args.end_retry_passes,
+        log=log,
+        retry_pool=all_targets,
+        process_kwargs=dict(
+            tokens=tokens,
+            github_token_name=github_token_name,
+            gitlab_token_name=args.gitlab_token_name,
+            bitbucket_token_name=args.bitbucket_token_name,
+            bitbucket_email_name=args.bitbucket_email_name,
+            github_token_fn=github_token_fn,
+            llm_config=llm_config,
+            run_dir=run_dir,
+            clones_dir=clones_dir,
+            github_host=args.github_host,
+            gitlab_host=args.gitlab_host,
+            log=log,
+            clone_timeout=args.clone_timeout,
+            clone_retries=args.clone_retries,
+            clone_extended_timeout=args.clone_extended_timeout,
+            for_check_enabled=not args.no_for_check,
+            for_check_ref_mode=args.for_check_refs,
+            commit_hashes_enabled=dedup_enabled,
+        ),
+    )
 
     rows = checkpoint.rows()
     apply_company_periods(rows)
@@ -3749,6 +3879,7 @@ def main() -> int:
     failures = [
         {
             "org": row.get("org"),
+            "subgroup": row.get("subgroup"),
             "repo": row.get("repo"),
             "error": row.get("error"),
             "error_class": row.get("error_class"),
@@ -3766,9 +3897,8 @@ def main() -> int:
         log.error("Failure classes: %s", by_class)
         for failure in failures[:50]:
             log.error(
-                "Failed repo %s/%s [%s]: %s",
-                failure.get("org"),
-                failure.get("repo"),
+                "Failed repo %s [%s]: %s",
+                row_key(failure),
                 failure.get("error_class") or "unknown",
                 failure.get("error"),
             )
@@ -3785,8 +3915,8 @@ def main() -> int:
         "\n"
         "To continue an interrupted or partial run:\n"
         f"  python extract_org_raw_data.py --resume {run_dir}\n"
-        "To retry timeout/network/rate-limit failures:\n"
-        f"  python extract_org_raw_data.py --resume {run_dir} --retry-failed\n"
+        "Timeout/network/rate-limit failures were already retried at the end of this run; "
+        "a resume retries any that are still failed.\n"
     )
     (logs_dir / "SUPPORT.txt").write_text(support_note, encoding="utf-8")
     log.info("Wrote support note: %s", logs_dir / "SUPPORT.txt")
@@ -3806,6 +3936,8 @@ def main() -> int:
         "resumable": True,
         "clone_timeout_seconds": args.clone_timeout,
         "clone_retries": args.clone_retries,
+        "clone_extended_timeout_seconds": args.clone_extended_timeout,
+        "end_retry_passes": args.end_retry_passes,
         "support_logs": {
             "extract_log": str(logs_dir / "extract.log"),
             "failures_json": str(logs_dir / "failures.json"),
@@ -3896,13 +4028,8 @@ def main() -> int:
     log.info("Zip=%s", zip_path)
     if failures:
         log.info(
-            "Completed with errors. Resume pending repos with: "
+            "Completed with errors (timeout/network failures were already retried). Resume with: "
             "python extract_org_raw_data.py --resume %s",
-            run_dir,
-        )
-        log.info(
-            "Retry timeout/network/rate-limit failures with: "
-            "python extract_org_raw_data.py --resume %s --retry-failed",
             run_dir,
         )
     print(
