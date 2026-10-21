@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from code_metrics import PR_FIELDS, STRUCTURE_FIELDS, pr_tier_metrics, structure_metrics
+import commit_dedup
 import for_check
 from count_merged_prs import (
     GITHUB_RATE_LIMIT_WAIT_SECONDS,
@@ -242,6 +243,8 @@ SUMMARY_FIELDS = [
     "llm_analysis_error",
     "error",
     "error_class",
+    # Filled once at the end of the run (see run_commit_dedup); blank while it is in progress.
+    *commit_dedup.DEDUP_FIELDS,
 ]
 
 TEST_DIR_HINTS = ("test", "tests", "spec", "specs", "__tests__")
@@ -681,6 +684,8 @@ class JobCheckpoint:
                         continue
                     key = repo_row_key(org, repo)
                     job.rows_by_key[key] = dict(row)
+                    # The percentages describe the whole run, which is about to change: never show the old ones.
+                    commit_dedup.blank_rows([job.rows_by_key[key]])
                     if key not in job.status_by_key:
                         error = str(row.get("error") or "").strip()
                         error_class = str(row.get("error_class") or "").strip()
@@ -2486,6 +2491,82 @@ def _for_check_snapshot(
         return for_check.unavailable(f"snapshot: {type(exc).__name__}: {exc}"[:300])
 
 
+def collect_commit_hashes(clone_path: Path, dest: Path, log: logging.Logger) -> int | None:
+    """Write every commit hash reachable from any ref of the repo to ``dest`` (sorted, gzip). Hashes only.
+
+    Returns the number of commits, or None when they could not be listed. A failure never fails the repo: it is
+    logged and the repo simply has no hash file, so its duplicate columns stay blank (unknown, not 0).
+    Uses its own subprocess call rather than run_git(), which returns "" on failure and so cannot tell an empty
+    repo from a broken one.
+    """
+    dest.unlink(missing_ok=True)  # a stale list from an earlier attempt must not outlive a failure here
+    try:
+        proc = subprocess.run(
+            ["git", *GIT_HARDEN_ARGS, "-C", str(clone_path), "rev-list", "--all"],
+            capture_output=True,
+            text=True,
+            timeout=GIT_LOG_TIMEOUT_SECONDS,
+            env=git_env(),
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "git failed").strip()[:300]
+            raise RuntimeError(f"git rev-list --all failed: {detail}")
+        return commit_dedup.write_hash_file(dest, proc.stdout.split())
+    except (subprocess.TimeoutExpired, OSError, RuntimeError, ValueError) as exc:
+        # ValueError: a hash that is not 40-hex (a SHA-256 repository); never compared rather than compared wrongly.
+        log.warning("Commit hashes not collected for %s (duplicate columns stay blank): %s", clone_path.name, exc)
+        dest.unlink(missing_ok=True)
+        return None
+
+
+def run_commit_dedup(
+    run_dir: Path,
+    rows: list[dict[str, Any]],
+    targets: list[RepoTarget],
+    log: logging.Logger,
+) -> dict[str, Any]:
+    """Compare commit hashes over every repo of the run that has a hash file, fill the three summary columns in
+    ``rows`` and write duplicates.csv. Reading the files (not the clones) is what makes a resumed run complete.
+    Never raises: on failure the columns stay blank and the problem is logged."""
+    commit_dedup.blank_rows(rows)
+    names_by_slug: dict[str, str] = {}
+    name_by_row: dict[tuple[str, str], str] = {}
+    failed_rows = {(str(r.get("org") or ""), str(r.get("repo") or "")) for r in rows if r.get("error")}
+    for target in targets:
+        row_id = (target.org, target.full_name.split("/")[-1])
+        if row_id in failed_rows:
+            continue  # a failed repo is unknown, even if an earlier attempt left a hash file
+        names_by_slug[safe_name(target.full_name.replace("/", "__"))] = target.full_name
+        name_by_row[row_id] = target.full_name
+    try:
+        result = commit_dedup.compute(commit_dedup.hash_sources(run_dir, names_by_slug))
+        commit_dedup.apply_to_rows(
+            rows, result, lambda row: name_by_row.get((str(row.get("org") or ""), str(row.get("repo") or "")))
+        )
+        commit_dedup.write_duplicates_csv(run_dir / commit_dedup.DUPLICATES_FILE_NAME, result.pairs)
+    except Exception:  # noqa: BLE001 - the comparison is an extra; it must not cost the run its other results
+        log.exception("Duplicate commits: comparison failed, the duplicate columns are blank")
+        commit_dedup.blank_rows(rows)
+        (run_dir / commit_dedup.DUPLICATES_FILE_NAME).unlink(missing_ok=True)
+        return {"enabled": False, "error": True}
+    if result.repos_compared < 2:
+        log.info("Duplicate commits: not compared (fewer than 2 repos with commit hashes)")
+    elif result.repos_sharing:
+        log.info(
+            "Duplicate commits: %s of %s repos share commits with another repo (%s)",
+            result.repos_sharing,
+            result.repos_compared,
+            commit_dedup.DUPLICATES_FILE_NAME,
+        )
+    else:
+        log.info("Duplicate commits: none found")
+    return {
+        "enabled": True,
+        "repos_compared": result.repos_compared,
+        "repos_sharing_commits": result.repos_sharing,
+    }
+
+
 def process_repo(
     target: RepoTarget,
     *,
@@ -2505,6 +2586,7 @@ def process_repo(
     clone_retries: int = DEFAULT_CLONE_RETRIES,
     for_check_enabled: bool = True,
     for_check_ref_mode: str = for_check.DEFAULT_REF_MODE,
+    commit_hashes_enabled: bool = True,
 ) -> dict[str, Any]:
     org = target.org
     repo = target.full_name.split("/")[-1]
@@ -2519,6 +2601,10 @@ def process_repo(
     if target.platform != "local":
         write_json(api_dir / "repo.json", meta)
     clone_path = target.local_path or clones_dir / slug
+    hashes_path = commit_dedup.hash_file_path(run_dir, slug)
+    if commit_hashes_enabled:
+        # A re-run repo must not keep an old list: it is rewritten below or the repo stays unknown.
+        hashes_path.unlink(missing_ok=True)
     # PR-tier percentages exist only when the platform API supplied PR detail;
     # git-history and local runs leave them blank rather than guessing.
     pr_tiers: tuple[dict[str, Any], list[dict[str, Any]]] | None = None
@@ -2681,6 +2767,10 @@ def process_repo(
             log=log,
         )
 
+        if commit_hashes_enabled:
+            # Complete (not capped like commits.jsonl) and taken while the clone still exists.
+            collect_commit_hashes(clone_path, hashes_path, log)
+
         scc = run_scc(clone_path)
         write_json(git_dir / "scc.json", scc)
         row["loc"] = scc["loc"]
@@ -2763,6 +2853,7 @@ def process_repo(
     except Exception as exc:
         row["error"] = str(exc)[:500]
         row["error_class"] = classify_error(exc)
+        hashes_path.unlink(missing_ok=True)  # a failed repo is unknown, not a repo with a partial history
         log.exception(
             "FAIL %s [%s]: %s",
             target.full_name,
@@ -3283,6 +3374,12 @@ def main() -> int:
         "digest), 'names' (verbatim; may expose client names or ticket ids) or 'none' (no ref rows)",
     )
     parser.add_argument(
+        "--no-dedup",
+        action="store_true",
+        help="Skip the commit-hash comparison between repos (duplicate_pct / duplicate_commits / duplicates_with "
+        "in summary.csv, duplicates.csv, git/<repo>/commit_hashes.txt.gz). On by default when the run has 2+ repos",
+    )
+    parser.add_argument(
         "--offline",
         action="store_true",
         help="Analyze --local-repos-dir only; make no network/API requests",
@@ -3542,6 +3639,9 @@ def main() -> int:
             bool(args.retry_failed),
         )
 
+    # One repo has nothing to be compared with, so no hash files are written for it either.
+    dedup_enabled = not args.no_dedup and len(all_targets) >= 2
+
     log.info("Extracting %s repos → %s", len(all_targets), run_dir)
     log.info(
         "This pass will process %s repos (clone_timeout=%ss clone_retries=%s workers=%s)",
@@ -3603,6 +3703,7 @@ def main() -> int:
                     clone_retries=args.clone_retries,
                     for_check_enabled=not args.no_for_check,
                     for_check_ref_mode=args.for_check_refs,
+                    commit_hashes_enabled=dedup_enabled,
                 ): t
                 for t in targets
             }
@@ -3627,6 +3728,13 @@ def main() -> int:
 
     rows = checkpoint.rows()
     apply_company_periods(rows)
+    if dedup_enabled:
+        dedup_manifest = run_commit_dedup(run_dir, rows, all_targets, log)
+    else:
+        # Values or a duplicates.csv left by an earlier run of this folder would describe a comparison that no longer applies.
+        commit_dedup.blank_rows(rows)
+        (run_dir / commit_dedup.DUPLICATES_FILE_NAME).unlink(missing_ok=True)
+        dedup_manifest = {"enabled": False}
     checkpoint.replace_rows(rows)
 
     summary_path = checkpoint.summary_path
@@ -3694,6 +3802,7 @@ def main() -> int:
         "error_classes": progress.get("error_classes") or {},
         "summary_csv": str(summary_path),
         "job_json": str(checkpoint.job_path),
+        "commit_dedup": dedup_manifest,
         "resumable": True,
         "clone_timeout_seconds": args.clone_timeout,
         "clone_retries": args.clone_retries,
@@ -3728,6 +3837,8 @@ def main() -> int:
             else {"enabled": False}
         ),
     }
+    if (run_dir / commit_dedup.DUPLICATES_FILE_NAME).is_file():
+        manifest["duplicates_csv"] = str(run_dir / commit_dedup.DUPLICATES_FILE_NAME)
     if args.offline:
         manifest["offline_field_sources"] = {
             "merged_prs": (

@@ -110,6 +110,7 @@ Useful when a security team asks what the token is actually allowed to touch. Al
 - **Retry failed repositories** — re-attempt timeout / network / rate-limit failures only
 - **Partial summary / archive download** — download `summary.csv` or a partial archive zip while a run is still in progress
 - **Download summary / archive zip** — browser downloads for the completed (or partial) run
+- **Compare commit hashes between repos (duplicate %)** — ticked by default; see [Duplicate commits](#duplicate-commits-duplicatescsv)
 
 ## Modes
 
@@ -190,8 +191,37 @@ Results are written to `./outputs/raw-extracts/` on your computer (mounted into 
 
 - `summary.csv` (+ `summary.xlsx` when `openpyxl` is installed)
 - `for-check.csv`, also the second sheet (`for-check`) of `summary.xlsx` — platform-side facts for the checker (see below)
-- metadata JSON under `api/` and `git/`
+- `duplicates.csv` — which repos of the run share commits (see [Duplicate commits](#duplicate-commits-duplicatescsv)); only when the comparison ran
+- metadata JSON under `api/` and `git/`, including `git/<org__repo>/commit_hashes.txt.gz` (commit hashes only)
 - a timestamped zip beside the run folder
+
+```
+summary.csv  duplicates.csv  for-check.csv  job.json  manifest.json  repos.json
+api/<org__repo>/    repo.json languages.json contributors.json merged_prs.json ...
+git/<org__repo>/    git_stats.json commits.jsonl scc.json ... commit_hashes.txt.gz
+logs/
+```
+
+### Duplicate commits (duplicates.csv)
+
+For one run, the tool compares the **commit hashes** of the repos it processed and reports, per repo, how much of its history also exists in at least one *other* repo of the run: a copy, a fork, a mirror, a repo split off another.
+
+- `commits(A)` is every hash reachable from any ref of repo A (`git rev-list --all`). It is complete: `EXTRACT_COMMIT_DETAIL_LIMIT` only trims `commits.jsonl`.
+- `summary.csv` gets three columns, appended after all existing ones:
+
+| Column | Meaning |
+|---|---|
+| `duplicate_pct` | 100 x commits of this repo that also exist in another repo of the run / commits of this repo, half-up to 1 decimal. `0.0` means compared and nothing shared |
+| `duplicate_commits` | the numerator: how many of this repo's commits exist in at least one other repo (a commit held by three repos is counted once) |
+| `duplicates_with` | the top 3 other repos as `name:pct_of_this_repo`, joined by `; `, by shared commits descending then name. `name` is the repo's full name as in `repos.json` |
+
+  The three are **blank** (unknown, never 0) for a repo with no commits, a repo whose hashes could not be collected (failed repo, `git rev-list` error or timeout, a SHA-256 repository), and for every repo when fewer than two repos have commits. They are blank while the run is in progress and are filled once, at the end.
+- `duplicates.csv` (run folder root, also in the zip): `repo_a,repo_b,shared_commits,pct_of_a,pct_of_b`, one row per unordered pair that shares at least one commit, sorted by `shared_commits` descending then `repo_a`, `repo_b` (`repo_a` sorts before `repo_b`). Header only when nothing is shared. A pair is two repos that share history; it does not say which one is the original.
+- One log line closes the comparison: `Duplicate commits: N of M repos share commits with another repo (duplicates.csv)` (M = repos with commits that were compared) or `Duplicate commits: none found`.
+- **On/off.** On by default when the run has 2 or more repos. `--no-dedup` (or unticking *Compare commit hashes between repos (duplicate %)* in the UI) skips it: no `duplicates.csv`, no hash files, and the three columns stay in `summary.csv` but blank, so the column layout never changes. On `--resume` the same flag clears values written by an earlier run.
+- **Resume.** The clone is deleted after each repo, so each repo's hashes are saved while it exists, in `git/<org__repo>/commit_hashes.txt.gz` (one 40-hex hash per line, sorted, gzip). The comparison runs once at the end over every repo of the run that has such a file, so `--resume` / `--retry-failed` produce the full result, not only the repos that were re-run. A repo that fails loses its hash file and is blank.
+- **Privacy.** `commit_hashes.txt.gz` holds hashes and nothing else: no messages, authors, paths or content (`test_no_source_in_archive.py` asserts every line is 40 lowercase hex characters). A hash is not secret, but it does let someone who already has a repository check whether it is a copy of yours.
+- **Limits and cost.** Memory is about 100 bytes per distinct commit hash across the whole run (an index of 20-byte keys), so 1M distinct commits is roughly 100 MB and 10M roughly 1 GB; the work is linear in the total number of commits, not quadratic in the number of repos. `rev-list --all` follows the existing `EXTRACT_GIT_LOG_TIMEOUT` and git hardening. Hosted-platform clones carry branches and tags, not PR/MR refs (`refs/pull/*`), so a commit that only exists in a PR is not counted. Two repos that independently made a commit with identical content, author, date and parent get the same hash and so count as sharing it. A corrupt `commit_hashes.txt.gz` makes the whole comparison fail: it is logged, the columns stay blank and `duplicates.csv` is not written.
 
 ### for-check.csv
 
@@ -239,7 +269,7 @@ archive cannot execute. `--github-host` / `--gitlab-host` must be a bare host (`
 ### Compatibility with Squirrel
 
 Squirrel (`stages.py`) reads `summary.csv` by header name (`loc`, `commits`, `merged_prs`) and passes `--no-for-check`.
-Neither changed: `summary.csv` columns are untouched and `--no-for-check` skips both `for-check.csv` and the xlsx sheet.
+Neither changed: existing `summary.csv` columns are untouched (the three duplicate columns are only appended at the end) and `--no-for-check` skips both `for-check.csv` and the xlsx sheet.
 `--no-for-check` and `--for-check-refs` exist only in profilers that include for-check; an older profiler rejects the
 flag (argparse "unrecognized arguments"), so pin Squirrel to a profiler version that has it.
 
@@ -272,6 +302,7 @@ python extract_org_raw_data.py --ui
 |------|---------|
 | `extract_org_raw_data.py` | CLI extractor |
 | `extract_ui.py` | Browser UI |
+| `commit_dedup.py` | Commit-hash comparison between repos: hash files, duplicate % columns, `duplicates.csv` |
 | `count_merged_prs.py` | GitHub/GitLab API helpers |
 | `for_check.py` | for-check.csv: platform-side counts/refs + summary.xlsx writer |
 | `github_app_auth.py` | GitHub App authentication |
