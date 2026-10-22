@@ -39,6 +39,7 @@ UI_LOG_LOCK = threading.Lock()
 # half-written (U2).
 ZIP_LOCK = threading.Lock()
 
+import for_check  # noqa: E402
 from extract_org_raw_data import (  # noqa: E402
     discover_local_repositories,
     list_bitbucket_repos_for_workspace,
@@ -286,7 +287,6 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
         or "bitbucket_token",
         "bitbucket_email_name": fields.get("bitbucket_email_name", ["bitbucket_email"])[0].strip(),
         "workers": fields.get("workers", ["4"])[0].strip() or "4",
-        "retry_failed": fields.get("retry_failed", [""])[0] == "on",
         "resume_run_dir": fields.get("resume_run_dir", [""])[0].strip(),
         "llm_enabled": llm_enabled,
         "selected_repos": "\n".join(selected),
@@ -526,19 +526,8 @@ def set_state(**updates: Any) -> None:
 
 
 def csv_to_xlsx(csv_path: Path) -> Path | None:
-    try:
-        import openpyxl
-    except ImportError:
-        return None
-    workbook = openpyxl.Workbook()
-    sheet = workbook.active
-    sheet.title = "summary"
-    with csv_path.open(newline="", encoding="utf-8") as handle:
-        for row in reader(handle):
-            sheet.append(row)
-    xlsx_path = csv_path.with_suffix(".xlsx")
-    workbook.save(xlsx_path)
-    return xlsx_path
+    """summary.xlsx with a "summary" sheet and, when for-check.csv sits beside it, a "for-check" sheet."""
+    return for_check.write_workbook(csv_path)
 
 
 def parse_manifest_from_log(log_lines: list[str]) -> dict[str, Any]:
@@ -901,8 +890,7 @@ __DOCKER_NOTICE__
     <label class="field">Resume previous run</label>
     <select name="resume_run_dir" id="resume-run-dir"><option value="">Start a new run</option></select>
     <div class="inline-actions"><button type="button" id="refresh-resumable" class="secondary">Refresh resumable runs</button></div>
-    <label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="retry-failed" type="checkbox" name="retry_failed"><strong>Retry failed repositories</strong><span class="small">Re-attempts timeout / network / rate-limit failures from the selected run.</span></label>
-    <p class="notice">Interrupted runs save progress after every repository. Pick a run above to continue from where it left off.</p>
+    <p class="notice">Interrupted runs save progress after every repository. Pick a run above to continue from where it left off. Repos that fail on a timeout or network error are retried automatically at the end of every run.</p>
   </div>
   <label class="choice" style="margin-top:18px;display:flex;align-items:center"><input id="llm-enabled" type="checkbox" name="llm_enabled"><strong>Enable LLM analysis</strong><span class="small">Adds codebase description, industry/domain, vibe-code signals, and repository type.</span></label>
   <div id="llm-fields" class="hidden"><label class="field">OpenAI API key<span class="req">*</span></label><input name="openai_key" type="password" autocomplete="off" placeholder="sk-..."><p id="offline-llm-warning" class="warning hidden">LLM mode requires an internet connection in offline mode.</p></div>
@@ -1227,7 +1215,6 @@ function readFormSettings(){
     bitbucket_email_name:data.get('bitbucket_email_name')||'',
     workers:data.get('workers')||'4',
     resume_run_dir:data.get('resume_run_dir')||'',
-    retry_failed:!!data.get('retry_failed'),
     llm_enabled:!!data.get('llm_enabled'),
     github_accessible:!!data.get('github_accessible'),
     gitlab_accessible:!!data.get('gitlab_accessible'),
@@ -1252,7 +1239,6 @@ function restoreFormSettings(settings){
   setValue('workers', settings.workers||'4');
   setValue('manual_repos', settings.manual_repos||'');
   document.querySelector('#llm-enabled').checked=!!settings.llm_enabled;
-  document.querySelector('#retry-failed').checked=!!settings.retry_failed;
   const accessible=document.querySelector('#github-accessible');
   if (accessible) accessible.checked=!!settings.github_accessible;
   const gitlabAccessible=document.querySelector('#gitlab-accessible');
@@ -1511,7 +1497,7 @@ async function refresh(){
     if (data.zip_path) parts.push('<strong>Archive zip:</strong> <code>'+data.zip_path+'</code>');
     if (data.run_dir) parts.push('<strong>Run folder:</strong> <code>'+data.run_dir+'</code>');
     if (data.host_output_hint) parts.push('<strong>Host folder:</strong> <code>'+data.host_output_hint+'</code>');
-    if (data.repos_failed>0) parts.push('Some repositories failed. Select this run under <strong>Resume previous run</strong> and enable <strong>Retry failed repositories</strong>.');
+    if (data.repos_failed>0) parts.push('Some repositories failed even after the automatic retry (not found, no permission, or still timing out). See <strong>failures.json</strong> in the support logs.');
     paths.innerHTML=parts.join('<br>');
     paths.classList.toggle('hidden', parts.length===0);
     const summaryLink=document.querySelector('#download-summary');
@@ -2013,7 +1999,6 @@ class Handler(BaseHTTPRequestHandler):
         selected_repos = merge_repo_selectors(selected_repos, manual_repos)
         workers = fields.get("workers", ["4"])[0].strip()
         resume_run_dir = fields.get("resume_run_dir", [""])[0].strip()
-        retry_failed = fields.get("retry_failed", [""])[0] == "on"
         try:
             workers_number = int(workers)
         except ValueError:
@@ -2021,13 +2006,6 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not 1 <= workers_number <= 20:
             self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Workers must be between 1 and 20.")
-            return
-        if retry_failed and not resume_run_dir:
-            self.respond(
-                HTTPStatus.BAD_REQUEST,
-                "text/plain",
-                "Select a previous run before enabling Retry failed repositories.",
-            )
             return
         if resume_run_dir:
             resume_path = Path(resume_run_dir)
@@ -2048,8 +2026,6 @@ class Handler(BaseHTTPRequestHandler):
         ]
         if resume_run_dir:
             command.extend(["--resume", resume_run_dir])
-            if retry_failed:
-                command.append("--retry-failed")
 
         # Secrets (pasted tokens, OpenAI key) travel to the child via the
         # environment only — never argv — so they stay out of logs and archives.

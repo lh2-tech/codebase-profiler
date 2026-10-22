@@ -52,6 +52,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from code_metrics import PR_FIELDS, STRUCTURE_FIELDS, pr_tier_metrics, structure_metrics
+import commit_dedup
+import for_check
 from count_merged_prs import (
     GITHUB_RATE_LIMIT_WAIT_SECONDS,
     github_api,
@@ -62,6 +64,7 @@ from count_merged_prs import (
     http_post_json,
     paginate_github,
     paginate_gitlab,
+    validate_host,
 )
 from github_app_auth import (
     DEFAULT_GITHUB_APP_ID,
@@ -80,6 +83,10 @@ BITBUCKET_API = "https://api.bitbucket.org/2.0"
 GITHUB_APP_TOKEN_KEY = "__github_app_installation_token__"
 DEFAULT_CLONE_TIMEOUT_SECONDS = 300
 DEFAULT_CLONE_RETRIES = 2
+# One last, longer clone try once every normal attempt has timed out or hit a network error; 0 turns it off.
+DEFAULT_CLONE_EXTENDED_TIMEOUT_SECONDS = 1200
+# Extra whole-pipeline passes at the end of a run over repos that failed with a retryable error.
+DEFAULT_END_RETRY_PASSES = 1
 
 # ── large-repo cost controls ────────────────────────────────────────────────
 # The per-commit file-churn export (commits.jsonl) is the single most expensive
@@ -106,6 +113,13 @@ SCC_TIMEOUT_SECONDS = _env_int("EXTRACT_SCC_TIMEOUT", 600)
 # platform default (which is often a stale README-only stub while the work
 # lives on develop/staging). EXTRACT_USE_DEFAULT_BRANCH=1 restores the old behaviour.
 USE_DEFAULT_BRANCH = os.environ.get("EXTRACT_USE_DEFAULT_BRANCH", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+# --local-repos-dir runs measure whatever is checked out. Moving HEAD of someone's own working copy would be intrusive, so the
+# same newest-branch rule applies to local repos only when asked (Squirrel measures its own throwaway clones and sets this).
+LOCAL_LATEST_BRANCH = os.environ.get("EXTRACT_LOCAL_LATEST_BRANCH", "").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -196,6 +210,8 @@ query MergedPRs($owner: String!, $name: String!, $cursor: String, $pageSize: Int
 
 SUMMARY_FIELDS = [
     "org",
+    # GitLab: the path between the group and the repo ("a/b"). Bitbucket: the project name. Blank on GitHub.
+    "subgroup",
     "project_name",
     "repo",
     "merged_prs",
@@ -233,6 +249,8 @@ SUMMARY_FIELDS = [
     "llm_analysis_error",
     "error",
     "error_class",
+    # Filled once at the end of the run (see run_commit_dedup); blank while it is in progress.
+    *commit_dedup.DEDUP_FIELDS,
 ]
 
 TEST_DIR_HINTS = ("test", "tests", "spec", "specs", "__tests__")
@@ -532,6 +550,10 @@ def log_runtime_diagnostics(log: logging.Logger, args: argparse.Namespace) -> No
     log.info("workers=%s", args.workers)
     log.info("clone_timeout=%s", getattr(args, "clone_timeout", DEFAULT_CLONE_TIMEOUT_SECONDS))
     log.info("clone_retries=%s", getattr(args, "clone_retries", DEFAULT_CLONE_RETRIES))
+    log.info(
+        "clone_extended_timeout=%s", getattr(args, "clone_extended_timeout", DEFAULT_CLONE_EXTENDED_TIMEOUT_SECONDS)
+    )
+    log.info("end_retry_passes=%s", getattr(args, "end_retry_passes", DEFAULT_END_RETRY_PASSES))
     log.info("github_rate_limit_wait_seconds=%s", GITHUB_RATE_LIMIT_WAIT_SECONDS)
     log.info("resume=%s", getattr(args, "resume", None))
     log.info("offline=%s", bool(args.offline))
@@ -620,8 +642,31 @@ def is_retryable_error_class(error_class: str) -> bool:
     return error_class in RETRYABLE_ERROR_CLASSES
 
 
-def repo_row_key(org: str, repo: str) -> str:
-    return f"{org}/{repo}".strip("/")
+def repo_row_key(org: str, repo: str, subgroup: str = "") -> str:
+    """Identity of a summary row. The subgroup is part of it: two GitLab subgroups can hold a repo of the same name."""
+    return "/".join(part for part in (org, subgroup, repo) if part).strip("/")
+
+
+def target_subgroup(target: "RepoTarget") -> str:
+    if target.platform == "gitlab":
+        return "/".join(target.full_name.strip("/").split("/")[1:-1])
+    if target.platform == "bitbucket":
+        project = (target.meta or {}).get("project")
+        if isinstance(project, dict):
+            return str(project.get("name") or project.get("key") or "")
+    return ""
+
+
+def target_row_key(target: "RepoTarget") -> str:
+    return repo_row_key(target.org, target.full_name.split("/")[-1], target_subgroup(target))
+
+
+def row_key(row: dict[str, Any]) -> str:
+    return repo_row_key(str(row.get("org") or ""), str(row.get("repo") or ""), str(row.get("subgroup") or ""))
+
+
+def _row_sort_key(row: dict[str, Any]) -> tuple[str, str, str]:
+    return (str(row.get("org")), str(row.get("subgroup") or ""), str(row.get("repo")))
 
 
 @dataclass
@@ -670,8 +715,10 @@ class JobCheckpoint:
                     repo = str(row.get("repo") or "")
                     if not org or not repo:
                         continue
-                    key = repo_row_key(org, repo)
+                    key = row_key(row)
                     job.rows_by_key[key] = dict(row)
+                    # The percentages describe the whole run, which is about to change: never show the old ones.
+                    commit_dedup.blank_rows([job.rows_by_key[key]])
                     if key not in job.status_by_key:
                         error = str(row.get("error") or "").strip()
                         error_class = str(row.get("error_class") or "").strip()
@@ -703,8 +750,8 @@ class JobCheckpoint:
             failed.add(key)
         return failed
 
-    def record(self, full_name: str, row: dict[str, Any]) -> None:
-        key = full_name.strip("/")
+    def record(self, row: dict[str, Any]) -> None:
+        key = row_key(row)
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         error = str(row.get("error") or "").strip()
         error_class = str(row.get("error_class") or "").strip()
@@ -723,7 +770,7 @@ class JobCheckpoint:
     def rows(self) -> list[dict[str, Any]]:
         with self._lock:
             values = list(self.rows_by_key.values())
-        values.sort(key=lambda r: (str(r.get("org")), str(r.get("repo"))))
+        values.sort(key=_row_sort_key)
         return values
 
     def persist(self) -> None:
@@ -738,7 +785,7 @@ class JobCheckpoint:
         with self._lock:
             self.rows_by_key = {}
             for row in rows:
-                key = repo_row_key(str(row.get("org") or ""), str(row.get("repo") or ""))
+                key = row_key(row)
                 if key:
                     self.rows_by_key[key] = dict(row)
             self.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -787,7 +834,7 @@ class JobCheckpoint:
 
     def _write_summary_unlocked(self) -> None:
         rows = list(self.rows_by_key.values())
-        rows.sort(key=lambda r: (str(r.get("org")), str(r.get("repo"))))
+        rows.sort(key=_row_sort_key)
         with self.summary_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
             writer.writeheader()
@@ -1113,6 +1160,28 @@ def fetch_bitbucket_merged_prs(
 # ── git / scc ───────────────────────────────────────────────────────────────
 
 
+# A client repo (local archive or fresh clone) is untrusted input: a shipped
+# .git/hooks/post-checkout or core.fsmonitor in its config would run code on our host.
+GIT_HARDEN_ARGS = (
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.fsmonitor=",
+    "-c", "core.pager=cat",
+    "-c", "core.askPass=",
+    "-c", "safe.directory=*",
+)
+
+
+def git_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    return {
+        **os.environ,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_PAGER": "cat",
+        "GIT_ASKPASS": "",
+        **(extra or {}),
+    }
+
+
 def run_git(
     repo: Path,
     *args: str,
@@ -1125,17 +1194,11 @@ def run_git(
     Docker when UID/GID ownership does not match the container user.
     """
     proc = subprocess.run(
-        [
-            "git",
-            "-c",
-            "safe.directory=*",
-            "-C",
-            str(repo),
-            *args,
-        ],
+        ["git", *GIT_HARDEN_ARGS, "-C", str(repo), *args],
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=git_env(),
     )
     if proc.returncode != 0:
         if log is not None:
@@ -1148,19 +1211,11 @@ def run_git(
 def probe_local_git(repo: Path, log: logging.Logger) -> bool:
     """Return True when git history is readable; log a clear warning otherwise."""
     proc = subprocess.run(
-        [
-            "git",
-            "-c",
-            "safe.directory=*",
-            "-C",
-            str(repo),
-            "rev-list",
-            "--count",
-            "HEAD",
-        ],
+        ["git", *GIT_HARDEN_ARGS, "-C", str(repo), "rev-list", "--count", "HEAD"],
         capture_output=True,
         text=True,
         timeout=60,
+        env=git_env(),
     )
     if proc.returncode == 0 and proc.stdout.strip().isdigit():
         return True
@@ -1182,49 +1237,68 @@ def clone_repo(
     timeout: int = DEFAULT_CLONE_TIMEOUT_SECONDS,
     retries: int = DEFAULT_CLONE_RETRIES,
     log: logging.Logger | None = None,
+    extended_timeout: int = DEFAULT_CLONE_EXTENDED_TIMEOUT_SECONDS,
 ) -> None:
-    """Clone with a short timeout and a few retries, then move on to the next repo."""
+    """Clone with a short timeout and a few retries. When the last of those fails on a timeout or network error,
+    one more try runs with ``extended_timeout``; if that fails too the error is raised and the run moves on."""
     attempts = max(1, retries + 1)
-    last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
+    attempt = 0
+    attempt_timeout = timeout
+    extended_used = False
+    while True:
+        attempt += 1
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+        env = git_env({"GIT_LFS_SKIP_SMUDGE": "1"})
+        timed_out: subprocess.TimeoutExpired | None = None
         try:
             proc = subprocess.run(
-                ["git", "clone", "--recurse-submodules=0", url, str(dest)],
+                ["git", *GIT_HARDEN_ARGS, "clone", "--recurse-submodules=0", url, str(dest)],
                 capture_output=True,
                 text=True,
-                timeout=timeout,
+                timeout=attempt_timeout,
                 env=env,
             )
         except subprocess.TimeoutExpired as exc:
+            timed_out = exc
+        if timed_out is None and proc.returncode == 0:
+            return
+        if timed_out is not None:
             shutil.rmtree(dest, ignore_errors=True)
             last_error = RuntimeError(
-                f"clone timed out after {timeout}s (attempt {attempt}/{attempts})"
+                f"clone timed out after {attempt_timeout}s (attempt {attempt}/{attempts + int(extended_used)})"
             )
-            if log is not None:
-                log.warning("%s", last_error)
-            if attempt >= attempts:
-                raise last_error from exc
-            time.sleep(min(2**attempt, 20))
-            continue
-        if proc.returncode == 0:
-            return
-        detail = proc.stderr or proc.stdout or "clone failed"
-        detail = CLONE_CREDENTIAL_RE.sub(r"\1***:***@", detail)
-        try:
-            shutil.rmtree(dest)
-        except OSError as exc:
-            # Log cleanup failure but don't suppress - will be caught in process_repo()
-            log.warning("Cleanup failed after clone error (disk may be full): %s", exc)
-        last_error = RuntimeError(detail[-800:])
+        else:
+            detail = proc.stderr or proc.stdout or "clone failed"
+            detail = CLONE_CREDENTIAL_RE.sub(r"\1***:***@", detail)
+            try:
+                shutil.rmtree(dest)
+            except FileNotFoundError:
+                pass  # git already removed the half-made directory
+            except OSError as exc:
+                # Not fatal here: process_repo() reports a leftover clone dir if the disk really is full.
+                if log is not None:
+                    log.warning("Cleanup failed after clone error (disk may be full): %s", exc)
+            last_error = RuntimeError(detail[-800:])
         error_class = classify_error(last_error)
         # Auth / not-found will not improve with retries.
-        if error_class in {"auth", "not_found", "disk_full"} or attempt >= attempts:
-            raise last_error
-        if log is not None:
+        if error_class in {"auth", "not_found", "disk_full"}:
+            raise last_error from timed_out
+        if attempt >= attempts:
+            if extended_used or extended_timeout <= 0 or not is_retryable_error_class(error_class):
+                raise last_error from timed_out
+            extended_used = True
+            attempt_timeout = extended_timeout
+            if log is not None:
+                log.warning(
+                    "clone failed %s times (%s); one last try with a %ss timeout: %s",
+                    attempts,
+                    error_class,
+                    extended_timeout,
+                    str(last_error)[:200],
+                )
+        elif log is not None:
             log.warning(
                 "clone failed (%s) attempt %s/%s; retrying: %s",
                 error_class,
@@ -1233,8 +1307,6 @@ def clone_repo(
                 str(last_error)[:200],
             )
         time.sleep(min(2**attempt, 20))
-    assert last_error is not None
-    raise last_error
 
 
 def github_clone_url(full_name: str, token: str, host: str) -> str:
@@ -1254,8 +1326,52 @@ def bitbucket_clone_url(full_name: str, token: str) -> str:
     return f"https://x-token-auth:{token}@bitbucket.org/{full_name}.git"
 
 
+def client_branch_for(repo: Path) -> str:
+    """The branch the client's summary names for this local repo: EXTRACT_LOCAL_BRANCH_MAP is a JSON file {repo dir name: branch}
+    (names case-insensitive). Unreadable or malformed files are ignored."""
+    path = os.environ.get("EXTRACT_LOCAL_BRANCH_MAP", "").strip()
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    want = {str(k).lower(): v for k, v in data.items() if isinstance(v, str)}.get(repo.name.lower(), "")
+    return want.strip()
+
+
+def checkout_client_branch(repo: Path, branch: str, log: logging.Logger | None = None) -> str:
+    """Check out the client's branch if this repo has it (own branch, else origin's); return its name, "" if it cannot."""
+    for ref, args in (
+        (f"refs/heads/{branch}", [branch]),
+        (f"refs/remotes/origin/{branch}", ["-B", branch, f"origin/{branch}"]),
+    ):
+        try:
+            run_git(repo, "show-ref", "--verify", "--quiet", ref)
+        except Exception:  # noqa: BLE001 - that ref does not exist here
+            continue
+        proc = subprocess.run(
+            ["git", *GIT_HARDEN_ARGS, "-C", str(repo), "checkout", "-q", *args],
+            capture_output=True,
+            text=True,
+            timeout=GIT_LOG_TIMEOUT_SECONDS,
+            env=git_env({"GIT_LFS_SKIP_SMUDGE": "1"}),
+        )
+        if proc.returncode == 0:
+            if log is not None:
+                log.info("measuring the client's branch %s", branch)
+            return branch
+        if log is not None:
+            log.warning("could not check out the client's branch %s: %s", branch, (proc.stderr or "")[-200:])
+        return ""
+    return ""
+
+
 def select_latest_branch(
-    repo: Path, default_branch: str = "", log: logging.Logger | None = None
+    repo: Path, default_branch: str = "", log: logging.Logger | None = None, local: bool = False
 ) -> str:
     """Check out the remote branch with the newest commit; return its name.
 
@@ -1264,6 +1380,9 @@ def select_latest_branch(
     author stats are all read from HEAD, so moving HEAD fixes them together.
     Ties go to the default branch. Returns "" if nothing could be selected, in
     which case HEAD is left untouched.
+
+    `local`: a --local-repos-dir repo. A clone of an export has refs/remotes/origin/* and is handled as above; a repo with no
+    remote-tracking refs falls back to its own branches (refs/heads/*).
     """
     prefix = "refs/remotes/origin/"
     try:
@@ -1274,6 +1393,15 @@ def select_latest_branch(
             "--format=%(refname)\t%(committerdate:unix)",
             prefix,
         )
+        if local and not out.strip():
+            prefix = "refs/heads/"
+            out = run_git(
+                repo,
+                "for-each-ref",
+                "--sort=-committerdate",
+                "--format=%(refname)\t%(committerdate:unix)",
+                prefix,
+            )
     except Exception as exc:  # noqa: BLE001 - never fail a repo over branch choice
         if log is not None:
             log.warning("branch selection skipped (for-each-ref failed): %s", exc)
@@ -1297,12 +1425,12 @@ def select_latest_branch(
     if chosen != current:
         try:
             proc = subprocess.run(
-                ["git", "-c", "safe.directory=*", "-C", str(repo), "checkout", "-q",
-                 "-B", chosen, f"origin/{chosen}"],
+                ["git", *GIT_HARDEN_ARGS, "-C", str(repo), "checkout", "-q",
+                 *(["-B", chosen, f"origin/{chosen}"] if prefix.startswith("refs/remotes/") else [chosen])],
                 capture_output=True,
                 text=True,
                 timeout=GIT_LOG_TIMEOUT_SECONDS,
-                env={**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"},
+                env=git_env({"GIT_LFS_SKIP_SMUDGE": "1"}),
             )
             if proc.returncode != 0:
                 raise RuntimeError((proc.stderr or proc.stdout or "checkout failed")[-300:])
@@ -2353,11 +2481,12 @@ def filter_local_targets(
 # ── per-repo orchestration ──────────────────────────────────────────────────
 
 
-def empty_summary_row(org: str, repo: str) -> dict[str, Any]:
+def empty_summary_row(org: str, repo: str, subgroup: str = "") -> dict[str, Any]:
     row: dict[str, Any] = {k: "" for k in SUMMARY_FIELDS}
     row.update(
         {
             "org": org,
+            "subgroup": subgroup,
             "project_name": org,
             "repo": repo,
             "merged_prs": 0,
@@ -2374,6 +2503,119 @@ def empty_summary_row(org: str, repo: str) -> dict[str, Any]:
         }
     )
     return row
+
+
+def _for_check_snapshot(
+    target: RepoTarget,
+    tokens: dict[str, str],
+    github_token_name: str,
+    gitlab_token_name: str,
+    bitbucket_token_name: str,
+    github_token_fn: Callable[[], str] | None,
+    github_host: str,
+    gitlab_host: str,
+    *,
+    bitbucket_email_name: str = DEFAULT_BITBUCKET_EMAIL_NAME,
+    light: bool = False,
+    ref_mode: str = for_check.DEFAULT_REF_MODE,
+) -> dict[str, Any]:
+    """Platform-side counts/refs for for-check.csv. Never raises: failures become error rows."""
+    if target.platform == "local":
+        return for_check.skipped("local clone: no platform source, platform facts not collected")
+    try:
+        if target.platform == "github":
+            token = github_token_fn() if github_token_fn else tokens[github_token_name]
+            host = github_host
+        elif target.platform == "gitlab":
+            token = tokens[gitlab_token_name]
+            host = gitlab_host
+        else:
+            token = tokens[bitbucket_token_name]
+            host = "bitbucket.org"
+        return for_check.snapshot(
+            target.platform, target.full_name, token=token, host=host,
+            project_id=target.meta.get("id") if target.platform == "gitlab" else None,
+            email=tokens.get(bitbucket_email_name, "") if target.platform == "bitbucket" else "",
+            light=light, ref_mode=ref_mode,
+        )
+    except Exception as exc:
+        return for_check.unavailable(f"snapshot: {type(exc).__name__}: {exc}"[:300])
+
+
+def collect_commit_hashes(clone_path: Path, dest: Path, log: logging.Logger) -> int | None:
+    """Write every commit hash reachable from any ref of the repo to ``dest`` (sorted, gzip). Hashes only.
+
+    Returns the number of commits, or None when they could not be listed. A failure never fails the repo: it is
+    logged and the repo simply has no hash file, so its duplicate columns stay blank (unknown, not 0).
+    Uses its own subprocess call rather than run_git(), which returns "" on failure and so cannot tell an empty
+    repo from a broken one.
+    """
+    dest.unlink(missing_ok=True)  # a stale list from an earlier attempt must not outlive a failure here
+    try:
+        proc = subprocess.run(
+            ["git", *GIT_HARDEN_ARGS, "-C", str(clone_path), "rev-list", "--all"],
+            capture_output=True,
+            text=True,
+            timeout=GIT_LOG_TIMEOUT_SECONDS,
+            env=git_env(),
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "git failed").strip()[:300]
+            raise RuntimeError(f"git rev-list --all failed: {detail}")
+        return commit_dedup.write_hash_file(dest, proc.stdout.split())
+    except (subprocess.TimeoutExpired, OSError, RuntimeError, ValueError) as exc:
+        # ValueError: a hash that is not 40-hex (a SHA-256 repository); never compared rather than compared wrongly.
+        log.warning("Commit hashes not collected for %s (duplicate columns stay blank): %s", clone_path.name, exc)
+        dest.unlink(missing_ok=True)
+        return None
+
+
+def run_commit_dedup(
+    run_dir: Path,
+    rows: list[dict[str, Any]],
+    targets: list[RepoTarget],
+    log: logging.Logger,
+) -> dict[str, Any]:
+    """Compare commit hashes over every repo of the run that has a hash file, fill the three summary columns in
+    ``rows`` and write duplicates.csv. Reading the files (not the clones) is what makes a resumed run complete.
+    Never raises: on failure the columns stay blank and the problem is logged."""
+    commit_dedup.blank_rows(rows)
+    names_by_slug: dict[str, str] = {}
+    name_by_row: dict[str, str] = {}
+    failed_rows = {row_key(r) for r in rows if r.get("error")}
+    for target in targets:
+        row_id = target_row_key(target)
+        if row_id in failed_rows:
+            continue  # a failed repo is unknown, even if an earlier attempt left a hash file
+        names_by_slug[safe_name(target.full_name.replace("/", "__"))] = target.full_name
+        name_by_row[row_id] = target.full_name
+    try:
+        result = commit_dedup.compute(commit_dedup.hash_sources(run_dir, names_by_slug))
+        commit_dedup.apply_to_rows(
+            rows, result, lambda row: name_by_row.get(row_key(row))
+        )
+        commit_dedup.write_duplicates_csv(run_dir / commit_dedup.DUPLICATES_FILE_NAME, result.pairs)
+    except Exception:  # noqa: BLE001 - the comparison is an extra; it must not cost the run its other results
+        log.exception("Duplicate commits: comparison failed, the duplicate columns are blank")
+        commit_dedup.blank_rows(rows)
+        (run_dir / commit_dedup.DUPLICATES_FILE_NAME).unlink(missing_ok=True)
+        return {"enabled": False, "error": True}
+    if result.repos_compared < 2:
+        log.info("Duplicate commits: not compared (fewer than 2 repos with commit hashes)")
+    elif result.repos_sharing:
+        log.info(
+            "Duplicate commits: %s of %s repos share commits with another repo (%s)",
+            result.repos_sharing,
+            result.repos_compared,
+            commit_dedup.DUPLICATES_FILE_NAME,
+        )
+    else:
+        log.info("Duplicate commits: none found")
+    return {
+        "enabled": True,
+        "repos_compared": result.repos_compared,
+        "repos_sharing_commits": result.repos_sharing,
+    }
 
 
 def process_repo(
@@ -2393,6 +2635,10 @@ def process_repo(
     log: logging.Logger,
     clone_timeout: int = DEFAULT_CLONE_TIMEOUT_SECONDS,
     clone_retries: int = DEFAULT_CLONE_RETRIES,
+    clone_extended_timeout: int = DEFAULT_CLONE_EXTENDED_TIMEOUT_SECONDS,
+    for_check_enabled: bool = True,
+    for_check_ref_mode: str = for_check.DEFAULT_REF_MODE,
+    commit_hashes_enabled: bool = True,
 ) -> dict[str, Any]:
     org = target.org
     repo = target.full_name.split("/")[-1]
@@ -2402,14 +2648,33 @@ def process_repo(
     api_dir.mkdir(parents=True, exist_ok=True)
     git_dir.mkdir(parents=True, exist_ok=True)
 
-    row = empty_summary_row(org, repo)
+    row = empty_summary_row(org, repo, target_subgroup(target))
     meta = target.meta
     if target.platform != "local":
         write_json(api_dir / "repo.json", meta)
     clone_path = target.local_path or clones_dir / slug
+    hashes_path = commit_dedup.hash_file_path(run_dir, slug)
+    if commit_hashes_enabled:
+        # A re-run repo must not keep an old list: it is rewritten below or the repo stays unknown.
+        hashes_path.unlink(missing_ok=True)
     # PR-tier percentages exist only when the platform API supplied PR detail;
     # git-history and local runs leave them blank rather than guessing.
     pr_tiers: tuple[dict[str, Any], list[dict[str, Any]]] | None = None
+    # for-check needs to know which merged_prs count the checker is looking at: the platform API, or the
+    # merge/squash markers recovered from git history (which undercount squash-and-rebase workflows).
+    merged_source = "git" if target.platform == "local" else "api"
+    commits_default_branch: Any = ""
+
+    fc_started = for_check.now()
+    fc_before = (
+        _for_check_snapshot(
+            target, tokens, github_token_name, gitlab_token_name, bitbucket_token_name,
+            github_token_fn, github_host, gitlab_host, light=True, ref_mode=for_check_ref_mode,
+            bitbucket_email_name=bitbucket_email_name,
+        )
+        if for_check_enabled
+        else None
+    )
 
     try:
         if target.platform == "github":
@@ -2494,6 +2759,7 @@ def process_repo(
                 timeout=clone_timeout,
                 retries=clone_retries,
                 log=log,
+                extended_timeout=clone_extended_timeout,
             )
 
         if target.platform != "local":
@@ -2504,11 +2770,37 @@ def process_repo(
                 or row["default_branch"]
             )
         else:
-            row["measured_branch"] = row["default_branch"]
+            wanted = client_branch_for(clone_path)
+            client_pick = checkout_client_branch(clone_path, wanted, log) if wanted else ""
+            row["measured_branch"] = client_pick or (
+                select_latest_branch(clone_path, row["default_branch"], log, local=True) or row["default_branch"]
+                if LOCAL_LATEST_BRANCH and not USE_DEFAULT_BRANCH
+                else row["default_branch"]
+            )
 
         git_stats = aggregate_git_stats(clone_path)
         write_json(git_dir / "git_stats.json", git_stats)
         row["total_commits"] = git_stats["total_commits"]
+        if target.platform == "local":
+            commits_default_branch = git_stats["total_commits"]
+            if row["measured_branch"] != row["default_branch"]:
+                # the default branch's own history, so the checker can still compare like with like
+                commits_default_branch = ""
+                for ref in (f"refs/heads/{row['default_branch']}", f"refs/remotes/origin/{row['default_branch']}"):
+                    try:
+                        counted = run_git(clone_path, "rev-list", "--count", ref).strip()
+                    except Exception:  # noqa: BLE001 - that ref does not exist in this clone
+                        continue
+                    if counted.isdigit():
+                        commits_default_branch = int(counted)
+                        break
+        elif row["default_branch"]:
+            # counts_*.commits is the platform's default-branch history, while total_commits is the measured
+            # branch: this is the same-basis number for the checker to compare against.
+            counted = run_git(
+                clone_path, "rev-list", "--count", f"refs/remotes/origin/{row['default_branch']}"
+            ).strip()
+            commits_default_branch = int(counted) if counted.isdigit() else ""
         row["first_commit"] = git_stats["first_commit"] or ""
         row["last_commit_date"] = git_stats["last_commit"] or ""
         row["span_days"] = (
@@ -2527,6 +2819,10 @@ def process_repo(
             total_commits=git_stats.get("total_commits"),
             log=log,
         )
+
+        if commit_hashes_enabled:
+            # Complete (not capped like commits.jsonl) and taken while the clone still exists.
+            collect_commit_hashes(clone_path, hashes_path, log)
 
         scc = run_scc(clone_path)
         write_json(git_dir / "scc.json", scc)
@@ -2556,6 +2852,7 @@ def process_repo(
             detected_prs = detect_merged_prs_from_git(clone_path)
             write_json(git_dir / "merged_prs_detected_from_git.json", detected_prs)
             row["merged_prs"] = len(detected_prs)
+            merged_source = "git"
 
         row["project_name"] = org
         row["total_files"] = count_total_files(clone_path)
@@ -2609,6 +2906,7 @@ def process_repo(
     except Exception as exc:
         row["error"] = str(exc)[:500]
         row["error_class"] = classify_error(exc)
+        hashes_path.unlink(missing_ok=True)  # a failed repo is unknown, not a repo with a partial history
         log.exception(
             "FAIL %s [%s]: %s",
             target.full_name,
@@ -2640,6 +2938,36 @@ def process_repo(
                     target.full_name,
                     exc,
                 )
+
+    if fc_before is not None:
+        fc_after = _for_check_snapshot(
+            target, tokens, github_token_name, gitlab_token_name, bitbucket_token_name,
+            github_token_fn, github_host, gitlab_host, ref_mode=for_check_ref_mode,
+            bitbucket_email_name=bitbucket_email_name,
+        )
+        for_check.save_repo(
+            api_dir,
+            platform=target.platform,
+            host={"github": github_host, "gitlab": gitlab_host, "bitbucket": "bitbucket.org"}.get(
+                target.platform, ""
+            ),
+            started_at=fc_started,
+            before=fc_before,
+            after=fc_after,
+            captured={
+                "repo": target.full_name,
+                "commits": row.get("total_commits", ""),
+                "measured_branch": row.get("measured_branch", ""),
+                "commits_default_branch": commits_default_branch,
+                "merged_prs": row.get("merged_prs", ""),
+                "merged_prs_source": merged_source,
+                "contributors": row.get("contributor_count", ""),
+                "default_branch": row.get("default_branch", ""),
+                "size_kb": row.get("size_kb", ""),
+                "extract_error": row.get("error", ""),
+            },
+            log=log,
+        )
 
     return row
 
@@ -2719,7 +3047,7 @@ def filter_targets_for_resume(
     skipped_ok = 0
     skipped_failed = 0
     for target in targets:
-        key = target.full_name.strip("/")
+        key = target_row_key(target)
         if key in ok_keys:
             skipped_ok += 1
             continue
@@ -2731,6 +3059,76 @@ def filter_targets_for_resume(
             continue
         to_process.append(target)
     return to_process, skipped_ok, skipped_failed
+
+
+def retryable_failed_targets(targets: list[RepoTarget], checkpoint: JobCheckpoint) -> list[RepoTarget]:
+    """Targets whose latest result failed on a timeout / network / rate-limit error. Not-found, auth and the like
+    would fail the same way again, so they stay failed."""
+    failed = checkpoint.failed_keys(retryable_only=True)
+    return [target for target in targets if target_row_key(target) in failed]
+
+
+def run_pass(
+    targets: list[RepoTarget],
+    checkpoint: JobCheckpoint,
+    *,
+    workers: int,
+    log: logging.Logger,
+    process_kwargs: dict[str, Any],
+    label: str = "",
+) -> None:
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(process_repo, target, **process_kwargs): target for target in targets}
+        for fut in as_completed(futures):
+            target = futures[fut]
+            try:
+                row = fut.result()
+            except Exception as exc:
+                log.exception("Worker crashed while collecting a repository result")
+                row = empty_summary_row(target.org, target.full_name.split("/")[-1], target_subgroup(target))
+                row["error"] = f"worker crash: {exc}"[:500]
+                row["error_class"] = classify_error(exc)
+            checkpoint.record(row)
+            progress = checkpoint.progress_snapshot()
+            log.info(
+                "%sProgress %s/%s ok=%s failed=%s",
+                label,
+                progress["done"],
+                progress["total"],
+                progress["ok"],
+                progress["failed"],
+            )
+
+
+def run_passes(
+    targets: list[RepoTarget],
+    checkpoint: JobCheckpoint,
+    *,
+    workers: int,
+    retry_passes: int,
+    log: logging.Logger,
+    process_kwargs: dict[str, Any],
+    retry_pool: list[RepoTarget] | None = None,
+) -> None:
+    """Process ``targets``, then re-process the repos that failed on a retryable error, up to ``retry_passes`` times.
+    The run is only finished once those retries are in. ``retry_pool`` is every target of the run (default: ``targets``),
+    so failures kept from an earlier, resumed pass of the same run are retried as well."""
+    if targets:
+        run_pass(targets, checkpoint, workers=workers, log=log, process_kwargs=process_kwargs)
+    pool = targets if retry_pool is None else retry_pool
+    for number in range(1, max(0, retry_passes) + 1):
+        again = retryable_failed_targets(pool, checkpoint)
+        if not again:
+            return
+        log.info("Retry pass %s/%s: %s repos failed on a timeout or network error", number, retry_passes, len(again))
+        run_pass(
+            again,
+            checkpoint,
+            workers=workers,
+            log=log,
+            process_kwargs=process_kwargs,
+            label=f"Retry {number}/{retry_passes} ",
+        )
 
 
 def resolve_github_token(
@@ -3007,6 +3405,24 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--clone-extended-timeout",
+        type=int,
+        default=DEFAULT_CLONE_EXTENDED_TIMEOUT_SECONDS,
+        help=(
+            "Seconds for one last clone try after the normal attempts timed out or hit a network error "
+            f"(default: {DEFAULT_CLONE_EXTENDED_TIMEOUT_SECONDS}; 0 disables it)."
+        ),
+    )
+    parser.add_argument(
+        "--end-retry-passes",
+        type=int,
+        default=DEFAULT_END_RETRY_PASSES,
+        help=(
+            "Passes at the end of the run that re-process repos which failed on a timeout, network or rate-limit "
+            f"error (default: {DEFAULT_END_RETRY_PASSES}; 0 disables). Not-found and permission failures are never retried."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         type=Path,
         default=None,
@@ -3087,6 +3503,24 @@ def main() -> int:
         help="Offline mode only: include matching local repo folder names (repeatable)",
     )
     parser.add_argument(
+        "--no-for-check",
+        action="store_true",
+        help="Skip for-check.csv (platform-side counts/refs recorded before and after each repo)",
+    )
+    parser.add_argument(
+        "--for-check-refs",
+        choices=for_check.REF_MODES,
+        default=for_check.DEFAULT_REF_MODE,
+        help="Branch/tag names in for-check.csv: 'hash' (default; sha and ref type kept, name replaced by a "
+        "digest), 'names' (verbatim; may expose client names or ticket ids) or 'none' (no ref rows)",
+    )
+    parser.add_argument(
+        "--no-dedup",
+        action="store_true",
+        help="Skip the commit-hash comparison between repos (duplicate_pct / duplicate_commits / duplicates_with "
+        "in summary.csv, duplicates.csv, git/<repo>/commit_hashes.txt.gz). On by default when the run has 2+ repos",
+    )
+    parser.add_argument(
         "--offline",
         action="store_true",
         help="Analyze --local-repos-dir only; make no network/API requests",
@@ -3159,12 +3593,22 @@ def main() -> int:
         serve(host=args.ui_host, port=args.ui_port)
         return 0
 
+    try:
+        args.github_host = validate_host(args.github_host, name="--github-host")
+        args.gitlab_host = validate_host(args.gitlab_host, name="--gitlab-host", allow_scheme=True)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+
     if args.retry_failed and not args.resume:
         raise SystemExit("--retry-failed requires --resume")
     if args.clone_timeout < 30:
         raise SystemExit("--clone-timeout must be at least 30 seconds")
     if args.clone_retries < 0:
         raise SystemExit("--clone-retries must be >= 0")
+    if args.clone_extended_timeout < 0:
+        raise SystemExit("--clone-extended-timeout must be >= 0")
+    if args.end_retry_passes < 0:
+        raise SystemExit("--end-retry-passes must be >= 0")
 
     resume_dir: Path | None = None
     resumed_targets: list[RepoTarget] | None = None
@@ -3340,12 +3784,16 @@ def main() -> int:
             bool(args.retry_failed),
         )
 
+    # One repo has nothing to be compared with, so no hash files are written for it either.
+    dedup_enabled = not args.no_dedup and len(all_targets) >= 2
+
     log.info("Extracting %s repos → %s", len(all_targets), run_dir)
     log.info(
-        "This pass will process %s repos (clone_timeout=%ss clone_retries=%s workers=%s)",
+        "This pass will process %s repos (clone_timeout=%ss clone_retries=%s extended=%ss workers=%s)",
         len(targets),
         args.clone_timeout,
         args.clone_retries,
+        args.clone_extended_timeout,
         args.workers,
     )
     log_runtime_diagnostics(log, args)
@@ -3379,56 +3827,59 @@ def main() -> int:
 
     if not targets:
         log.info("Nothing left to process; refreshing final artifacts from checkpoint")
-    else:
-        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-            futures = {
-                pool.submit(
-                    process_repo,
-                    t,
-                    tokens=tokens,
-                    github_token_name=github_token_name,
-                    gitlab_token_name=args.gitlab_token_name,
-                    bitbucket_token_name=args.bitbucket_token_name,
-                    bitbucket_email_name=args.bitbucket_email_name,
-                    github_token_fn=github_token_fn,
-                    llm_config=llm_config,
-                    run_dir=run_dir,
-                    clones_dir=clones_dir,
-                    github_host=args.github_host,
-                    gitlab_host=args.gitlab_host,
-                    log=log,
-                    clone_timeout=args.clone_timeout,
-                    clone_retries=args.clone_retries,
-                ): t
-                for t in targets
-            }
-            for fut in as_completed(futures):
-                target = futures[fut]
-                try:
-                    row = fut.result()
-                except Exception as exc:
-                    log.exception("Worker crashed while collecting a repository result")
-                    row = empty_summary_row(target.org, target.full_name.split("/")[-1])
-                    row["error"] = f"worker crash: {exc}"[:500]
-                    row["error_class"] = classify_error(exc)
-                checkpoint.record(target.full_name, row)
-                progress = checkpoint.progress_snapshot()
-                log.info(
-                    "Progress %s/%s ok=%s failed=%s",
-                    progress["done"],
-                    progress["total"],
-                    progress["ok"],
-                    progress["failed"],
-                )
+    run_passes(
+        targets,
+        checkpoint,
+        workers=args.workers,
+        retry_passes=args.end_retry_passes,
+        log=log,
+        retry_pool=all_targets,
+        process_kwargs=dict(
+            tokens=tokens,
+            github_token_name=github_token_name,
+            gitlab_token_name=args.gitlab_token_name,
+            bitbucket_token_name=args.bitbucket_token_name,
+            bitbucket_email_name=args.bitbucket_email_name,
+            github_token_fn=github_token_fn,
+            llm_config=llm_config,
+            run_dir=run_dir,
+            clones_dir=clones_dir,
+            github_host=args.github_host,
+            gitlab_host=args.gitlab_host,
+            log=log,
+            clone_timeout=args.clone_timeout,
+            clone_retries=args.clone_retries,
+            clone_extended_timeout=args.clone_extended_timeout,
+            for_check_enabled=not args.no_for_check,
+            for_check_ref_mode=args.for_check_refs,
+            commit_hashes_enabled=dedup_enabled,
+        ),
+    )
 
     rows = checkpoint.rows()
     apply_company_periods(rows)
+    if dedup_enabled:
+        dedup_manifest = run_commit_dedup(run_dir, rows, all_targets, log)
+    else:
+        # Values or a duplicates.csv left by an earlier run of this folder would describe a comparison that no longer applies.
+        commit_dedup.blank_rows(rows)
+        (run_dir / commit_dedup.DUPLICATES_FILE_NAME).unlink(missing_ok=True)
+        dedup_manifest = {"enabled": False}
     checkpoint.replace_rows(rows)
 
     summary_path = checkpoint.summary_path
+    if not args.no_for_check and for_check.write_run_csv(run_dir) is None:
+        log.warning("for-check.csv could not be written")
+    try:
+        for_check.write_workbook(summary_path, include_for_check=not args.no_for_check)
+    except Exception:
+        # The workbook is a convenience copy of summary.csv; it must not stop failures.json and the zip.
+        log.exception("summary.xlsx could not be written; summary.csv%s is unaffected",
+                      "" if args.no_for_check else " and for-check.csv are")
     failures = [
         {
             "org": row.get("org"),
+            "subgroup": row.get("subgroup"),
             "repo": row.get("repo"),
             "error": row.get("error"),
             "error_class": row.get("error_class"),
@@ -3446,9 +3897,8 @@ def main() -> int:
         log.error("Failure classes: %s", by_class)
         for failure in failures[:50]:
             log.error(
-                "Failed repo %s/%s [%s]: %s",
-                failure.get("org"),
-                failure.get("repo"),
+                "Failed repo %s [%s]: %s",
+                row_key(failure),
                 failure.get("error_class") or "unknown",
                 failure.get("error"),
             )
@@ -3465,8 +3915,8 @@ def main() -> int:
         "\n"
         "To continue an interrupted or partial run:\n"
         f"  python extract_org_raw_data.py --resume {run_dir}\n"
-        "To retry timeout/network/rate-limit failures:\n"
-        f"  python extract_org_raw_data.py --resume {run_dir} --retry-failed\n"
+        "Timeout/network/rate-limit failures were already retried at the end of this run; "
+        "a resume retries any that are still failed.\n"
     )
     (logs_dir / "SUPPORT.txt").write_text(support_note, encoding="utf-8")
     log.info("Wrote support note: %s", logs_dir / "SUPPORT.txt")
@@ -3482,9 +3932,12 @@ def main() -> int:
         "error_classes": progress.get("error_classes") or {},
         "summary_csv": str(summary_path),
         "job_json": str(checkpoint.job_path),
+        "commit_dedup": dedup_manifest,
         "resumable": True,
         "clone_timeout_seconds": args.clone_timeout,
         "clone_retries": args.clone_retries,
+        "clone_extended_timeout_seconds": args.clone_extended_timeout,
+        "end_retry_passes": args.end_retry_passes,
         "support_logs": {
             "extract_log": str(logs_dir / "extract.log"),
             "failures_json": str(logs_dir / "failures.json"),
@@ -3516,6 +3969,8 @@ def main() -> int:
             else {"enabled": False}
         ),
     }
+    if (run_dir / commit_dedup.DUPLICATES_FILE_NAME).is_file():
+        manifest["duplicates_csv"] = str(run_dir / commit_dedup.DUPLICATES_FILE_NAME)
     if args.offline:
         manifest["offline_field_sources"] = {
             "merged_prs": (
@@ -3574,13 +4029,8 @@ def main() -> int:
     log.info("Zip=%s", zip_path)
     if failures:
         log.info(
-            "Completed with errors. Resume pending repos with: "
+            "Completed with errors (timeout/network failures were already retried). Resume with: "
             "python extract_org_raw_data.py --resume %s",
-            run_dir,
-        )
-        log.info(
-            "Retry timeout/network/rate-limit failures with: "
-            "python extract_org_raw_data.py --resume %s --retry-failed",
             run_dir,
         )
     print(
