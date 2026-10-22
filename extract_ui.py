@@ -268,6 +268,14 @@ def read_bitbucket_credentials(fields: dict[str, list[str]]) -> tuple[str, str]:
     return tokens[token_name], (tokens.get(email_name, "") if email_name else "")
 
 
+def compare_commits_from_fields(fields: dict[str, list[str]]) -> bool:
+    """The duplicate-% checkbox is ticked by default, but an unticked box is simply absent from the posted form.
+    The hidden `compare_commits_shown` marker tells "the user unticked it" apart from "this POST never had the box"."""
+    if fields.get("compare_commits_shown", [""])[0] != "1":
+        return True
+    return fields.get("compare_commits", [""])[0] == "on"
+
+
 def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
     llm_enabled = fields.get("llm_enabled", [""])[0] == "on"
     selected = extract_selected_repos(fields)
@@ -290,6 +298,7 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
         "retry_failed": fields.get("retry_failed", [""])[0] == "on",
         "resume_run_dir": fields.get("resume_run_dir", [""])[0].strip(),
         "llm_enabled": llm_enabled,
+        "compare_commits": compare_commits_from_fields(fields),
         "selected_repos": "\n".join(selected),
         "manual_repos": "\n".join(manual),
         "github_accessible": fields.get("github_accessible", [""])[0] == "on",
@@ -871,6 +880,7 @@ __DOCKER_NOTICE__
     <label class="choice" style="margin-top:12px;display:flex;align-items:center"><input id="retry-failed" type="checkbox" name="retry_failed"><strong>Retry failed repositories</strong><span class="small">Re-attempts timeout / network / rate-limit failures from the selected run.</span></label>
     <p class="notice">Interrupted runs save progress after every repository. Pick a run above to continue from where it left off.</p>
   </div>
+  <label class="choice" style="margin-top:18px;display:flex;align-items:center"><input type="hidden" name="compare_commits_shown" value="1"><input id="compare-commits" type="checkbox" name="compare_commits" checked><strong>Compare commit hashes between repos (duplicate %)</strong><span class="small">Adds duplicate_pct, duplicate_commits and duplicates_with to summary.csv and a duplicates.csv. Only commit hashes are kept, never messages or code. Needs 2 or more repos.</span></label>
   <label class="choice" style="margin-top:18px;display:flex;align-items:center"><input id="llm-enabled" type="checkbox" name="llm_enabled"><strong>Enable LLM analysis</strong><span class="small">Adds codebase description, industry/domain, vibe-code signals, and repository type.</span></label>
   <div id="llm-fields" class="hidden"><label class="field">OpenAI API key<span class="req">*</span></label><input name="openai_key" type="password" autocomplete="off" placeholder="sk-..."><p id="offline-llm-warning" class="warning hidden">LLM mode requires an internet connection in offline mode.</p></div>
   <button id="start">Create output</button>
@@ -1196,6 +1206,7 @@ function readFormSettings(){
     resume_run_dir:data.get('resume_run_dir')||'',
     retry_failed:!!data.get('retry_failed'),
     llm_enabled:!!data.get('llm_enabled'),
+    compare_commits:!!data.get('compare_commits'),
     github_accessible:!!data.get('github_accessible'),
     gitlab_accessible:!!data.get('gitlab_accessible'),
     selected_repos:getSelectedRepos().join('\\n'),
@@ -1219,6 +1230,7 @@ function restoreFormSettings(settings){
   setValue('workers', settings.workers||'4');
   setValue('manual_repos', settings.manual_repos||'');
   document.querySelector('#llm-enabled').checked=!!settings.llm_enabled;
+  document.querySelector('#compare-commits').checked=settings.compare_commits!==false;
   document.querySelector('#retry-failed').checked=!!settings.retry_failed;
   const accessible=document.querySelector('#github-accessible');
   if (accessible) accessible.checked=!!settings.github_accessible;
@@ -2163,6 +2175,9 @@ class Handler(BaseHTTPRequestHandler):
             command.append("--llm")
             # Keep the key out of command arguments, logs, and output archives.
             env_overrides["OPENAI_API_KEY"] = openai_key
+
+        if not compare_commits_from_fields(fields):
+            command.append("--no-dedup")
 
         # Atomically claim the single run slot: check *and* set running under one
         # lock hold so two concurrent /start requests can't both pass the guard

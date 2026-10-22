@@ -245,6 +245,8 @@ class MockedPlatformArchiveTests(unittest.TestCase):
         for path in [*run_dir.rglob("*"), *unzipped.rglob("*")]:
             if not path.is_file():
                 continue
+            if path.name.endswith(".gz"):
+                continue  # binary; checked line by line above
             if path.suffix == ".xlsx":
                 with zipfile.ZipFile(path) as xz:
                     blobs += [(f"{path.name}:{n}", xz.read(n).decode("utf-8", "ignore")) for n in xz.namelist()]
@@ -252,6 +254,17 @@ class MockedPlatformArchiveTests(unittest.TestCase):
         self.assertTrue(any(name.endswith("for-check.csv") for name, _ in blobs))
         self.assertTrue(any(name.startswith("summary.xlsx:") for name, _ in blobs))
         self.assertTrue(any(name.endswith("for_check.json") for name, _ in blobs))
+        # The commit-hash list is the one new per-repo file: it must hold hashes and nothing else (no messages,
+        # authors or paths), both in the run folder and inside the zip.
+        import gzip
+        import re
+        hash_files = [*run_dir.rglob("commit_hashes.txt.gz"), *unzipped.rglob("commit_hashes.txt.gz")]
+        self.assertEqual(len(hash_files), 2)
+        for hash_file in hash_files:
+            lines = gzip.open(hash_file, "rt").read().splitlines()
+            self.assertEqual(len(lines), 1)
+            for line in lines:
+                self.assertRegex(line, r"^[0-9a-f]{40}$")
         for name, body in blobs:
             for marker in self.MARKERS:
                 if name.endswith(("clone", ".py")):
