@@ -31,6 +31,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY extract_org_raw_data.py code_metrics.py extract_ui.py count_merged_prs.py github_app_auth.py clone_all_repos.py LH2-DataLabs.svg ./
 COPY tokens.example .
 
+# Bake every tree-sitter grammar the profiler uses into the image. The language pack otherwise
+# downloads them at run time, and a failed download silently dropped a language from the counts.
+RUN python -c "import code_metrics as m, tree_sitter_language_pack as t; \
+names = sorted(set(m.EXT_LANG.values())); t.download(names); \
+[t.get_parser(n) for n in names]; print('preloaded', len(names), 'grammars')"
+
 RUN mkdir -p /app/outputs/raw-extracts /data/repos
 
 ENV EXTRACT_UI_DOCKER=1 \

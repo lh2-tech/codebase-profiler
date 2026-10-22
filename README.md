@@ -155,6 +155,9 @@ Aggregate-only columns added to `summary.csv` (implemented in `code_metrics.py`)
 | `docstring_coverage_pct` | Functions with a docstring (Python) or adjacent doc comment (other languages) |
 | `comment_docstring_ratio` | SCC comment lines / (comment + code) over the same production source files as `function_count` (tests, vendored/generated code, Markdown/JSON/YAML excluded); SCC counts docstrings as comments |
 | `untested_files`, `untested_files_pct` | Heuristic: production files that no test imports (imports are parsed and resolved for Python, JS/TS, Java/Kotlin/Scala) and that have no same-named test in a mirrored directory (generic stems like `models`/`utils`/`index` need the directories to line up). Not coverage; other languages use name matching only |
+| `structure_parse_gaps` | Languages whose tree-sitter grammar failed to load, e.g. `c_sharp:1109 files`. Blank when everything loaded. If skipped files are 5% or more of the parseable files, `function_count`, `class_count` and `docstring_coverage_pct` are left blank instead of publishing an undercount |
+
+The Docker image pre-downloads every grammar at build time (and fails the build if one will not load); at run time a failed grammar load is retried 3 times.
 
 PR tiers need the platform API: GitHub and GitLab only (GitLab adds one `closes_issues` call per MR). Bitbucket, git-history-only and local runs leave them blank. Tiers are applied Rich > Simple > Standard. Per-PR tiers are written to `api/<repo>/pr_tiers.json`.
 

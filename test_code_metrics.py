@@ -179,5 +179,68 @@ class StructureTests(unittest.TestCase):
         self.assertEqual(out["docstring_coverage_pct"], 50.0)
 
 
+class GrammarFailureTests(StructureTests):
+    """A grammar that cannot load must never turn into a silent undercount."""
+
+    def setUp(self):
+        cm._PARSERS.clear()
+        self._retry = cm.GRAMMAR_RETRY_SECONDS
+        cm.GRAMMAR_RETRY_SECONDS = 0
+        if cm._load_parsers() is None:
+            self.skipTest("tree-sitter-language-pack not installed")
+        self.real = cm._load_parsers()
+
+    def tearDown(self):
+        cm.GRAMMAR_RETRY_SECONDS = self._retry
+        cm._PARSERS.clear()
+
+    def run_with(self, get_parser, files):
+        from unittest import mock
+        with mock.patch.object(cm, "_load_parsers", return_value=get_parser):
+            return self.run_metrics(files)
+
+    def test_failed_grammar_blanks_counts_and_names_the_gap(self):
+        def flaky(lang):
+            if lang == "c_sharp":
+                raise RuntimeError("Download error")
+            return self.real(lang)
+        files = {f"a{i}.cs": "class A { void M() {} }\n" for i in range(20)}
+        files["b.py"] = "def f():\n    pass\n"
+        out = self.run_with(flaky, files)
+        self.assertEqual(out["structure_parse_gaps"], "c_sharp:20 files")
+        self.assertEqual(out["function_count"], "")   # unmeasured, not 1
+        self.assertEqual(out["class_count"], "")
+        self.assertNotEqual(out["untested_files_pct"], "")  # parser-free metrics survive
+
+    def test_small_gap_keeps_counts_but_is_reported(self):
+        def flaky(lang):
+            if lang == "c_sharp":
+                raise RuntimeError("Download error")
+            return self.real(lang)
+        files = {f"m{i}.py": "def f():\n    pass\n" for i in range(40)}
+        files["x.cs"] = "class A { void M() {} }\n"
+        out = self.run_with(flaky, files)
+        self.assertEqual(out["structure_parse_gaps"], "c_sharp:1 files")
+        self.assertEqual(out["function_count"], 40)
+
+    def test_transient_failure_is_retried(self):
+        calls = {"n": 0}
+        def once_flaky(lang):
+            if lang == "python":
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise RuntimeError("Download error")
+            return self.real(lang)
+        out = self.run_with(once_flaky, {"a.py": "def f():\n    pass\n"})
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(out["function_count"], 1)
+        self.assertEqual(out["structure_parse_gaps"], "")
+
+    def test_csharp_is_counted_when_grammar_loads(self):
+        out = self.run_metrics({"A.cs": "namespace N;\npublic class A {\n  public void M() {}\n  public A() {}\n}\n"})
+        self.assertEqual((out["function_count"], out["class_count"]), (2, 1))
+        self.assertEqual(out["structure_parse_gaps"], "")
+
+
 if __name__ == "__main__":
     unittest.main()

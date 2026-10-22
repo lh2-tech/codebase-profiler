@@ -24,11 +24,14 @@ for a property of the repository.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import posixpath
 import re
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -38,6 +41,18 @@ STANDARD_MAX_FILES = 10
 
 MAX_FILES = 20_000
 MAX_BYTES = 1_000_000
+
+# The language pack fetches each grammar on first use. A failed fetch used to make that
+# language vanish from the counts without a trace (a 1,109-file C# repo reported 0 classes).
+# Loads are now retried, shared across worker threads, and a language that still cannot be
+# loaded is reported in `structure_parse_gaps`. When such languages cover this share of the
+# parseable files, the counts are left blank rather than published as an undercount.
+GRAMMAR_LOAD_ATTEMPTS = 3
+GRAMMAR_RETRY_SECONDS = 2.0
+GAP_BLANK_FRACTION = 0.05
+_PARSERS: dict[str, Any] = {}
+_PARSER_LOCK = threading.Lock()
+log = logging.getLogger("code_metrics")
 
 PR_FIELDS = [
     "pr_simple_pct",
@@ -53,6 +68,7 @@ STRUCTURE_FIELDS = [
     "comment_docstring_ratio",
     "untested_files",
     "untested_files_pct",
+    "structure_parse_gaps",
 ]
 
 # --------------------------------------------------------------------------
@@ -240,6 +256,23 @@ def _load_parsers() -> Callable[[str], Any] | None:
     except Exception:
         return None
     return get_parser
+
+
+def _get_parser(lang: str, get_parser: Callable[[str], Any]) -> Any | None:
+    """Load a grammar once per process, retrying a flaky download. None if it never loads."""
+    with _PARSER_LOCK:
+        if lang in _PARSERS:
+            return _PARSERS[lang]
+        for attempt in range(1, GRAMMAR_LOAD_ATTEMPTS + 1):
+            try:
+                _PARSERS[lang] = get_parser(lang)
+                return _PARSERS[lang]
+            except Exception as exc:  # DownloadError, LanguageNotFoundError, ...
+                log.warning("grammar %s failed to load (attempt %d/%d): %s",
+                            lang, attempt, GRAMMAR_LOAD_ATTEMPTS, str(exc)[:160])
+                if attempt < GRAMMAR_LOAD_ATTEMPTS:
+                    time.sleep(GRAMMAR_RETRY_SECONDS * attempt)
+        return None  # not cached: the next repo gets to try again
 
 
 def _walk(root: Any) -> Iterable[Any]:
@@ -554,19 +587,18 @@ def structure_metrics(
 
     get_parser = _load_parsers()
     if get_parser is None:
+        out["structure_parse_gaps"] = "tree-sitter unavailable"
         return out
 
-    parsers: dict[str, Any] = {}
     funcs = classes = documented = parsed = 0
+    gaps: dict[str, int] = {}
+    parseable = 0
     for rel, path in prod:
         lang = EXT_LANG[path.suffix.lower()]
-        if lang not in parsers:
-            try:
-                parsers[lang] = get_parser(lang)
-            except Exception:
-                parsers[lang] = None
-        parser = parsers[lang]
+        parseable += 1
+        parser = _get_parser(lang, get_parser)
         if parser is None:
+            gaps[lang] = gaps.get(lang, 0) + 1
             continue
         try:
             if path.stat().st_size > MAX_BYTES:
@@ -579,7 +611,11 @@ def structure_metrics(
         classes += c
         documented += d
         parsed += 1
-    if parsed:
+    if gaps:
+        out["structure_parse_gaps"] = "; ".join(f"{k}:{v} files" for k, v in sorted(gaps.items()))
+        log.warning("%s: grammars unavailable, skipped %s", repo.name, out["structure_parse_gaps"])
+    skipped = sum(gaps.values())
+    if parsed and not (parseable and skipped / parseable >= GAP_BLANK_FRACTION):
         out["function_count"] = funcs
         out["class_count"] = classes
         if funcs:
