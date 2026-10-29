@@ -40,6 +40,7 @@ UI_LOG_LOCK = threading.Lock()
 ZIP_LOCK = threading.Lock()
 
 import for_check  # noqa: E402
+import highlight  # noqa: E402
 from extract_org_raw_data import (  # noqa: E402
     discover_local_repositories,
     list_bitbucket_repos_for_workspace,
@@ -527,7 +528,9 @@ def set_state(**updates: Any) -> None:
 
 def csv_to_xlsx(csv_path: Path) -> Path | None:
     """summary.xlsx with a "summary" sheet and, when for-check.csv sits beside it, a "for-check" sheet."""
-    return for_check.write_workbook(csv_path)
+    xlsx = for_check.write_workbook(csv_path)
+    highlight.write_project_compiled(csv_path)
+    return xlsx
 
 
 def parse_manifest_from_log(log_lines: list[str]) -> dict[str, Any]:

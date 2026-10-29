@@ -94,7 +94,7 @@ class SubgroupTests(unittest.TestCase):
 
     def test_the_column_sits_right_after_org_and_dedup_stays_last(self):
         self.assertEqual(ex.SUMMARY_FIELDS[:2], ["org", "subgroup"])
-        self.assertEqual(ex.SUMMARY_FIELDS[-3:], ["duplicate_pct", "duplicate_commits", "duplicates_with"])
+        self.assertEqual(ex.SUMMARY_FIELDS[-6:], ["duplicate_pct", "duplicate_commits", "duplicates_with", "duplicate_of", "duplicate_loc", "duplicate_prs"])
 
     def test_same_named_repos_in_two_subgroups_keep_separate_rows(self):
         a, b = _target("gitlab", "ft/platforms/ocr-service"), _target("gitlab", "ft/invoicing/ocr-service")

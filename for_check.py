@@ -28,6 +28,7 @@ from __future__ import annotations
 import base64
 import csv
 import hashlib
+import highlight
 import json
 import logging
 import os
@@ -458,7 +459,18 @@ def _cell(sheet, value: str, text_only: bool):
 _TEXT_SECTIONS = {"meta", "error", "ref_before", "ref_after"}  # shas and names must not turn into numbers
 
 
-def _append_csv(sheet, path: Path, for_check: bool, max_rows: int | None = None) -> None:
+def _fill_cell(sheet, cell, color: str):
+    from openpyxl.cell import WriteOnlyCell
+    from openpyxl.styles import PatternFill
+
+    if isinstance(cell, (int, float, str)):
+        cell = WriteOnlyCell(sheet, value=cell)
+    cell.fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+    return cell
+
+
+def _append_csv(sheet, path: Path, for_check: bool, max_rows: int | None = None, fills=None) -> None:
+    """``fills(header, line)`` -> {column index: hex colour}, to colour individual cells (summary sheet only)."""
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.reader(handle)
         header = next(reader, [])
@@ -469,7 +481,12 @@ def _append_csv(sheet, path: Path, for_check: bool, max_rows: int | None = None)
                 sheet.append([_cell(sheet, f"truncated: rows beyond {max_rows - 1} omitted, see {path.name}", True)])
                 return
             text_row = for_check and len(line) > 1 and (line[1] in _TEXT_SECTIONS or line[2:3] == ["default_branch"])
-            sheet.append([_cell(sheet, v, text_row or i in text_cols) for i, v in enumerate(line)])
+            cells = [_cell(sheet, v, text_row or i in text_cols) for i, v in enumerate(line)]
+            if fills is not None:
+                for i, color in fills(header, line).items():
+                    if i < len(cells):
+                        cells[i] = _fill_cell(sheet, cells[i], color)
+            sheet.append(cells)
 
 
 def write_workbook(summary_csv: Path, include_for_check: bool = True) -> Path | None:
@@ -481,7 +498,7 @@ def write_workbook(summary_csv: Path, include_for_check: bool = True) -> Path | 
     except ImportError:
         return None
     workbook = openpyxl.Workbook(write_only=True)  # streams rows, so a big for-check sheet stays out of memory
-    _append_csv(workbook.create_sheet("summary"), summary_csv, for_check=False)
+    _append_csv(workbook.create_sheet("summary"), summary_csv, for_check=False, fills=highlight.summary_fills)
     fc_csv = summary_csv.with_name(FILE_NAME)
     if include_for_check and fc_csv.is_file():
         _append_csv(workbook.create_sheet(SHEET_NAME), fc_csv, for_check=True, max_rows=XLSX_MAX_ROWS)

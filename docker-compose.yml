@@ -10,6 +10,7 @@ services:
       DEFAULT_TOKENS_FILE: /app/secrets/tokens
       HOST_OUTPUT_HINT: ./outputs/raw-extracts
       PYTHONUNBUFFERED: "1"
+      DUPLICATE_THRESHOLD_PCT: ${DUPLICATE_THRESHOLD_PCT:-25}
     volumes:
       # Mount the directory, not the file: a single-file bind mount pins one
       # inode, so if the host tokens file is created or replaced after the
