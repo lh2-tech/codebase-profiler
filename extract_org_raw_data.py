@@ -51,6 +51,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import hg_metrics
 from code_metrics import PR_FIELDS, STRUCTURE_FIELDS, pr_tier_metrics, structure_metrics
 import commit_dedup
 import for_check
@@ -256,6 +257,7 @@ SUMMARY_FIELDS = [
 TEST_DIR_HINTS = ("test", "tests", "spec", "specs", "__tests__")
 SKIP_WALK_DIRS = {
     ".git",
+    ".hg",
     "node_modules",
     "vendor",
     "dist",
@@ -470,6 +472,7 @@ class RepoTarget:
     full_name: str
     meta: dict[str, Any]
     local_path: Path | None = None
+    vcs: str = "git"  # git | hg (local targets only)
 
 
 def parse_tokens_file(path: Path) -> dict[str, str]:
@@ -1715,6 +1718,54 @@ def detect_merged_prs_from_git(repo: Path) -> list[dict[str, str]]:
     )
 
 
+def detect_merged_prs_from_hg(repo: Path) -> list[dict[str, str]]:
+    """Mercurial twin of ``detect_merged_prs_from_git``.
+
+    Same numbered-marker patterns (Bitbucket "pull request #N" is the common one
+    in hg history, GitHub/GitLab text survives ``hg convert``), then every merge
+    changeset not already counted.
+    """
+    records: dict[str, dict[str, str]] = {}
+    merges: list[dict[str, str]] = []
+    for c in hg_metrics.iter_commits(repo, with_body=True, timeout=GIT_LOG_TIMEOUT_SECONDS):
+        subject, body = c["subject"], c["body"]
+        number = method = source_branch = ""
+        title = subject
+        if match := GITHUB_MERGE_RE.match(subject):
+            number, source_branch = match.groups()
+            method = "merge-commit"
+            title = body.strip().splitlines()[0] if body.strip() else subject
+        elif match := BITBUCKET_MERGE_RE.match(subject):
+            source_branch, number = match.groups()
+            method = "merge-commit"
+        elif match := GITLAB_MR_RE.search(body):
+            number = match.group(1)
+            method = "merge-commit"
+        elif match := GITHUB_SQUASH_RE.search(subject):
+            number = match.group(1)
+            method = "squash"
+            title = GITHUB_SQUASH_RE.sub("", subject).strip()
+        record = {
+            "pr_number": number,
+            "method": method or "merge-commit-unnumbered",
+            "source_branch": source_branch,
+            "title": title,
+            "merged_at": c["date"],
+            "merged_by_name": c["name"],
+            "merged_by_email": c["email"],
+            "merge_commit": c["sha"],
+        }
+        if number:
+            if number in records and records[number]["method"] == "merge-commit":
+                continue
+            records[number] = record
+        elif c["is_merge"]:
+            merges.append(record)
+    counted = {r["merge_commit"] for r in records.values()}
+    extra = [m for m in merges if m["merge_commit"] not in counted]
+    return sorted([*records.values(), *extra], key=lambda r: r["merged_at"])
+
+
 def unnumbered_merge_commits(repo: Path) -> list[dict[str, str]]:
     """Merge commits without PR/MR numbers in their message.
 
@@ -1944,7 +1995,7 @@ def _collect_lockfile_backed_dep_roots(repo: Path) -> list[str]:
         dirs[:] = [
             d
             for d in dirs
-            if d != ".git" and d.lower() not in {"node_modules", "vendor", "pods", ".venv", "venv"}
+            if d not in (".git", ".hg") and d.lower() not in {"node_modules", "vendor", "pods", ".venv", "venv"}
         ]
         files_lower = {name.lower() for name in files}
         rel = Path(root).relative_to(repo)
@@ -1974,6 +2025,7 @@ def _collect_oss_license_roots(repo: Path) -> list[str]:
     roots: list[str] = []
     skip_dir_names = {
         ".git",
+        ".hg",
         "node_modules",
         ".venv",
         "venv",
@@ -2039,7 +2091,7 @@ def path_bucket_loc_pcts(repo: Path) -> dict[str, float | str]:
     open_source = 0
     library_modules = 0
     for root, dirs, files in os.walk(repo):
-        dirs[:] = [directory for directory in dirs if directory != ".git"]
+        dirs[:] = [directory for directory in dirs if directory not in (".git", ".hg")]
         rel_root = Path(root).relative_to(repo).as_posix().replace("\\", "/")
         if rel_root == ".":
             rel_root = ""
@@ -2273,15 +2325,21 @@ Do not invent facts. Do not reproduce source code, secrets, or long text."""
     }
 
 
-def find_local_repositories(root: Path) -> list[RepoTarget]:
-    """Discover working trees beneath ``root`` without reading any remote service."""
+_VCS_MARKER = {"git": ".git", "hg": ".hg"}
+
+
+def find_local_repositories(root: Path, vcs: str = "git") -> list[RepoTarget]:
+    """Discover working trees beneath ``root`` without reading any remote service.
+
+    ``vcs`` selects the marker directory: ``.git`` or ``.hg``.
+    """
     if not root.is_dir():
         raise SystemExit(f"Local repositories directory not found: {root}")
 
     repos: list[RepoTarget] = []
     for current, dirs, _ in os.walk(root):
         current_path = Path(current)
-        if (current_path / ".git").exists():
+        if (current_path / _VCS_MARKER[vcs]).exists():
             org, full_name = local_org_and_full_name(root, current_path)
             repos.append(
                 RepoTarget(
@@ -2290,6 +2348,7 @@ def find_local_repositories(root: Path) -> list[RepoTarget]:
                     full_name=full_name,
                     meta={},
                     local_path=current_path,
+                    vcs=vcs,
                 )
             )
             dirs[:] = []
@@ -2300,18 +2359,19 @@ def find_local_repositories(root: Path) -> list[RepoTarget]:
             if directory not in SKIP_WALK_DIRS and not directory.startswith(".")
         ]
     if not repos:
-        raise SystemExit(f"No Git repositories found beneath: {root}")
+        label = "Mercurial" if vcs == "hg" else "Git"
+        raise SystemExit(f"No {label} repositories found beneath: {root}")
     return sorted(repos, key=lambda repo: repo.full_name.lower())
 
 
-def discover_local_repositories(root: Path) -> list[RepoTarget]:
+def discover_local_repositories(root: Path, vcs: str = "git") -> list[RepoTarget]:
     """Like ``find_local_repositories`` but returns an empty list when nothing is found."""
     if not root.is_dir():
         return []
     repos: list[RepoTarget] = []
     for current, dirs, _ in os.walk(root):
         current_path = Path(current)
-        if (current_path / ".git").exists():
+        if (current_path / _VCS_MARKER[vcs]).exists():
             org, full_name = local_org_and_full_name(root, current_path)
             repos.append(
                 RepoTarget(
@@ -2320,6 +2380,7 @@ def discover_local_repositories(root: Path) -> list[RepoTarget]:
                     full_name=full_name,
                     meta={},
                     local_path=current_path,
+                    vcs=vcs,
                 )
             )
             dirs[:] = []
@@ -2542,6 +2603,21 @@ def _for_check_snapshot(
         return for_check.unavailable(f"snapshot: {type(exc).__name__}: {exc}"[:300])
 
 
+def collect_commit_hashes_hg(repo: Path, dest: Path, log: logging.Logger) -> int | None:
+    """Mercurial twin of ``collect_commit_hashes``: every changeset node (40-hex), hashes only.
+
+    Node ids are comparable between hg repos (forks, clones) but never match Git SHAs, so a
+    Mercurial run only finds duplicates among its own repositories.
+    """
+    dest.unlink(missing_ok=True)
+    try:
+        return commit_dedup.write_hash_file(dest, hg_metrics.all_nodes(repo, GIT_LOG_TIMEOUT_SECONDS))
+    except (subprocess.TimeoutExpired, OSError, RuntimeError, ValueError) as exc:
+        log.warning("Commit hashes not collected for %s (duplicate columns stay blank): %s", repo.name, exc)
+        dest.unlink(missing_ok=True)
+        return None
+
+
 def collect_commit_hashes(clone_path: Path, dest: Path, log: logging.Logger) -> int | None:
     """Write every commit hash reachable from any ref of the repo to ``dest`` (sorted, gzip). Hashes only.
 
@@ -2653,6 +2729,9 @@ def process_repo(
     if target.platform != "local":
         write_json(api_dir / "repo.json", meta)
     clone_path = target.local_path or clones_dir / slug
+    is_hg = target.vcs == "hg"
+    hg_repo = clone_path  # the .hg repository; clone_path may move to a scratch tree
+    scratch_tree: Path | None = None
     hashes_path = commit_dedup.hash_file_path(run_dir, slug)
     if commit_hashes_enabled:
         # A re-run repo must not keep an old list: it is rewritten below or the repo stays unknown.
@@ -2741,12 +2820,20 @@ def process_repo(
         else:
             if target.local_path is None:
                 raise RuntimeError("Local repository path is missing")
-            probe_local_git(clone_path, log)
+            if is_hg:
+                if not hg_metrics.probe_local_hg(clone_path, log):
+                    raise RuntimeError(
+                        "Mercurial history unreadable (is `hg` installed and is "
+                        f"{clone_path} a complete repository?)"
+                    )
+            else:
+                probe_local_git(clone_path, log)
             row["repo_created_at"] = ""
             row["primary_language"] = ""
             row["size_kb"] = ""
             row["default_branch"] = (
-                run_git(clone_path, "symbolic-ref", "--short", "HEAD").strip()
+                (hg_metrics.current_branch(clone_path) if is_hg else
+                 run_git(clone_path, "symbolic-ref", "--short", "HEAD").strip())
                 or "not_collected_offline"
             )
             row["merged_prs"] = 0
@@ -2778,7 +2865,18 @@ def process_repo(
                 else row["default_branch"]
             )
 
-        git_stats = aggregate_git_stats(clone_path)
+        if is_hg:
+            git_stats = hg_metrics.aggregate_hg_stats(hg_repo, is_bot_author, log)
+            clone_path, tree_branch, is_scratch = hg_metrics.prepare_working_tree(
+                hg_repo, clones_dir / f"{slug}-hg-archive", log
+            )
+            if is_scratch:
+                scratch_tree = clone_path
+                row["measured_branch"] = tree_branch
+                row["default_branch"] = tree_branch
+            write_json(git_dir / "hg_stats.json", git_stats)
+        else:
+            git_stats = aggregate_git_stats(clone_path)
         write_json(git_dir / "git_stats.json", git_stats)
         row["total_commits"] = git_stats["total_commits"]
         if target.platform == "local":
@@ -2813,16 +2911,31 @@ def process_repo(
         row["bot_authors"] = git_stats["bot_authors"]
         row["bot_commit_ratio"] = git_stats["bot_commit_ratio"]
 
-        export_commits_jsonl(
-            clone_path,
-            git_dir / "commits.jsonl",
-            total_commits=git_stats.get("total_commits"),
-            log=log,
-        )
+        if is_hg:
+            hg_metrics.export_commits_jsonl(
+                hg_repo,
+                git_dir / "commits.jsonl",
+                is_bot=is_bot_author,
+                total_commits=git_stats.get("total_commits"),
+                max_commits=COMMIT_DETAIL_LIMIT,
+                timeout=GIT_LOG_TIMEOUT_SECONDS,
+                log=log,
+                write_json=write_json,
+            )
+        else:
+            export_commits_jsonl(
+                clone_path,
+                git_dir / "commits.jsonl",
+                total_commits=git_stats.get("total_commits"),
+                log=log,
+            )
 
         if commit_hashes_enabled:
             # Complete (not capped like commits.jsonl) and taken while the clone still exists.
-            collect_commit_hashes(clone_path, hashes_path, log)
+            if is_hg:
+                collect_commit_hashes_hg(hg_repo, hashes_path, log)
+            else:
+                collect_commit_hashes(clone_path, hashes_path, log)
 
         scc = run_scc(clone_path)
         write_json(git_dir / "scc.json", scc)
@@ -2830,7 +2943,11 @@ def process_repo(
 
         if target.platform == "local":
             primary_language, language_breakdown = scc_languages_breakdown(scc)
-            detected_prs = detect_merged_prs_from_git(clone_path)
+            detected_prs = (
+                detect_merged_prs_from_hg(hg_repo)
+                if is_hg
+                else detect_merged_prs_from_git(clone_path)
+            )
             write_json(git_dir / "merged_prs_detected_from_git.json", detected_prs)
             row["repo_created_at"] = git_stats["first_commit"] or ""
             row["primary_language"] = primary_language
@@ -2896,6 +3013,8 @@ def process_repo(
                     target.full_name,
                     exc,
                 )
+        if scratch_tree is not None:
+            shutil.rmtree(scratch_tree, ignore_errors=True)
         log.info(
             "OK %s: merged_prs=%s loc=%s span_days=%s",
             target.full_name,
@@ -2913,6 +3032,8 @@ def process_repo(
             row["error_class"],
             row["error"],
         )
+        if scratch_tree is not None:
+            shutil.rmtree(scratch_tree, ignore_errors=True)
         if target.platform != "local":
             try:
                 shutil.rmtree(clone_path)
@@ -2994,6 +3115,7 @@ def serialize_targets(targets: list[RepoTarget]) -> list[dict[str, Any]]:
             "full_name": target.full_name,
             "meta": target.meta,
             "local_path": str(target.local_path) if target.local_path else None,
+            "vcs": target.vcs,
         }
         for target in targets
     ]
@@ -3027,6 +3149,7 @@ def load_targets_from_repos_json(path: Path) -> list[RepoTarget] | None:
                 full_name=full_name,
                 meta=meta,
                 local_path=local_path,
+                vcs=str(item.get("vcs") or "git"),
             )
         )
     return targets or None
@@ -3497,6 +3620,11 @@ def main() -> int:
         help="Directory containing fully cloned Git repositories",
     )
     parser.add_argument(
+        "--hg",
+        action="store_true",
+        help="Treat --local-repos-dir as Mercurial repositories (.hg); implies --offline",
+    )
+    parser.add_argument(
         "--local-repo",
         action="append",
         default=[],
@@ -3619,6 +3747,15 @@ def main() -> int:
         resumed_targets = load_targets_from_repos_json(resume_dir / "repos.json")
         if resumed_targets and all(t.platform == "local" for t in resumed_targets):
             args.offline = True
+            if all(t.vcs == "hg" for t in resumed_targets):
+                args.hg = True
+    if args.hg:
+        args.offline = True
+        if not hg_metrics.hg_available():
+            raise SystemExit(
+                "--hg needs the `hg` command on PATH (apt install mercurial, "
+                "brew install mercurial, or pip install mercurial)."
+            )
 
     if args.offline and not args.local_repos_dir and resumed_targets is None:
         raise SystemExit("--offline requires --local-repos-dir")
@@ -3718,7 +3855,9 @@ def main() -> int:
 
     if all_targets is None:
         if args.offline:
-            all_targets = find_local_repositories(args.local_repos_dir.resolve())
+            all_targets = find_local_repositories(
+                args.local_repos_dir.resolve(), "hg" if args.hg else "git"
+            )
             if args.local_repo:
                 all_targets = filter_local_targets(all_targets, args.local_repo)
         else:
@@ -3971,6 +4110,17 @@ def main() -> int:
     }
     if (run_dir / commit_dedup.DUPLICATES_FILE_NAME).is_file():
         manifest["duplicates_csv"] = str(run_dir / commit_dedup.DUPLICATES_FILE_NAME)
+    if args.hg:
+        manifest["vcs"] = "mercurial"
+        manifest["hg_notes"] = (
+            "History totals (commits, authors, dates, merged PRs) cover every visible "
+            "changeset on all named branches; Git runs cover the checked-out branch only. "
+            "LOC/files/tests are measured on the checked-out working tree, or on an "
+            "archive of the newest open head when the repo has no working tree. "
+            "Per-changeset churn is parsed from `hg log --git -p`; merge changesets "
+            "carry no file list, as with `git log --numstat`. Subrepos (.hgsub) are not "
+            "followed. Branch/head/tag counts are in git/<repo>/hg_stats.json."
+        )
     if args.offline:
         manifest["offline_field_sources"] = {
             "merged_prs": (

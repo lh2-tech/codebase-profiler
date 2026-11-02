@@ -4,7 +4,7 @@ ARG TARGETARCH=amd64
 ARG SCC_VERSION=3.7.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git ca-certificates curl tar \
+        git mercurial ca-certificates curl tar \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
@@ -28,7 +28,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY extract_org_raw_data.py commit_dedup.py code_metrics.py extract_ui.py for_check.py count_merged_prs.py github_app_auth.py clone_all_repos.py LH2-DataLabs.svg ./
+COPY extract_org_raw_data.py hg_metrics.py commit_dedup.py code_metrics.py extract_ui.py for_check.py count_merged_prs.py github_app_auth.py clone_all_repos.py LH2-DataLabs.svg ./
 COPY tokens.example .
 
 # Bake every tree-sitter grammar the profiler uses into the image. The language pack otherwise
@@ -37,10 +37,11 @@ RUN python -c "import code_metrics as m, tree_sitter_language_pack as t; \
 names = sorted(set(m.EXT_LANG.values())); t.download(names); \
 [t.get_parser(n) for n in names]; print('preloaded', len(names), 'grammars')"
 
-RUN mkdir -p /app/outputs/raw-extracts /data/repos
+RUN mkdir -p /app/outputs/raw-extracts /data/repos /data/hg-repos
 
 ENV EXTRACT_UI_DOCKER=1 \
     DEFAULT_LOCAL_REPOS_DIR=/data/repos \
+    DEFAULT_HG_REPOS_DIR=/data/hg-repos \
     DEFAULT_TOKENS_FILE=/app/secrets/tokens \
     HOST_OUTPUT_HINT=./outputs/raw-extracts \
     PYTHONUNBUFFERED=1 \

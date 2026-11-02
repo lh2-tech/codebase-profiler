@@ -715,6 +715,14 @@ def default_local_repos_dir() -> str:
     )
 
 
+def default_hg_repos_dir() -> str:
+    docker_mode = is_docker_mode()
+    return os.environ.get(
+        "DEFAULT_HG_REPOS_DIR",
+        "/data/hg-repos" if docker_mode else str((ROOT / "hg-repos").resolve()),
+    )
+
+
 def default_tokens_file() -> str:
     docker_mode = is_docker_mode()
     return os.environ.get(
@@ -726,6 +734,7 @@ def default_tokens_file() -> str:
 def page() -> str:
     docker_mode = is_docker_mode()
     default_local = default_local_repos_dir()
+    default_hg = default_hg_repos_dir()
     default_tokens = default_tokens_file()
     host_repos_hint = os.environ.get("HOST_REPOS_HINT", "./repos")
     docker_notice = ""
@@ -860,12 +869,17 @@ __DOCKER_NOTICE__
 <div class="card"><strong>Where are the repositories?</strong>
 <div class="choices">
   <label class="choice"><input type="radio" name="mode" value="offline" checked> <strong>Already cloned here</strong><span class="small">Runs entirely offline. No internet connection is needed.</span></label>
+  <label class="choice"><input type="radio" name="mode" value="hg"> <strong>Mercurial (local)</strong><span class="small">Local Mercurial (<code>.hg</code>) repositories. Runs entirely offline; needs <code>hg</code>.</span></label>
   <label class="choice"><input type="radio" name="mode" value="hosted"> <strong>Hosted platform</strong><span class="small">Connect to a GitHub organisation, GitLab group or Bitbucket workspace with a token file.</span></label>
 </div></div>
 <div class="card">
   <div id="offline-fields">
     <div class="inline-actions"><button type="button" id="load-local-repos" class="secondary">Load repositories</button></div>
     <p class="notice"><strong>Offline clones:</strong> place full git clones in the mounted repos folder on your computer (default <code>./repos</code>, or the path set by <code>LOCAL_REPOS_DIR</code>). Use a normal <code>git clone</code> without <code>--depth</code>.</p>
+  </div>
+  <div id="hg-fields" class="hidden">
+    <div class="inline-actions"><button type="button" id="load-hg-repos" class="secondary">Load repositories</button></div>
+    <p class="notice"><strong>Mercurial repositories:</strong> place full Mercurial clones (folders containing <code>.hg</code>) in the mounted hg folder on your computer (default <code>./hg-repos</code>, or the path set by <code>LOCAL_HG_REPOS_DIR</code>). History totals cover every named branch; LOC and file metrics use the checked-out working tree (or the newest open head when the clone has none). Subrepos are not followed.</p>
   </div>
   <div id="hosted-fields" class="hidden">
     <label class="field">Platform</label><select id="hosted-platform" name="hosted_platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option><option value="bitbucket">Bitbucket</option></select>
@@ -917,7 +931,7 @@ __DOCKER_NOTICE__
 const FORM_STORAGE_KEY='extract-ui-form-v8';
 const DEFAULT_LOCAL_REPOS_DIR='__DEFAULT_LOCAL_REPOS_DIR__';
 const DEFAULT_TOKENS_FILE='__DEFAULT_TOKENS_FILE__';
-const forms = {offline:document.querySelector('#offline-fields'), hosted:document.querySelector('#hosted-fields')};
+const forms = {offline:document.querySelector('#offline-fields'), hg:document.querySelector('#hg-fields'), hosted:document.querySelector('#hosted-fields')};
 let savedRepoChecks=new Set();
 function updateRepoPickerCopy(){
   const platform=document.querySelector('#hosted-platform').value;
@@ -936,6 +950,11 @@ function updateRepoPickerCopy(){
     help.textContent='Leave all unchecked to include every repository in the workspace, or select the ones you want.';
     if (manualLabel) manualLabel.textContent='Manual repository list';
     if (manualHelp) manualHelp.textContent='One workspace/repo per line. Use this when a repository is missing from the workspace listing.';
+  } else if (mode!=='hosted') {
+    label.textContent='Repositories to include';
+    help.textContent='Leave all unchecked to analyse every repository found in the folder, or select the ones you want.';
+    if (manualLabel) manualLabel.textContent='Manual repository list';
+    if (manualHelp) manualHelp.textContent='';
   } else {
     label.textContent='Repositories to include';
     help.textContent='Organisation mode: leave all unchecked to include every repository in the org. Accessible-repo mode: select the repos you want, or use Select all.';
@@ -954,7 +973,7 @@ function choosePlatform(){
   if (mode!=='hosted') document.querySelector('#repo-picker-wrap').classList.add('hidden');
   updateRepoPickerCopy();
 }
-function chooseLlm(){ const enabled=document.querySelector('#llm-enabled').checked; const offline=document.querySelector('input[name=mode]:checked').value==='offline'; document.querySelector('#llm-fields').classList.toggle('hidden', !enabled); document.querySelector('#offline-llm-warning').classList.toggle('hidden', !(enabled && offline)); }
+function chooseLlm(){ const enabled=document.querySelector('#llm-enabled').checked; const offline=document.querySelector('input[name=mode]:checked').value!=='hosted'; document.querySelector('#llm-fields').classList.toggle('hidden', !enabled); document.querySelector('#offline-llm-warning').classList.toggle('hidden', !(enabled && offline)); }
 function getSelectedRepos(){ return [...document.querySelectorAll('input[name="selected_repos"]:checked')].map(el=>el.value); }
 function getManualRepos(){
   const el=document.querySelector('#manual-repos');
@@ -1026,6 +1045,22 @@ async function loadLocalRepos(){
     const payload=await postDiscover('/discover/local', {local_repos_dir:DEFAULT_LOCAL_REPOS_DIR});
     rememberRepoChecks();
     renderRepoPicker(payload.items, 'No Git repositories found in the mounted repos folder.');
+  } catch (error) {
+    document.querySelector('#repo-picker-wrap').classList.add('hidden');
+    showFormError(error.message);
+  } finally {
+    setButtonLoading(button, false);
+  }
+}
+async function loadHgRepos(){
+  showFormError('');
+  const button=document.querySelector('#load-hg-repos');
+  setButtonLoading(button, true, 'Load repositories');
+  showRepoPickerLoading('Searching Mercurial folders…');
+  try {
+    const payload=await postDiscover('/discover/local', {vcs:'hg'});
+    rememberRepoChecks();
+    renderRepoPicker(payload.items, 'No Mercurial repositories found in the mounted hg folder.');
   } catch (error) {
     document.querySelector('#repo-picker-wrap').classList.add('hidden');
     showFormError(error.message);
@@ -1157,7 +1192,7 @@ function validateForm(){
   const data=readFormSettings();
   const errors=[];
   const isResume=!!(data.resume_run_dir||'').trim();
-  if (data.mode!=='offline') {
+  if (data.mode==='hosted') {
     if (data.hosted_platform==='github') {
       const ghToken=(document.querySelector('[name=github_token]')?.value||'').trim();
       if (!ghToken && !data.github_token_name.trim()) errors.push(['github_token','Paste a GitHub token, or enter the token key from your file.']);
@@ -1337,6 +1372,7 @@ document.querySelectorAll('input[name=mode]').forEach(e=>e.addEventListener('cha
 document.querySelector('#hosted-platform').addEventListener('change',choosePlatform);
 document.querySelector('#llm-enabled').addEventListener('change',chooseLlm);
 document.querySelector('#load-local-repos').addEventListener('click', loadLocalRepos);
+document.querySelector('#load-hg-repos').addEventListener('click', loadHgRepos);
 document.querySelector('#load-github-orgs').addEventListener('click', loadHostedOrgs);
 document.querySelector('#load-github-accessible').addEventListener('click', loadAccessibleGithubRepos);
 document.querySelector('#load-gitlab-groups').addEventListener('click', loadHostedOrgs);
@@ -1536,7 +1572,7 @@ loadResumableRuns();
 setInterval(refresh,1200); refresh();
 </script></main></body></html>""".replace("__CSRF_TOKEN__", CSRF_TOKEN).replace(
         "__DOCKER_NOTICE__", docker_notice
-    ).replace("__DEFAULT_LOCAL_REPOS_DIR__", escape(default_local)).replace(
+    ).replace("__DEFAULT_LOCAL_REPOS_DIR__", escape(default_local)).replace("__DEFAULT_HG_REPOS_DIR__", escape(default_hg)).replace(
         "__DEFAULT_TOKENS_FILE__", escape(default_tokens)
     )
 
@@ -1784,7 +1820,8 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(HTTPStatus.OK, "application/json", json.dumps(result))
             return
         if path == "/discover/local":
-            local_dir = default_local_repos_dir()
+            vcs = "hg" if fields.get("vcs", [""])[0] == "hg" else "git"
+            local_dir = default_hg_repos_dir() if vcs == "hg" else default_local_repos_dir()
             if not local_dir or not Path(local_dir).is_dir():
                 self.respond(
                     HTTPStatus.BAD_REQUEST,
@@ -1792,7 +1829,10 @@ class Handler(BaseHTTPRequestHandler):
                     json.dumps(
                         {
                             "error": (
-                                "Mounted repos folder not found. Put full clones in "
+                                "Mounted Mercurial folder not found. Put full clones in "
+                                "./hg-repos (or the LOCAL_HG_REPOS_DIR path from .env)."
+                                if vcs == "hg"
+                                else "Mounted repos folder not found. Put full clones in "
                                 "./repos (or the LOCAL_REPOS_DIR path from .env)."
                             )
                         }
@@ -1800,7 +1840,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             try:
-                targets = discover_local_repositories(Path(local_dir).resolve())
+                targets = discover_local_repositories(Path(local_dir).resolve(), vcs)
                 items = [
                     {"id": target.full_name, "name": target.full_name}
                     for target in targets
@@ -2044,6 +2084,22 @@ class Handler(BaseHTTPRequestHandler):
             command.append("--offline")
             if local_dir:
                 command.extend(["--local-repos-dir", local_dir])
+            if not resume_run_dir:
+                for repo_name in selected_repos:
+                    command.extend(["--local-repo", repo_name])
+        elif mode == "hg":
+            hg_dir = default_hg_repos_dir()
+            if not resume_run_dir and (not hg_dir or not Path(hg_dir).is_dir()):
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "text/plain",
+                    "Mounted Mercurial folder not found. Put full clones in ./hg-repos "
+                    "(or the LOCAL_HG_REPOS_DIR path from .env).",
+                )
+                return
+            command.extend(["--offline", "--hg"])
+            if hg_dir:
+                command.extend(["--local-repos-dir", hg_dir])
             if not resume_run_dir:
                 for repo_name in selected_repos:
                     command.extend(["--local-repo", repo_name])

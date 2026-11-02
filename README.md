@@ -190,6 +190,22 @@ LOCAL_REPOS_DIR=/Users/me/customer-repos
 
 The UI uses the mounted folder automatically — no path entry needed. Optionally list specific repositories with **Load repositories** / **Repositories to include**.
 
+### Mercurial (local)
+
+The **Mercurial (local)** tab analyses full Mercurial clones (folders containing `.hg`) with the same summary columns, `git_stats.json` and `commits.jsonl` as Git runs. Put them in `./hg-repos` (or set `LOCAL_HG_REPOS_DIR` in `.env`); the image installs `hg`. Runs are offline.
+
+```bash
+python extract_org_raw_data.py --hg --local-repos-dir ~/customer-hg-repos   # needs `hg` on PATH
+```
+
+How it differs from Git:
+
+- **History scope.** Commits, authors, dates and merged PRs cover every visible changeset on all named branches (Git runs follow the checked-out branch only). Branch, head, tag and bookmark counts, merge-changeset count and commits per branch are in `git/<repo>/hg_stats.json`.
+- **Working tree.** LOC, files, tests and structure metrics use the checked-out tree. A clone with no working tree (`hg clone -U`) is exported with `hg archive` from the newest open head into a scratch folder, measured, and deleted; `measured_branch` records that head's branch.
+- **Churn.** `commits.jsonl` is parsed from one `hg log --git -p` stream. Merge changesets have no file list (as with `git log --numstat`); binary files count 0/0.
+- **Merged PRs.** No platform API: numbered markers in messages (Bitbucket "pull request #N", `(#N)` squashes, GitLab/GitHub merge text from converted repos) plus every other merge changeset.
+- **Not covered.** PR tiers (blank, as for other offline runs), `.hgsub` subrepos, largefiles/LFS content.
+
 ## Outputs
 
 Results are written to `./outputs/raw-extracts/` on your computer (mounted into the container). Each run produces:
@@ -308,6 +324,7 @@ python extract_org_raw_data.py --ui
 | `extract_org_raw_data.py` | CLI extractor |
 | `extract_ui.py` | Browser UI |
 | `commit_dedup.py` | Commit-hash comparison between repos: hash files, duplicate % columns, `duplicates.csv` |
+| `hg_metrics.py` | Mercurial history stats, per-changeset churn, working-tree export |
 | `count_merged_prs.py` | GitHub/GitLab API helpers |
 | `for_check.py` | for-check.csv: platform-side counts/refs + summary.xlsx writer |
 | `github_app_auth.py` | GitHub App authentication |
