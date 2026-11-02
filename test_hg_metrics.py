@@ -124,6 +124,19 @@ class HgMetricsTests(unittest.TestCase):
         again = ex.load_targets_from_repos_json(self._dump(found))
         self.assertTrue(all(t.vcs == "hg" for t in again))
 
+    def test_epoch_zero_placeholder_date_is_ignored(self) -> None:
+        repo = self.root / "epoch"
+        repo.mkdir()
+        _hg(repo, "init")
+        for i, date in enumerate(["2021-05-01 10:00 +0000", "0 0", "2021-06-01 10:00 +0000"]):
+            (repo / "f.txt").write_text(f"{i}\n")
+            _hg(repo, "add") if i == 0 else None
+            _hg(repo, "commit", "-m", f"c{i}", "-d", date)
+        stats = hg.aggregate_hg_stats(repo, ex.is_bot_author)
+        self.assertEqual(stats["total_commits"], 3)
+        self.assertTrue(stats["first_commit"].startswith("2021-05-01"))
+        self.assertTrue(stats["last_commit"].startswith("2021-06-01"))
+
     def _dump(self, targets: list) -> Path:
         p = self.root / "repos.json"
         p.write_text(json.dumps(ex.serialize_targets(targets)))

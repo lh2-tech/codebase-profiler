@@ -268,6 +268,10 @@ def aggregate_hg_stats(
         if dt is None:
             continue
         ts = dt.astimezone(timezone.utc)
+        if ts.timestamp() <= 0:
+            # Epoch-0 is a placeholder some repos carry on a stray changeset
+            # (mercurial itself has one); it would pin first_commit to 1970.
+            continue
         if first is None or ts < first.astimezone(timezone.utc):
             first, first_s = dt, c["date"]
         if last is None or ts > last.astimezone(timezone.utc):
