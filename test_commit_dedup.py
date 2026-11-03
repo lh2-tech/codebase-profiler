@@ -128,7 +128,7 @@ class SummaryRowsTests(unittest.TestCase):
 
     def test_fields_are_appended_after_every_existing_column(self):
         self.assertEqual(
-            ex.SUMMARY_FIELDS[-3:], ["duplicate_pct", "duplicate_commits", "duplicates_with"]
+            ex.SUMMARY_FIELDS[-6:], cd.ALL_FIELDS
         )
         self.assertEqual(cd.DEDUP_FIELDS, ["duplicate_pct", "duplicate_commits", "duplicates_with"])
 
@@ -333,7 +333,7 @@ class RunTests(unittest.TestCase):
     def test_default_run_fills_summary_writes_duplicates_and_hash_files(self):
         run = self._run()
         summary = read_summary(run)
-        self.assertEqual(list(summary["A"])[-3:], cd.DEDUP_FIELDS)
+        self.assertEqual(list(summary["A"])[-6:], cd.ALL_FIELDS)
         self.assertEqual((summary["A"]["duplicate_pct"], summary["A"]["duplicate_commits"], summary["A"]["duplicates_with"]),
                          ("100.0", "3", "B:100.0"))
         self.assertEqual((summary["B"]["duplicate_pct"], summary["B"]["duplicate_commits"], summary["B"]["duplicates_with"]),
@@ -393,7 +393,7 @@ class RunTests(unittest.TestCase):
     def test_no_dedup_writes_no_files_and_leaves_the_columns_blank(self):
         run = self._run("--no-dedup")
         summary = read_summary(run)
-        self.assertEqual(list(summary["A"])[-3:], cd.DEDUP_FIELDS)  # columns stay so the schema never changes
+        self.assertEqual(list(summary["A"])[-6:], cd.ALL_FIELDS)  # columns stay so the schema never changes
         for row in summary.values():
             self.assertEqual([row[f] for f in cd.DEDUP_FIELDS], ["", "", ""])
         self.assertFalse((run / "duplicates.csv").exists())

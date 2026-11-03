@@ -55,6 +55,8 @@ import hg_metrics
 from code_metrics import PR_FIELDS, STRUCTURE_FIELDS, pr_tier_metrics, structure_metrics
 import commit_dedup
 import for_check
+import highlight
+import pr_signals
 from count_merged_prs import (
     GITHUB_RATE_LIMIT_WAIT_SECONDS,
     github_api,
@@ -252,6 +254,8 @@ SUMMARY_FIELDS = [
     "error_class",
     # Filled once at the end of the run (see run_commit_dedup); blank while it is in progress.
     *commit_dedup.DEDUP_FIELDS,
+    # Only for a repo above the duplicate threshold (DUPLICATE_THRESHOLD_PCT); blank otherwise.
+    *commit_dedup.DETAIL_FIELDS,
 ]
 
 TEST_DIR_HINTS = ("test", "tests", "spec", "specs", "__tests__")
@@ -2646,6 +2650,77 @@ def collect_commit_hashes(clone_path: Path, dest: Path, log: logging.Logger) -> 
         return None
 
 
+def collect_commit_loc(clone_path: Path, dest: Path, log: logging.Logger) -> int | None:
+    """Write ``<hash> <added code lines>`` for every commit of the repo to ``dest`` (gzip). Numbers only.
+
+    Feeds the ``duplicate_loc`` column. A failure is logged and leaves no file, so the column stays blank."""
+    dest.unlink(missing_ok=True)
+    try:
+        proc = subprocess.run(
+            ["git", *GIT_HARDEN_ARGS, "-C", str(clone_path), "log", "--all", "--no-merges", "--no-renames",
+             "--numstat", "--format=%x1e%H"],
+            capture_output=True,
+            text=True,
+            timeout=GIT_LOG_TIMEOUT_SECONDS,
+            env=git_env(),
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "git failed").strip()[:300]
+            raise RuntimeError(f"git log --numstat failed: {detail}")
+        added: dict[str, int] = {}
+        for chunk in proc.stdout.split("\x1e"):
+            lines = chunk.splitlines()
+            if not lines:
+                continue
+            total = 0
+            for line in lines[1:]:
+                parts = line.split("\t", 2)
+                if len(parts) == 3 and parts[0].isdigit() and Path(parts[2]).suffix.lower() in CODE_LOC_EXTENSIONS:
+                    total += int(parts[0])
+            added[lines[0].strip()] = total
+        return commit_dedup.write_loc_file(dest, added)
+    except (subprocess.TimeoutExpired, OSError, RuntimeError, ValueError) as exc:
+        log.warning("Commit LOC not collected for %s (duplicate_loc stays blank): %s", clone_path.name, exc)
+        dest.unlink(missing_ok=True)
+        return None
+
+
+def collect_pr_signals(clone_path: Path, dest: Path, log: logging.Logger) -> list[pr_signals.PrSignal] | None:
+    """Per-PR open-source and AI-signature line counts (see pr_signals.py), saved to ``dest``. None when they could
+    not be worked out; the two summary fields then keep their repo-level value without PR counts."""
+    dest.unlink(missing_ok=True)
+    try:
+        records = detect_merged_prs_from_git(clone_path)
+        dep_roots = _collect_lockfile_backed_dep_roots(clone_path)
+        license_roots = _collect_oss_license_roots(clone_path)
+
+        def is_code(rel: str) -> bool:
+            return Path(rel).suffix.lower() in CODE_LOC_EXTENSIONS
+
+        def is_oss_path(rel: str) -> bool:
+            directory = Path(rel).parent.as_posix()
+            directory = "" if directory == "." else directory
+            return (
+                _dir_under_roots(directory, dep_roots)
+                or _dir_under_roots(directory, license_roots)
+                or _file_has_oss_spdx(clone_path / rel)
+            )
+
+        def git(*args: str) -> str:
+            return run_git(clone_path, *args, timeout=GIT_LOG_TIMEOUT_SECONDS)
+
+        signals = pr_signals.analyse(records, git, is_oss_path=is_oss_path, is_code=is_code)
+        if signals is None:
+            log.warning("PR signals for %s skipped: time budget exceeded (PR counts stay blank)", clone_path.name)
+            return None
+        write_json(dest, [sig.as_json() for sig in signals])
+        return signals
+    except (subprocess.TimeoutExpired, OSError, RuntimeError, ValueError) as exc:
+        log.warning("PR signals not collected for %s (PR counts stay blank): %s", clone_path.name, exc)
+        dest.unlink(missing_ok=True)
+        return None
+
+
 def run_commit_dedup(
     run_dir: Path,
     rows: list[dict[str, Any]],
@@ -2666,9 +2741,13 @@ def run_commit_dedup(
         names_by_slug[safe_name(target.full_name.replace("/", "__"))] = target.full_name
         name_by_row[row_id] = target.full_name
     try:
-        result = commit_dedup.compute(commit_dedup.hash_sources(run_dir, names_by_slug))
+        result = commit_dedup.compute(
+            commit_dedup.hash_sources(run_dir, names_by_slug),
+            loc_sources=commit_dedup.loc_sources(run_dir, names_by_slug),
+            pr_sources=pr_signals.pr_commit_sources(run_dir, names_by_slug),
+        )
         commit_dedup.apply_to_rows(
-            rows, result, lambda row: name_by_row.get(row_key(row))
+            rows, result, lambda row: name_by_row.get(row_key(row)), threshold=commit_dedup.threshold_pct()
         )
         commit_dedup.write_duplicates_csv(run_dir / commit_dedup.DUPLICATES_FILE_NAME, result.pairs)
     except Exception:  # noqa: BLE001 - the comparison is an extra; it must not cost the run its other results
@@ -2733,9 +2812,13 @@ def process_repo(
     hg_repo = clone_path  # the .hg repository; clone_path may move to a scratch tree
     scratch_tree: Path | None = None
     hashes_path = commit_dedup.hash_file_path(run_dir, slug)
+    loc_path = commit_dedup.loc_file_path(run_dir, slug)
+    pr_signals_path = pr_signals.file_path(run_dir, slug)
+    pr_signals_path.unlink(missing_ok=True)
     if commit_hashes_enabled:
         # A re-run repo must not keep an old list: it is rewritten below or the repo stays unknown.
         hashes_path.unlink(missing_ok=True)
+        loc_path.unlink(missing_ok=True)
     # PR-tier percentages exist only when the platform API supplied PR detail;
     # git-history and local runs leave them blank rather than guessing.
     pr_tiers: tuple[dict[str, Any], list[dict[str, Any]]] | None = None
@@ -2933,9 +3016,12 @@ def process_repo(
         if commit_hashes_enabled:
             # Complete (not capped like commits.jsonl) and taken while the clone still exists.
             if is_hg:
+                # No duplicate_loc for Mercurial: commit_loc.txt.gz comes from a numstat log of a Git clone,
+                # so the column stays blank (unknown) for hg repos.
                 collect_commit_hashes_hg(hg_repo, hashes_path, log)
             else:
                 collect_commit_hashes(clone_path, hashes_path, log)
+                collect_commit_loc(clone_path, loc_path, log)
 
         scc = run_scc(clone_path)
         write_json(git_dir / "scc.json", scc)
@@ -2997,6 +3083,17 @@ def process_repo(
                 row.update(run_llm_analysis(clone_path, row, llm_config))
             except Exception as exc:
                 row["llm_analysis_error"] = str(exc)[:500]
+
+        # Open source / vibe-coded: append "<PRs affected>[,>50%:<PRs mostly affected>]" to the repo-level value.
+        # Git history only: a Mercurial repo keeps the repo-level value without PR counts.
+        pr_counts = None if is_hg else collect_pr_signals(clone_path, pr_signals_path, log)
+        if pr_counts is not None:
+            row["open_source_loc_pct"] = pr_signals.with_pr_counts(
+                row["open_source_loc_pct"], pr_signals.tally(pr_counts, "oss")
+            )
+            row["vibe_code_signals"] = pr_signals.with_pr_counts(
+                row["vibe_code_signals"], pr_signals.tally(pr_counts, "ai")
+            )
 
         if target.platform != "local":
             try:
@@ -4011,6 +4108,7 @@ def main() -> int:
         log.warning("for-check.csv could not be written")
     try:
         for_check.write_workbook(summary_path, include_for_check=not args.no_for_check)
+        highlight.write_project_compiled(summary_path)
     except Exception:
         # The workbook is a convenience copy of summary.csv; it must not stop failures.json and the zip.
         log.exception("summary.xlsx could not be written; summary.csv%s is unaffected",
@@ -4154,7 +4252,8 @@ def main() -> int:
             "open_source_loc_pct": (
                 "Share of code LOC with strong OSS evidence: lockfile-backed "
                 "dependency trees, recognized OSS LICENSE/COPYING text, or "
-                "SPDX-License-Identifier with a known OSS license."
+                "SPDX-License-Identifier with a known OSS license. After the first comma: "
+                "PRs touching such code, then ',>50%:N' when N PRs have more than half of their changed LOC in it."
             ),
             "library_modules_loc_pct": (
                 "Share of code LOC under library/framework/module path segments "

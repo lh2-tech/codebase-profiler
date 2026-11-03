@@ -210,7 +210,7 @@ How it differs from Git:
 
 Results are written to `./outputs/raw-extracts/` on your computer (mounted into the container). Each run produces:
 
-- `summary.csv` (+ `summary.xlsx` when `openpyxl` is installed)
+- `summary.csv` (+ `summary.xlsx` and `project_compiled.xlsx`, colour-coded, when `openpyxl` is installed; see [Flagged duplicates](#flagged-duplicates-and-the-colour-coded-workbooks))
 - `for-check.csv`, also the second sheet (`for-check`) of `summary.xlsx` — platform-side facts for the checker (see below)
 - `duplicates.csv` — which repos of the run share commits (see [Duplicate commits](#duplicate-commits-duplicatescsv)); only when the comparison ran
 - metadata JSON under `api/` and `git/`, including `git/<org__repo>/commit_hashes.txt.gz` (commit hashes only)
@@ -219,7 +219,7 @@ Results are written to `./outputs/raw-extracts/` on your computer (mounted into 
 ```
 summary.csv  duplicates.csv  for-check.csv  job.json  manifest.json  repos.json
 api/<org__repo>/    repo.json languages.json contributors.json merged_prs.json ...
-git/<org__repo>/    git_stats.json commits.jsonl scc.json ... commit_hashes.txt.gz
+git/<org__repo>/    git_stats.json commits.jsonl scc.json ... commit_hashes.txt.gz commit_loc.txt.gz pr_signals.json
 logs/
 ```
 
@@ -228,7 +228,7 @@ logs/
 For one run, the tool compares the **commit hashes** of the repos it processed and reports, per repo, how much of its history also exists in at least one *other* repo of the run: a copy, a fork, a mirror, a repo split off another.
 
 - `commits(A)` is every hash reachable from any ref of repo A (`git rev-list --all`). It is complete: `EXTRACT_COMMIT_DETAIL_LIMIT` only trims `commits.jsonl`.
-- `summary.csv` gets three columns, appended after all existing ones:
+- `summary.csv` gets three columns, appended after all existing ones (three more follow for flagged repos, see [Flagged duplicates](#flagged-duplicates-and-the-colour-coded-workbooks)):
 
 | Column | Meaning |
 |---|---|
@@ -243,6 +243,31 @@ For one run, the tool compares the **commit hashes** of the repos it processed a
 - **Resume.** The clone is deleted after each repo, so each repo's hashes are saved while it exists, in `git/<org__repo>/commit_hashes.txt.gz` (one 40-hex hash per line, sorted, gzip). The comparison runs once at the end over every repo of the run that has such a file, so `--resume` / `--retry-failed` produce the full result, not only the repos that were re-run. A repo that fails loses its hash file and is blank.
 - **Privacy.** `commit_hashes.txt.gz` holds hashes and nothing else: no messages, authors, paths or content (`test_no_source_in_archive.py` asserts every line is 40 lowercase hex characters). A hash is not secret, but it does let someone who already has a repository check whether it is a copy of yours.
 - **Limits and cost.** Memory is about 100 bytes per distinct commit hash across the whole run (an index of 20-byte keys), so 1M distinct commits is roughly 100 MB and 10M roughly 1 GB; the work is linear in the total number of commits, not quadratic in the number of repos. `rev-list --all` follows the existing `EXTRACT_GIT_LOG_TIMEOUT` and git hardening. Hosted-platform clones carry branches and tags, not PR/MR refs (`refs/pull/*`), so a commit that only exists in a PR is not counted. Two repos that independently made a commit with identical content, author, date and parent get the same hash and so count as sharing it. A corrupt `commit_hashes.txt.gz` makes the whole comparison fail: it is logged, the columns stay blank and `duplicates.csv` is not written.
+
+### Flagged duplicates and the colour-coded workbooks
+
+A repo is **flagged** when its `duplicate_pct` is *above* `DUPLICATE_THRESHOLD_PCT` (default `25`; set it in `.env`, docker-compose passes it through; a value that is not a number between 0 and 100 falls back to 25). Only flagged repos get the three extra columns, appended after `duplicates_with`; they are blank for every other repo:
+
+| Column | Meaning |
+|---|---|
+| `duplicate_of` | the other repo that shares the most commits with this one (the full ranking stays in `duplicates_with` / `duplicates.csv`) |
+| `duplicate_loc` | lines added (code files only, same extensions as the LOC metrics) by this repo's commits that at least one other repo also holds. Taken from `git/<repo>/commit_loc.txt.gz` (`<hash> <added lines>`, numbers only) |
+| `duplicate_prs` | merged PRs/MRs whose merge or squash commit at least one other repo also holds |
+
+PRs are found by their merge/squash commit in history (the same markers as the merged-PR fallback), so a PR rebased onto the branch without any marker is not seen. All duplicate numbers are commit-hash based: a copy whose history was rewritten (squashed import, `filter-repo`) shares no hashes and is not detected.
+
+**Open source and vibe coded, per PR.** `open_source_loc_pct` and `vibe_code_signals` keep their repo-level value and now carry PR counts in the same cell, after a comma: `12.5,7` = repo value 12.5, 7 PRs affected. When at least one PR is more than 50% affected, `,>50%:N` follows (`12.5,7,>50%:2`). For `vibe_code_signals` the repo value is the LLM's JSON array, or `-` when the LLM is off (`-,3`). No PR counts means the PRs could not be analysed (time budget of 300 s per repo exceeded, or a git error).
+
+- *Open source PR*: share of the PR's changed code lines (added + deleted, net diff of the merge) in files with the same strong open-source evidence as `open_source_loc_pct` (lockfile-backed dependency trees, OSS LICENSE subtrees, SPDX headers).
+- *Vibe coded PR*: share of the PR's changed code lines in commits that carry an AI-tool signature: a `Co-Authored-By` / "Generated with" trailer naming Claude, Copilot, Cursor, Codex, Gemini, Aider, Devin or Windsurf, or a known AI agent as author/committer. A squash commit is all or nothing. This is evidence of tool use, **not** proof of authorship, and AI-written code without a signature is invisible. It is deliberately not an LLM judgement per PR (cost, and nothing to check it against).
+- Affected = share above 0; more than half = share strictly above 50%.
+- `git/<repo>/pr_signals.json` keeps numbers, PR numbers and each PR's merge/squash hash only (no paths, messages or authors).
+
+**Workbooks** (a CSV cannot hold colours; both need `openpyxl`, both are in the zip):
+
+- `summary.xlsx`, sheet `summary`: a flagged repo's `repo` cell and its six duplicate columns are orange; an `open_source_loc_pct` cell is blue and a `vibe_code_signals` cell green when at least one PR is more than 50% affected.
+- `project_compiled.xlsx`, sheet `project compiled`: one row per repo (project, language, LOC, PRs, commits, contributors, the duplicate columns, open source, vibe coded). Every repo positive for **duplicate** (orange), **open source** (blue: repo share above 0 or any PR affected) or **vibe coded** (green: any LLM signal or any PR affected) has that signal's cells coloured; the `repo` cell takes one colour (duplicate, then open source, then vibe coded). Failed repos are never coloured. Column Z holds the colour key and, under it, "How to read the cells" (the `value,PRs affected,>50%:N` format, `-` for LLM off, blank vs `0` duplicate values).
+- In both workbooks the headers of `open_source_loc_pct`, `vibe_code_signals` and the six duplicate columns carry a hover note with the column's full definition, so the sheets can be read without this README.
 
 ### for-check.csv
 
