@@ -31,3 +31,7 @@ run_offline_after_clone.sh
 watchdog_clone_pipeline.sh
 analyze_loc_composition_kits.py
 analyze_loc_composition_llm.py
+
+# Mercurial repos (UI "Mercurial (local)" mode)
+hg-repos/**/*
+!hg-repos/.gitkeep
