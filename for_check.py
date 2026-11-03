@@ -469,12 +469,26 @@ def _fill_cell(sheet, cell, color: str):
     return cell
 
 
+def _header_cell(sheet, name: str):
+    """Summary header cell, with a hover note when the column packs several numbers (see highlight.HEADER_NOTES)."""
+    from openpyxl.cell import WriteOnlyCell
+
+    value = _cell(sheet, name, True)
+    comment = highlight.header_comment(name)
+    if comment is None:
+        return value
+    # text_only: _cell gives a plain string, or an already-built cell when the name looks like a formula
+    cell = WriteOnlyCell(sheet, value=value) if isinstance(value, str) else value
+    cell.comment = comment
+    return cell
+
+
 def _append_csv(sheet, path: Path, for_check: bool, max_rows: int | None = None, fills=None) -> None:
     """``fills(header, line)`` -> {column index: hex colour}, to colour individual cells (summary sheet only)."""
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.reader(handle)
         header = next(reader, [])
-        sheet.append([_cell(sheet, h, True) for h in header])
+        sheet.append([_header_cell(sheet, h) if fills is not None else _cell(sheet, h, True) for h in header])
         text_cols = {i for i, h in enumerate(header) if h in _TEXT_COLUMNS}
         for n, line in enumerate(reader, 1):
             if max_rows is not None and n >= max_rows:

@@ -266,7 +266,8 @@ PRs are found by their merge/squash commit in history (the same markers as the m
 **Workbooks** (a CSV cannot hold colours; both need `openpyxl`, both are in the zip):
 
 - `summary.xlsx`, sheet `summary`: a flagged repo's `repo` cell and its six duplicate columns are orange; an `open_source_loc_pct` cell is blue and a `vibe_code_signals` cell green when at least one PR is more than 50% affected.
-- `project_compiled.xlsx`, sheet `project compiled`: one row per repo (project, language, LOC, PRs, commits, contributors, the duplicate columns, open source, vibe coded). Every repo positive for **duplicate** (orange), **open source** (blue: repo share above 0 or any PR affected) or **vibe coded** (green: any LLM signal or any PR affected) has that signal's cells coloured; the `repo` cell takes one colour (duplicate, then open source, then vibe coded). Failed repos are never coloured. Column Z holds the colour key.
+- `project_compiled.xlsx`, sheet `project compiled`: one row per repo (project, language, LOC, PRs, commits, contributors, the duplicate columns, open source, vibe coded). Every repo positive for **duplicate** (orange), **open source** (blue: repo share above 0 or any PR affected) or **vibe coded** (green: any LLM signal or any PR affected) has that signal's cells coloured; the `repo` cell takes one colour (duplicate, then open source, then vibe coded). Failed repos are never coloured. Column Z holds the colour key and, under it, "How to read the cells" (the `value,PRs affected,>50%:N` format, `-` for LLM off, blank vs `0` duplicate values).
+- In both workbooks the headers of `open_source_loc_pct`, `vibe_code_signals` and the six duplicate columns carry a hover note with the column's full definition, so the sheets can be read without this README.
 
 ### for-check.csv
 

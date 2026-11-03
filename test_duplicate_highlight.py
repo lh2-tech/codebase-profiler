@@ -335,6 +335,38 @@ class WorkbookTests(unittest.TestCase):
             self.assertIsNone(filled("clean", "repo"))
             self.assertEqual(sheet.cell(row=rows["oss"], column=col["loc"]).value, 20)  # numbers stay numbers
 
+    def test_summary_workbook_headers_explain_the_cell_format(self):
+        import openpyxl
+        import for_check
+
+        with tempfile.TemporaryDirectory() as tmp:
+            xlsx = for_check.write_workbook(self._summary(Path(tmp)), include_for_check=False)
+            sheet = openpyxl.load_workbook(xlsx)["summary"]
+            notes = {c.value: c.comment.text for c in sheet[1] if c.comment}
+            self.assertIn("PRs affected", notes["open_source_loc_pct"])
+            self.assertIn(">50%", notes["vibe_code_signals"])
+            self.assertIn("LLM", notes["vibe_code_signals"])
+            self.assertIn("blank", notes["duplicate_pct"].lower())
+            for name in cd.DETAIL_FIELDS:
+                self.assertIn("flagged", notes[name].lower())
+            self.assertNotIn("repo", notes)  # only the columns that need explaining
+            self.assertEqual(sheet.cell(row=2, column=1).comment, None)  # data rows carry no notes
+
+    def test_project_compiled_explains_the_cell_format_below_the_colour_key(self):
+        import openpyxl
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sheet = openpyxl.load_workbook(highlight.write_project_compiled(self._summary(Path(tmp))))[
+                "project compiled"]
+            key = [sheet.cell(row=r, column=highlight.LEGEND_COLUMN).value for r in range(1, sheet.max_row + 1)]
+            self.assertIn("How to read the cells", key)
+            text = "\n".join(v for v in key if v)
+            self.assertIn("12.5,7,>50%:2", text)
+            self.assertIn("LLM was off", text)
+            self.assertIn("not compared", text)
+            header = {c.value: c.comment.text for c in sheet[1] if c.comment}
+            self.assertIn("PRs affected", header["open_source_loc_pct"])
+
 
 if __name__ == "__main__":
     unittest.main()

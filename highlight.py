@@ -36,6 +36,51 @@ _TEXT_COLUMNS = {"project_name", "subgroup", "repo", "primary_language", "duplic
                  "vibe_code_signals"}
 
 
+_PR_COUNT_NOTE = (
+    "Format: <repo value>,<PRs affected>[,>50%:<PRs more than half affected>], e.g. 12.5,7,>50%:2. "
+    "Only the repo value (no commas) = the PRs could not be analysed."
+)
+_FLAGGED_ONLY = " Filled only for flagged repos (duplicate_pct above DUPLICATE_THRESHOLD_PCT), blank otherwise."
+# Hover notes on the header cells of both workbooks: the cells pack several numbers, and a CSV has nowhere to say so.
+HEADER_NOTES = {
+    "open_source_loc_pct": "Repo value = % of the repo's code lines in files with strong open-source evidence. "
+    "PRs affected = merged PRs that change such files. " + _PR_COUNT_NOTE,
+    "vibe_code_signals": "Repo value = the LLM's list of AI-code signals, or - when the LLM was off. "
+    "PRs affected = merged PRs with an AI-tool signature (Co-Authored-By / Generated-with trailer, AI bot author). "
+    + _PR_COUNT_NOTE,
+    "duplicate_pct": "% of this repo's commits that also exist in another repo of the run. "
+    "0.0 = compared, nothing shared. Blank = not compared (no commit hashes, or --no-dedup).",
+    "duplicate_commits": "How many of this repo's commits exist in at least one other repo of the run.",
+    "duplicates_with": "Top 3 other repos as name:% of this repo's commits. Every pair is in duplicates.csv.",
+    "duplicate_of": "The repo that shares the most commits with this one." + _FLAGGED_ONLY,
+    "duplicate_loc": "Code lines added by this repo's commits that another repo also holds." + _FLAGGED_ONLY,
+    "duplicate_prs": "Merged PRs whose merge or squash commit another repo also holds." + _FLAGGED_ONLY,
+}
+FORMAT_KEY_TITLE = "How to read the cells"
+FORMAT_KEY = [
+    "open_source_loc_pct / vibe_code_signals: <repo value>,<PRs affected>[,>50%:<PRs more than half affected>]",
+    "  e.g. 12.5,7,>50%:2 = repo value 12.5, 7 PRs affected, 2 of them more than half",
+    "  open source repo value = % of the repo's code lines in open-source files",
+    "  vibe coded repo value = the LLM's AI-code signals, - when the LLM was off",
+    "  no commas = the PRs could not be analysed (time budget, git error, Mercurial repo)",
+    "duplicate_pct: 0 = compared, nothing shared; blank = not compared",
+    "duplicate_of / duplicate_loc / duplicate_prs: flagged repos only",
+    "Hover a column header for its full definition",
+]
+
+
+def header_comment(name: str):
+    """openpyxl Comment for a header cell, or None when the column needs no explanation."""
+    text = HEADER_NOTES.get(name)
+    if text is None:
+        return None
+    from openpyxl.comments import Comment
+
+    comment = Comment(text, "codebase-profiler")
+    comment.width, comment.height = 360, 140
+    return comment
+
+
 def _filled(value: Any) -> bool:
     return str(value or "").strip() not in ("", "-", "[]")
 
@@ -129,6 +174,7 @@ def write_project_compiled(summary_csv: Path) -> Path | None:
     sheet.append(COMPILED_COLUMNS)
     for cell in sheet[1]:
         cell.font = Font(bold=True)
+        cell.comment = header_comment(cell.value)
     column = {name: i + 1 for i, name in enumerate(COMPILED_COLUMNS)}
 
     for r, row in enumerate(rows, start=2):
@@ -160,12 +206,15 @@ def write_project_compiled(summary_csv: Path) -> Path | None:
         ("Open source: open-source code found (share of LOC, or PRs touching it)", OPEN_SOURCE_COLOR),
         ("Vibe coded: AI-tool signals found (LLM signals, or PRs with an AI signature)", VIBE_COLOR),
         ("The repo name takes one colour only: duplicate, then open source, then vibe coded", None),
+        ("", None),
+        (FORMAT_KEY_TITLE, None),
+        *((line, None) for line in FORMAT_KEY),
     ]
     for offset, (text, color) in enumerate(legend, start=1):
-        cell = sheet.cell(row=offset, column=LEGEND_COLUMN, value=text)
+        cell = sheet.cell(row=offset, column=LEGEND_COLUMN, value=text or None)
         if color:
             cell.fill = fill(color)
-        elif offset == 1:
+        elif text in ("Colour key", FORMAT_KEY_TITLE):
             cell.font = Font(bold=True)
     sheet.column_dimensions["Z"].width = 90
     sheet.freeze_panes = "A2"
