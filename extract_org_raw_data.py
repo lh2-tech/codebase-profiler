@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import hg_metrics
+import p4_metrics
 from code_metrics import PR_FIELDS, STRUCTURE_FIELDS, pr_tier_metrics, structure_metrics
 import commit_dedup
 import for_check
@@ -476,7 +477,7 @@ class RepoTarget:
     full_name: str
     meta: dict[str, Any]
     local_path: Path | None = None
-    vcs: str = "git"  # git | hg (local targets only)
+    vcs: str = "git"  # git | hg | p4 (local targets only; p4 reads a Perforce server, see meta["p4"])
 
 
 def parse_tokens_file(path: Path) -> dict[str, str]:
@@ -565,7 +566,9 @@ def log_runtime_diagnostics(log: logging.Logger, args: argparse.Namespace) -> No
     log.info("resume=%s", getattr(args, "resume", None))
     log.info("offline=%s", bool(args.offline))
     log.info("llm=%s", bool(args.llm))
-    if args.offline:
+    if getattr(args, "p4_port", ""):
+        log.info("p4_port=%s p4_user=%s p4_paths=%s", args.p4_port, args.p4_user, args.p4_path)
+    elif args.offline:
         log.info("local_repos_dir=%s", args.local_repos_dir)
     else:
         log.info("github_host=%s", args.github_host)
@@ -655,7 +658,8 @@ def repo_row_key(org: str, repo: str, subgroup: str = "") -> str:
 
 
 def target_subgroup(target: "RepoTarget") -> str:
-    if target.platform == "gitlab":
+    if target.platform == "gitlab" or target.vcs == "p4":
+        # p4: full_name is "<depot>/<dir>/…/<name>"; the middle keeps two projects that end in the same name apart.
         return "/".join(target.full_name.strip("/").split("/")[1:-1])
     if target.platform == "bitbucket":
         project = (target.meta or {}).get("project")
@@ -2368,6 +2372,56 @@ def find_local_repositories(root: Path, vcs: str = "git") -> list[RepoTarget]:
     return sorted(repos, key=lambda repo: repo.full_name.lower())
 
 
+_P4_CONNS: dict[tuple[str, str], p4_metrics.P4Conn] = {}
+
+
+def p4_connection(target: RepoTarget, log: logging.Logger | None = None) -> p4_metrics.P4Conn:
+    """One logged-in connection per (server, user), shared by every Perforce target of the run.
+
+    The secret comes from the environment only (``P4_TICKET`` or ``P4_PASSWORD``): it is never a CLI
+    argument and never written to repos.json, so a resumed run needs the variable set again.
+    """
+    info = target.meta.get("p4") or {}
+    key = (str(info.get("port") or ""), str(info.get("user") or ""))
+    conn = _P4_CONNS.get(key)
+    if conn is None:
+        conn = p4_metrics.P4Conn(
+            port=key[0],
+            user=key[1],
+            password=os.environ.get("P4_TICKET") or os.environ.get("P4_PASSWORD") or "",
+        )
+        p4_metrics.connect(conn, log, fingerprint=os.environ.get("P4_FINGERPRINT", ""))
+        _P4_CONNS[key] = conn
+    return conn
+
+
+def build_p4_targets(port: str, user: str, depot_paths: list[str]) -> list[RepoTarget]:
+    """One target per depot path: ``//depot/project`` -> org ``depot``, full_name ``depot/project``."""
+    targets: list[RepoTarget] = []
+    seen: set[str] = set()
+    for raw in depot_paths:
+        scope = p4_metrics.normalize_depot_path(raw)
+        if scope in seen:
+            continue
+        seen.add(scope)
+        name = p4_metrics.slug_for(scope)
+        if "/" not in name:
+            name = f"{name}/{name}"  # a whole depot: depot/depot, so org and repo are both its name
+        targets.append(
+            RepoTarget(
+                platform="local",
+                org=name.split("/")[0],
+                full_name=name,
+                meta={"p4": {"port": port, "user": user, "depot_path": scope}},
+                local_path=None,
+                vcs="p4",
+            )
+        )
+    if not targets:
+        raise SystemExit("--p4-port needs at least one --p4-path (e.g. //depot/project)")
+    return sorted(targets, key=lambda t: t.full_name.lower())
+
+
 def discover_local_repositories(root: Path, vcs: str = "git") -> list[RepoTarget]:
     """Like ``find_local_repositories`` but returns an empty list when nothing is found."""
     if not root.is_dir():
@@ -2807,8 +2861,14 @@ def process_repo(
     meta = target.meta
     if target.platform != "local":
         write_json(api_dir / "repo.json", meta)
-    clone_path = target.local_path or clones_dir / slug
+    is_p4 = target.vcs == "p4"
+    # A Perforce target has no local folder: its head revision is synced into a scratch tree.
+    clone_path = clones_dir / f"{slug}-p4-sync" if is_p4 else target.local_path or clones_dir / slug
     is_hg = target.vcs == "hg"
+    p4_conn: p4_metrics.P4Conn | None = None
+    p4_scope = ""
+    p4_changes: list[dict[str, Any]] = []
+    p4_integrations: list[dict[str, str]] = []
     hg_repo = clone_path  # the .hg repository; clone_path may move to a scratch tree
     scratch_tree: Path | None = None
     hashes_path = commit_dedup.hash_file_path(run_dir, slug)
@@ -2901,9 +2961,14 @@ def process_repo(
 
             clone_url = bitbucket_clone_url(target.full_name, token)
         else:
-            if target.local_path is None:
+            if is_p4:
+                p4_scope = str((target.meta.get("p4") or {}).get("depot_path") or "")
+                p4_conn = p4_connection(target, log)
+            elif target.local_path is None:
                 raise RuntimeError("Local repository path is missing")
-            if is_hg:
+            if is_p4:
+                pass  # connected above; history is read from the server
+            elif is_hg:
                 if not hg_metrics.probe_local_hg(clone_path, log):
                     raise RuntimeError(
                         "Mercurial history unreadable (is `hg` installed and is "
@@ -2915,6 +2980,7 @@ def process_repo(
             row["primary_language"] = ""
             row["size_kb"] = ""
             row["default_branch"] = (
+                p4_scope if is_p4 else
                 (hg_metrics.current_branch(clone_path) if is_hg else
                  run_git(clone_path, "symbolic-ref", "--short", "HEAD").strip())
                 or "not_collected_offline"
@@ -2939,6 +3005,8 @@ def process_repo(
                 else select_latest_branch(clone_path, row["default_branch"], log)
                 or row["default_branch"]
             )
+        elif is_p4:
+            row["measured_branch"] = p4_scope  # a depot path has one head; there is no branch to pick
         else:
             wanted = client_branch_for(clone_path)
             client_pick = checkout_client_branch(clone_path, wanted, log) if wanted else ""
@@ -2948,7 +3016,14 @@ def process_repo(
                 else row["default_branch"]
             )
 
-        if is_hg:
+        if is_p4:
+            assert p4_conn is not None
+            p4_changes = list(p4_metrics.iter_changes(p4_conn, p4_scope, timeout=GIT_LOG_TIMEOUT_SECONDS, log=log))
+            git_stats = p4_metrics.aggregate_p4_stats(p4_conn, p4_scope, is_bot_author, log, changes=p4_changes)
+            scratch_tree = clone_path
+            p4_metrics.sync_working_tree(p4_conn, p4_scope, clone_path, log)
+            write_json(git_dir / "p4_stats.json", git_stats)
+        elif is_hg:
             git_stats = hg_metrics.aggregate_hg_stats(hg_repo, is_bot_author, log)
             clone_path, tree_branch, is_scratch = hg_metrics.prepare_working_tree(
                 hg_repo, clones_dir / f"{slug}-hg-archive", log
@@ -2994,7 +3069,19 @@ def process_repo(
         row["bot_authors"] = git_stats["bot_authors"]
         row["bot_commit_ratio"] = git_stats["bot_commit_ratio"]
 
-        if is_hg:
+        if is_p4:
+            _, p4_integrations = p4_metrics.export_commits_jsonl(
+                p4_conn,
+                p4_scope,
+                git_dir / "commits.jsonl",
+                changes=p4_changes,
+                is_bot=is_bot_author,
+                max_commits=COMMIT_DETAIL_LIMIT,
+                timeout=GIT_LOG_TIMEOUT_SECONDS,
+                log=log,
+                write_json=write_json,
+            )
+        elif is_hg:
             hg_metrics.export_commits_jsonl(
                 hg_repo,
                 git_dir / "commits.jsonl",
@@ -3015,7 +3102,11 @@ def process_repo(
 
         if commit_hashes_enabled:
             # Complete (not capped like commits.jsonl) and taken while the clone still exists.
-            if is_hg:
+            if is_p4:
+                # Changelist numbers are server-local, so they are never comparable between depots:
+                # no hash file, and duplicate_pct stays blank (unknown) for Perforce targets.
+                pass
+            elif is_hg:
                 # No duplicate_loc for Mercurial: commit_loc.txt.gz comes from a numstat log of a Git clone,
                 # so the column stays blank (unknown) for hg repos.
                 collect_commit_hashes_hg(hg_repo, hashes_path, log)
@@ -3030,7 +3121,9 @@ def process_repo(
         if target.platform == "local":
             primary_language, language_breakdown = scc_languages_breakdown(scc)
             detected_prs = (
-                detect_merged_prs_from_hg(hg_repo)
+                p4_integrations
+                if is_p4
+                else detect_merged_prs_from_hg(hg_repo)
                 if is_hg
                 else detect_merged_prs_from_git(clone_path)
             )
@@ -3086,7 +3179,7 @@ def process_repo(
 
         # Open source / vibe-coded: append "<PRs affected>[,>50%:<PRs mostly affected>]" to the repo-level value.
         # Git history only: a Mercurial repo keeps the repo-level value without PR counts.
-        pr_counts = None if is_hg else collect_pr_signals(clone_path, pr_signals_path, log)
+        pr_counts = None if is_hg or is_p4 else collect_pr_signals(clone_path, pr_signals_path, log)
         if pr_counts is not None:
             row["open_source_loc_pct"] = pr_signals.with_pr_counts(
                 row["open_source_loc_pct"], pr_signals.tally(pr_counts, "oss")
@@ -3722,6 +3815,19 @@ def main() -> int:
         help="Treat --local-repos-dir as Mercurial repositories (.hg); implies --offline",
     )
     parser.add_argument(
+        "--p4-port",
+        default="",
+        help="Perforce server (P4PORT, e.g. ssl:perforce.example.com:1666). Profiles each --p4-path; "
+        "implies --offline. The password/ticket is read from the P4_PASSWORD or P4_TICKET env var.",
+    )
+    parser.add_argument("--p4-user", default="", help="Perforce user name (default: $P4USER)")
+    parser.add_argument(
+        "--p4-path",
+        action="append",
+        default=[],
+        help="Depot path to profile, e.g. //depot/project (repeatable). Each becomes one repo row.",
+    )
+    parser.add_argument(
         "--local-repo",
         action="append",
         default=[],
@@ -3846,6 +3952,20 @@ def main() -> int:
             args.offline = True
             if all(t.vcs == "hg" for t in resumed_targets):
                 args.hg = True
+            if all(t.vcs == "p4" for t in resumed_targets):
+                args.p4_port = "resume"  # real server is stored per target in repos.json
+    if args.p4_port:
+        args.offline = True
+        if args.hg:
+            raise SystemExit("--p4-port and --hg are different version-control systems; pick one")
+        if not p4_metrics.p4_available():
+            raise SystemExit(
+                "--p4-port needs the `p4` command on PATH (https://www.perforce.com/downloads/helix-command-line-client-p4)."
+            )
+        if not args.p4_user:
+            args.p4_user = os.environ.get("P4USER", "")
+        if args.p4_port != "resume" and not args.p4_user:
+            raise SystemExit("--p4-port needs --p4-user (or P4USER in the environment)")
     if args.hg:
         args.offline = True
         if not hg_metrics.hg_available():
@@ -3854,7 +3974,7 @@ def main() -> int:
                 "brew install mercurial, or pip install mercurial)."
             )
 
-    if args.offline and not args.local_repos_dir and resumed_targets is None:
+    if args.offline and not args.local_repos_dir and not args.p4_port and resumed_targets is None:
         raise SystemExit("--offline requires --local-repos-dir")
     if args.offline and (
         args.github_org
@@ -3951,7 +4071,9 @@ def main() -> int:
     all_targets: list[RepoTarget] | None = resumed_targets
 
     if all_targets is None:
-        if args.offline:
+        if args.p4_port:
+            all_targets = build_p4_targets(args.p4_port, args.p4_user, args.p4_path)
+        elif args.offline:
             all_targets = find_local_repositories(
                 args.local_repos_dir.resolve(), "hg" if args.hg else "git"
             )
@@ -3972,7 +4094,9 @@ def main() -> int:
         # Prefer the original stamp from the folder name when present.
         stamp = run_dir.name.rsplit("-", 1)[-1] if "-" in run_dir.name else stamp
     else:
-        if args.offline:
+        if args.p4_port:
+            label = re.sub(r"[^A-Za-z0-9._-]+", "-", args.p4_port.split(":")[-2] if args.p4_port.count(":") >= 1 else args.p4_port) or "perforce"
+        elif args.offline:
             label = args.local_repos_dir.name
         elif args.github_org:
             label = args.github_org[0]
@@ -4208,7 +4332,19 @@ def main() -> int:
     }
     if (run_dir / commit_dedup.DUPLICATES_FILE_NAME).is_file():
         manifest["duplicates_csv"] = str(run_dir / commit_dedup.DUPLICATES_FILE_NAME)
-    if args.hg:
+    if args.p4_port:
+        manifest["vcs"] = "perforce"
+        manifest["p4_notes"] = (
+            "Read from a Perforce server with the p4 CLI; the password/ticket is never stored. Each "
+            "target is one depot path: commits are the submitted changelists touching it (files outside "
+            "the path are ignored), merged_prs counts integration changelists (action integrate/branch), "
+            "which carry no file list like a Git merge. Added/deleted file line counts come from `p4 print` "
+            "for text files (describe has no counts for them), bounded by P4_PRINT_LIMIT; see "
+            "commits_detail_meta.json. LOC/files/tests are measured on a scratch sync of the head revision. "
+            "Changelist numbers are server-local, so duplicate_pct is blank for Perforce. Details in "
+            "git/<repo>/p4_stats.json."
+        )
+    elif args.hg:
         manifest["vcs"] = "mercurial"
         manifest["hg_notes"] = (
             "History totals (commits, authors, dates, merged PRs) cover every visible "

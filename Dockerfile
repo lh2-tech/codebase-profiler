@@ -2,6 +2,7 @@ FROM python:3.11-slim-bookworm
 
 ARG TARGETARCH=amd64
 ARG SCC_VERSION=3.7.0
+ARG P4_VERSION=r25.2
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git mercurial ca-certificates curl tar \
@@ -23,12 +24,28 @@ RUN set -eux; \
     rm /tmp/scc.tgz; \
     scc --version
 
+# Perforce command-line client (not in Debian's repositories); used by the "Perforce (server)" mode.
+# The arch comes from the running image (uname), not TARGETARCH: that ARG is only set by buildx, and an
+# x86_64 p4 in an arm64 image fails to start (it is dynamically linked).
+RUN set -eux; \
+    case "$(uname -m)" in \
+      aarch64|arm64) P4_ARCH=linux26aarch64 ;; \
+      *) P4_ARCH=linux26x86_64 ;; \
+    esac; \
+    for attempt in 1 2 3; do \
+      curl -fsSL "https://cdist2.perforce.com/perforce/${P4_VERSION}/bin.${P4_ARCH}/p4" \
+        -o /usr/local/bin/p4 && break || ([ $attempt -eq 3 ] && exit 1); \
+      sleep 2; \
+    done; \
+    chmod +x /usr/local/bin/p4; \
+    p4 -V >/dev/null
+
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY extract_org_raw_data.py hg_metrics.py commit_dedup.py code_metrics.py extract_ui.py for_check.py highlight.py pr_signals.py count_merged_prs.py github_app_auth.py clone_all_repos.py LH2-DataLabs.svg ./
+COPY extract_org_raw_data.py hg_metrics.py p4_metrics.py commit_dedup.py code_metrics.py extract_ui.py for_check.py highlight.py pr_signals.py count_merged_prs.py github_app_auth.py clone_all_repos.py LH2-DataLabs.svg ./
 COPY tokens.example .
 
 # Bake every tree-sitter grammar the profiler uses into the image. The language pack otherwise

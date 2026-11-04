@@ -190,6 +190,24 @@ LOCAL_REPOS_DIR=/Users/me/customer-repos
 
 The UI uses the mounted folder automatically — no path entry needed. Optionally list specific repositories with **Load repositories** / **Repositories to include**.
 
+### Perforce (server)
+
+The **Perforce (server)** tab reads depot paths from a Perforce (Helix Core) server with the `p4` CLI and produces the same summary columns, `git_stats.json` and `commits.jsonl` as Git runs. Enter the server (`P4PORT`), user and password or ticket, then **Load depots** to pick top-level folders (or paste `//depot/project` paths). Each depot path is one repository row; the image installs `p4`.
+
+```bash
+export P4_PASSWORD=...        # or P4_TICKET; never a CLI argument, never written to disk or the archive
+python extract_org_raw_data.py --p4-port ssl:perforce.example.com:1666 --p4-user alice \
+    --p4-path //depot/project --p4-path //depot/other               # needs `p4` on PATH
+```
+
+What the numbers mean for Perforce:
+
+- **Commits** are the submitted changelists that touch the depot path; files outside the path are ignored. `merged_prs` counts *integration* changelists (action `integrate` or `branch`) — Perforce has no pull requests — and, like a Git merge commit, they carry no file list so a branch copy does not look like thousands of authored lines.
+- **Line counts.** `p4 describe` has no line counts for added or deleted files, so those come from `p4 print` for text files (binary files count 0/0). That is bounded by `P4_PRINT_LIMIT` files (default 50000) and `P4_PRINT_MAX_BYTES` per file (default 2 MiB); anything past the bound is reported in `commits_detail_meta.json`.
+- **LOC, languages, tests** are measured on a scratch sync of the head revision (through a throw-away client that is deleted afterwards).
+- **Duplicates.** Changelist numbers are server-local, so `duplicate_pct` is blank for Perforce.
+- **Auth.** A password is exchanged for a ticket (`p4 login -p`); an `ssl:` server whose fingerprint is not yet trusted needs `P4_FINGERPRINT` (or `p4 trust` once) — it is never accepted automatically. The run is read-only.
+
 ### Mercurial (local)
 
 The **Mercurial (local)** tab analyses full Mercurial clones (folders containing `.hg`) with the same summary columns, `git_stats.json` and `commits.jsonl` as Git runs. Put them in `./hg-repos` (or set `LOCAL_HG_REPOS_DIR` in `.env`); the image installs `hg`. Runs are offline.
@@ -350,6 +368,7 @@ python extract_org_raw_data.py --ui
 | `extract_ui.py` | Browser UI |
 | `commit_dedup.py` | Commit-hash comparison between repos: hash files, duplicate % columns, `duplicates.csv` |
 | `hg_metrics.py` | Mercurial history stats, per-changeset churn, working-tree export |
+| `p4_metrics.py` | Perforce history stats, per-changelist churn, head-revision sync |
 | `count_merged_prs.py` | GitHub/GitLab API helpers |
 | `for_check.py` | for-check.csv: platform-side counts/refs + summary.xlsx writer |
 | `github_app_auth.py` | GitHub App authentication |

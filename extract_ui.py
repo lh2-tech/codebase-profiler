@@ -40,6 +40,7 @@ UI_LOG_LOCK = threading.Lock()
 ZIP_LOCK = threading.Lock()
 
 import for_check  # noqa: E402
+import p4_metrics  # noqa: E402
 import highlight  # noqa: E402
 from extract_org_raw_data import (  # noqa: E402
     discover_local_repositories,
@@ -275,6 +276,8 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
     manual = parse_repo_selectors(fields.get("manual_repos", [""])[0])
     return {
         "mode": fields.get("mode", ["offline"])[0],
+        "p4_port": fields.get("p4_port", [""])[0].strip(),
+        "p4_user": fields.get("p4_user", [""])[0].strip(),
         "hosted_platform": fields.get("hosted_platform", ["github"])[0],
         "github_org": fields.get("github_org", [""])[0].strip(),
         "github_token_name": fields.get("github_token_name", ["data-lh2-github-token"])[0].strip()
@@ -873,6 +876,7 @@ __DOCKER_NOTICE__
 <div class="choices">
   <label class="choice"><input type="radio" name="mode" value="offline" checked> <strong>Already cloned here</strong><span class="small">Runs entirely offline. No internet connection is needed.</span></label>
   <label class="choice"><input type="radio" name="mode" value="hg"> <strong>Mercurial (local)</strong><span class="small">Local Mercurial (<code>.hg</code>) repositories. Runs entirely offline; needs <code>hg</code>.</span></label>
+  <label class="choice"><input type="radio" name="mode" value="p4"> <strong>Perforce (server)</strong><span class="small">Depot paths on a Perforce (Helix Core) server. Read-only; needs <code>p4</code>.</span></label>
   <label class="choice"><input type="radio" name="mode" value="hosted"> <strong>Hosted platform</strong><span class="small">Connect to a GitHub organisation, GitLab group or Bitbucket workspace with a token file.</span></label>
 </div></div>
 <div class="card">
@@ -883,6 +887,14 @@ __DOCKER_NOTICE__
   <div id="hg-fields" class="hidden">
     <div class="inline-actions"><button type="button" id="load-hg-repos" class="secondary">Load repositories</button></div>
     <p class="notice"><strong>Mercurial repositories:</strong> place full Mercurial clones (folders containing <code>.hg</code>) in the mounted hg folder on your computer (default <code>./hg-repos</code>, or the path set by <code>LOCAL_HG_REPOS_DIR</code>). History totals cover every named branch; LOC and file metrics use the checked-out working tree (or the newest open head when the clone has none). Subrepos are not followed.</p>
+  </div>
+  <div id="p4-fields" class="hidden">
+    <label class="field">Server (P4PORT)<span class="req">*</span></label><input name="p4_port" id="p4-port" placeholder="ssl:perforce.example.com:1666" autocomplete="off" spellcheck="false">
+    <label class="field">User<span class="req">*</span></label><input name="p4_user" id="p4-user" placeholder="your Perforce user" autocomplete="off" spellcheck="false">
+    <label class="field">Password or ticket <span class="small">(held in memory for this run only)</span></label><input name="p4_password" type="password" autocomplete="off" spellcheck="false" placeholder="Password, or a ticket from p4 login -p">
+    <label class="field">SSL fingerprint <span class="small">(only for a new ssl: server you have verified with your Perforce admin)</span></label><input name="p4_fingerprint" autocomplete="off" spellcheck="false" placeholder="AA:BB:CC:…">
+    <div class="inline-actions"><button type="button" id="load-p4-paths" class="secondary">Load depots</button></div>
+    <p class="notice"><strong>Perforce:</strong> each depot path becomes one repository row. Load the depots to pick top-level folders, or paste paths such as <code>//depot/project</code> below. History is the submitted changelists touching the path; integration changelists count as merges. The password or ticket is never written to disk, logs or the output archive.</p>
   </div>
   <div id="hosted-fields" class="hidden">
     <label class="field">Platform</label><select id="hosted-platform" name="hosted_platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option><option value="bitbucket">Bitbucket</option></select>
@@ -934,7 +946,7 @@ __DOCKER_NOTICE__
 const FORM_STORAGE_KEY='extract-ui-form-v8';
 const DEFAULT_LOCAL_REPOS_DIR='__DEFAULT_LOCAL_REPOS_DIR__';
 const DEFAULT_TOKENS_FILE='__DEFAULT_TOKENS_FILE__';
-const forms = {offline:document.querySelector('#offline-fields'), hg:document.querySelector('#hg-fields'), hosted:document.querySelector('#hosted-fields')};
+const forms = {offline:document.querySelector('#offline-fields'), hg:document.querySelector('#hg-fields'), p4:document.querySelector('#p4-fields'), hosted:document.querySelector('#hosted-fields')};
 let savedRepoChecks=new Set();
 function updateRepoPickerCopy(){
   const platform=document.querySelector('#hosted-platform').value;
@@ -943,6 +955,8 @@ function updateRepoPickerCopy(){
   const help=document.querySelector('#repo-selection-help');
   const manualLabel=document.querySelector('#manual-repos-label');
   const manualHelp=document.querySelector('#manual-repos-help');
+  const manualBox=document.querySelector('#manual-repos');
+  if (manualBox) { if (manualBox.dataset.ph===undefined) manualBox.dataset.ph=manualBox.placeholder; manualBox.placeholder = mode==='p4' ? '//depot/project-one\\n//depot/project-two' : manualBox.dataset.ph; }
   if (mode==='hosted' && platform==='gitlab') {
     label.textContent='Projects to include';
     help.textContent='Group mode: leave all unchecked to include every project in the selected group. All-projects mode: select the projects you want, or use Select all.';
@@ -953,6 +967,11 @@ function updateRepoPickerCopy(){
     help.textContent='Leave all unchecked to include every repository in the workspace, or select the ones you want.';
     if (manualLabel) manualLabel.textContent='Manual repository list';
     if (manualHelp) manualHelp.textContent='One workspace/repo per line. Use this when a repository is missing from the workspace listing.';
+  } else if (mode==='p4') {
+    label.textContent='Depot paths to include';
+    help.textContent='Select the folders to profile, or paste depot paths below. Nothing is profiled until at least one path is chosen.';
+    if (manualLabel) manualLabel.textContent='Depot paths';
+    if (manualHelp) manualHelp.textContent='One depot path per line, e.g. //depot/project (a trailing /... is optional).';
   } else if (mode!=='hosted') {
     label.textContent='Repositories to include';
     help.textContent='Leave all unchecked to analyse every repository found in the folder, or select the ones you want.';
@@ -972,8 +991,8 @@ function choosePlatform(){
   document.querySelector('#github-fields').classList.toggle('hidden', platform!=='github');
   document.querySelector('#gitlab-fields').classList.toggle('hidden', platform!=='gitlab');
   document.querySelector('#bitbucket-fields').classList.toggle('hidden', platform!=='bitbucket');
-  document.querySelector('#manual-repos-wrap').classList.toggle('hidden', mode!=='hosted');
-  if (mode!=='hosted') document.querySelector('#repo-picker-wrap').classList.add('hidden');
+  document.querySelector('#manual-repos-wrap').classList.toggle('hidden', mode!=='hosted' && mode!=='p4');
+  if (mode!=='hosted' && mode!=='p4') document.querySelector('#repo-picker-wrap').classList.add('hidden');
   updateRepoPickerCopy();
 }
 function chooseLlm(){ const enabled=document.querySelector('#llm-enabled').checked; const offline=document.querySelector('input[name=mode]:checked').value!=='hosted'; document.querySelector('#llm-fields').classList.toggle('hidden', !enabled); document.querySelector('#offline-llm-warning').classList.toggle('hidden', !(enabled && offline)); }
@@ -1064,6 +1083,23 @@ async function loadHgRepos(){
     const payload=await postDiscover('/discover/local', {vcs:'hg'});
     rememberRepoChecks();
     renderRepoPicker(payload.items, 'No Mercurial repositories found in the mounted hg folder.');
+  } catch (error) {
+    document.querySelector('#repo-picker-wrap').classList.add('hidden');
+    showFormError(error.message);
+  } finally {
+    setButtonLoading(button, false);
+  }
+}
+async function loadP4Paths(){
+  showFormError('');
+  const button=document.querySelector('#load-p4-paths');
+  setButtonLoading(button, true, 'Load depots');
+  showRepoPickerLoading('Reading depots from the Perforce server…');
+  try {
+    const val=n=>(document.querySelector('[name='+n+']')?.value||'').trim();
+    const payload=await postDiscover('/discover/p4', {p4_port:val('p4_port'), p4_user:val('p4_user'), p4_password:val('p4_password'), p4_fingerprint:val('p4_fingerprint')});
+    rememberRepoChecks();
+    renderRepoPicker(payload.items, 'No depots visible to this user.');
   } catch (error) {
     document.querySelector('#repo-picker-wrap').classList.add('hidden');
     showFormError(error.message);
@@ -1195,6 +1231,11 @@ function validateForm(){
   const data=readFormSettings();
   const errors=[];
   const isResume=!!(data.resume_run_dir||'').trim();
+  if (data.mode==='p4' && !isResume) {
+    if (!data.p4_port.trim()) errors.push(['p4-port','Enter the Perforce server (P4PORT).']);
+    if (!data.p4_user.trim()) errors.push(['p4-user','Enter the Perforce user name.']);
+    if (!getSelectedRepos().length && !getManualRepos().length) errors.push(['manual-repos','Load depots and select paths, or paste depot paths such as //depot/project.']);
+  }
   if (data.mode==='hosted') {
     if (data.hosted_platform==='github') {
       const ghToken=(document.querySelector('[name=github_token]')?.value||'').trim();
@@ -1242,6 +1283,8 @@ function readFormSettings(){
   const data=new FormData(form);
   return {
     mode:data.get('mode')||'offline',
+    p4_port:data.get('p4_port')||'',
+    p4_user:data.get('p4_user')||'',
     hosted_platform:data.get('hosted_platform')||'github',
     github_org:data.get('github_org')||'',
     github_token_name:data.get('github_token_name')||'data-lh2-github-token',
@@ -1265,6 +1308,8 @@ function restoreFormSettings(settings){
   const modeInput=document.querySelector('input[name=mode][value="'+(settings.mode||'offline')+'"]');
   if (modeInput) modeInput.checked=true;
   const setValue=(name,value)=>{ const el=document.querySelector('[name="'+name+'"]'); if (el && value!=null) el.value=value; };
+  setValue('p4_port', settings.p4_port||'');
+  setValue('p4_user', settings.p4_user||'');
   setValue('hosted_platform', settings.hosted_platform||'github');
   setValue('github_org', settings.github_org||'');
   setValue('github_token_name', settings.github_token_name||'data-lh2-github-token');
@@ -1376,6 +1421,7 @@ document.querySelector('#hosted-platform').addEventListener('change',choosePlatf
 document.querySelector('#llm-enabled').addEventListener('change',chooseLlm);
 document.querySelector('#load-local-repos').addEventListener('click', loadLocalRepos);
 document.querySelector('#load-hg-repos').addEventListener('click', loadHgRepos);
+document.querySelector('#load-p4-paths').addEventListener('click', loadP4Paths);
 document.querySelector('#load-github-orgs').addEventListener('click', loadHostedOrgs);
 document.querySelector('#load-github-accessible').addEventListener('click', loadAccessibleGithubRepos);
 document.querySelector('#load-gitlab-groups').addEventListener('click', loadHostedOrgs);
@@ -1785,6 +1831,7 @@ class Handler(BaseHTTPRequestHandler):
             "/discover/orgs",
             "/discover/repos",
             "/discover/accessible-repos",
+            "/discover/p4",
         }:
             self.respond(HTTPStatus.NOT_FOUND, "text/plain", "Not found")
             return
@@ -1851,6 +1898,39 @@ class Handler(BaseHTTPRequestHandler):
                 ui_log(f"Discover local ok path={local_dir!r} count={len(items)}")
             except Exception as exc:
                 ui_log(f"Discover local failed path={local_dir!r}", exc=exc)
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "application/json",
+                    json.dumps({"error": str(exc)[:500]}),
+                )
+                return
+            self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": items}))
+            return
+        if path == "/discover/p4":
+            port = fields.get("p4_port", [""])[0].strip()
+            user = fields.get("p4_user", [""])[0].strip()
+            if not port or not user:
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "application/json",
+                    json.dumps({"error": "Enter the Perforce server (P4PORT) and user first."}),
+                )
+                return
+            try:
+                conn = p4_metrics.P4Conn(
+                    port=port, user=user, password=fields.get("p4_password", [""])[0]
+                )
+                p4_metrics.connect(conn, fingerprint=fields.get("p4_fingerprint", [""])[0].strip())
+                items: list[dict[str, str]] = []
+                for depot in p4_metrics.list_depots(conn):
+                    if depot["type"] not in ("local", "stream"):
+                        continue  # spec / unload / archive / graph depots hold no project history
+                    dirs = p4_metrics.list_top_dirs(conn, depot["name"])
+                    for d in dirs or [f"//{depot['name']}"]:
+                        items.append({"id": d, "name": d})
+                ui_log(f"Discover p4 ok server={port!r} count={len(items)}")
+            except Exception as exc:  # noqa: BLE001 - p4 errors are already credential-free
+                ui_log(f"Discover p4 failed server={port!r}", exc=exc)
                 self.respond(
                     HTTPStatus.BAD_REQUEST,
                     "application/json",
@@ -2106,6 +2186,35 @@ class Handler(BaseHTTPRequestHandler):
             if not resume_run_dir:
                 for repo_name in selected_repos:
                     command.extend(["--local-repo", repo_name])
+        elif mode == "p4":
+            p4_port = fields.get("p4_port", [""])[0].strip()
+            p4_user = fields.get("p4_user", [""])[0].strip()
+            p4_paths = merge_repo_selectors(selected_repos, manual_repos)
+            if not resume_run_dir and not (p4_port and p4_user and p4_paths):
+                self.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    "text/plain",
+                    "Enter the Perforce server and user, and choose at least one depot path.",
+                )
+                return
+            if not resume_run_dir and any(not p.startswith("//") for p in p4_paths):
+                self.respond(
+                    HTTPStatus.BAD_REQUEST, "text/plain", "Depot paths must start with // (e.g. //depot/project)."
+                )
+                return
+            # A resumed run reads the server and paths from its repos.json; only the secret is needed again.
+            command.extend(["--p4-port", p4_port or "resume"])
+            if p4_user:
+                command.extend(["--p4-user", p4_user])
+            if not resume_run_dir:
+                for depot_path in p4_paths:
+                    command.extend(["--p4-path", depot_path])
+            secret = fields.get("p4_password", [""])[0].strip()
+            if secret:
+                env_overrides["P4_PASSWORD"] = secret
+            fingerprint = fields.get("p4_fingerprint", [""])[0].strip()
+            if fingerprint:
+                env_overrides["P4_FINGERPRINT"] = fingerprint
         elif mode == "hosted":
             platform = fields.get("hosted_platform", ["github"])[0]
             tokens_file = default_tokens_file()
