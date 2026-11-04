@@ -53,6 +53,7 @@ from typing import Any, Callable
 
 import hg_metrics
 import p4_metrics
+import vcs_extra
 from code_metrics import PR_FIELDS, STRUCTURE_FIELDS, pr_tier_metrics, structure_metrics
 import commit_dedup
 import for_check
@@ -3152,6 +3153,28 @@ def process_repo(
 
         row["project_name"] = org
         row["total_files"] = count_total_files(clone_path)
+        if is_hg or is_p4:
+            # Metrics the Git-shaped summary hides (change size, binary share, activity, authorship, branch copies).
+            extra: dict[str, Any] = {}
+            if is_p4:
+                assert p4_conn is not None
+                git_stats["integration_changelists"] = len(p4_integrations)
+                write_json(git_dir / "p4_stats.json", git_stats)
+                extra.update(p4_metrics.branch_origin(p4_conn, p4_scope, row["total_files"], log))
+            else:
+                extra["has_largefiles"] = (clone_path / ".hglf").is_dir()
+                extra["has_subrepos"] = bool(git_stats.get("has_subrepos"))
+            write_json(
+                git_dir / "vcs_extra.json",
+                vcs_extra.collect(
+                    repo=target.full_name,
+                    vcs=target.vcs,
+                    tree=clone_path,
+                    commits_jsonl=git_dir / "commits.jsonl",
+                    stats=git_stats,
+                    extra=extra,
+                ),
+            )
         row["has_tests"] = detect_tests(clone_path)
         row["has_test_runner"] = detect_test_runner(clone_path)
         row["has_ci_cd"] = detect_ci_cd(clone_path)
@@ -4228,6 +4251,8 @@ def main() -> int:
     checkpoint.replace_rows(rows)
 
     summary_path = checkpoint.summary_path
+    if any(t.vcs in ("hg", "p4") for t in all_targets):
+        vcs_extra.write_run_csv(run_dir, vcs_extra.load_run_records(run_dir))
     if not args.no_for_check and for_check.write_run_csv(run_dir) is None:
         log.warning("for-check.csv could not be written")
     try:
@@ -4330,6 +4355,8 @@ def main() -> int:
             else {"enabled": False}
         ),
     }
+    if (run_dir / "vcs_extra_metrics.csv").is_file():
+        manifest["vcs_extra_metrics_csv"] = str(run_dir / "vcs_extra_metrics.csv")
     if (run_dir / commit_dedup.DUPLICATES_FILE_NAME).is_file():
         manifest["duplicates_csv"] = str(run_dir / commit_dedup.DUPLICATES_FILE_NAME)
     if args.p4_port:

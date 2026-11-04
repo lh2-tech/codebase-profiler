@@ -190,6 +190,25 @@ LOCAL_REPOS_DIR=/Users/me/customer-repos
 
 The UI uses the mounted folder automatically — no path entry needed. Optionally list specific repositories with **Load repositories** / **Repositories to include**.
 
+### Extra metrics for Mercurial and Perforce (`vcs_extra_metrics.csv`)
+
+The summary columns are the same for every VCS so sheets stay comparable, but they hide things that matter
+for non-Git history. Mercurial and Perforce runs therefore also write `vcs_extra_metrics.csv` (one row per
+repo; the full detail is in `git/<repo>/vcs_extra.json`):
+
+| Group | Columns | Why |
+|-------|---------|-----|
+| Change size | `median_lines_per_change`, `p90_…`, `max_lines_in_a_change`, `median_files_per_change`, `mega_changes_pct` | A Perforce changelist is not a Git commit; compare granularity before comparing commit counts |
+| Content mix | `files`, `total_bytes`, `binary_files_pct`, `binary_bytes_pct`, `files_over_10mb`, `largest_file_bytes` | LOC says nothing about asset-heavy repos (game, CAD, media) |
+| Activity | `commits_last_90d/365d`, `active_authors_90d/365d`, `active_months`, `longest_gap_days` | Alive or abandoned |
+| Authorship | `top_author_share_pct`, `authors_for_80pct_of_commits` | Concentration / bus factor |
+| Message quality | `generic_message_pct`, `review_tagged_pct` | Empty or default messages; review markers (`#review-123`, `Reviewed-by`, `r=`…) in the subject |
+| Merges and branches | `merge_or_integration_commits/pct`, `branch_or_stream_count`, `has_subrepos`, `has_largefiles` | History shape |
+| Branch copies (Perforce) | `branch_copy_pct`, `integration_sources` | Share of the path that was branched from another depot path, from Perforce's own integration records. Count such paths once, or their LOC and history are double-counted |
+
+Mercurial `has_largefiles` flags repos whose big files are stored outside the history. `review_tagged_pct`
+only sees the first line of the message, so it is a floor, not a review rate.
+
 ### Perforce (server)
 
 The **Perforce (server)** tab reads depot paths from a Perforce (Helix Core) server with the `p4` CLI and produces the same summary columns, `git_stats.json` and `commits.jsonl` as Git runs. Enter the server (`P4PORT`), user and password or ticket, then **Load depots** to pick top-level folders (or paste `//depot/project` paths). Each depot path is one repository row; the image installs `p4`.

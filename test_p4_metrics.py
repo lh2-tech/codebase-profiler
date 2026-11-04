@@ -270,6 +270,13 @@ class P4ServerTests(unittest.TestCase):
         clients = p4.run_marshal(self.conn, "clients", "-e", "datalabs-*")
         self.assertEqual(clients, [])  # the throw-away client is gone
 
+    def test_branch_origin_flags_a_branched_copy(self) -> None:
+        rel = p4.branch_origin(self.conn, "//depot/rel", tree_files=5)
+        self.assertEqual(rel["branch_copy_pct"], 100.0)
+        self.assertEqual(rel["integration_sources"], ["//depot/main (5)"])
+        main = p4.branch_origin(self.conn, "//depot/main", tree_files=4)
+        self.assertEqual((main["branch_copy_pct"], main["integration_sources"]), (0.0, []))
+
     def test_discovery(self) -> None:
         self.assertEqual([d["name"] for d in p4.list_depots(self.conn)], ["depot"])
         self.assertEqual(p4.list_top_dirs(self.conn, "depot"), ["//depot/main", "//depot/other", "//depot/rel"])
@@ -327,6 +334,15 @@ class P4AuthAndEndToEndTests(unittest.TestCase):
         self.assertEqual(main["primary_language"], "Python")
         self.assertEqual(main["duplicate_pct"], "")  # changelist numbers are server-local
         self.assertTrue((run / "git/depot__main/p4_stats.json").is_file())
+        with (run / "vcs_extra_metrics.csv").open() as fh:
+            extra = {r["repo"]: r for r in csv.DictReader(fh)}
+        self.assertEqual(extra["depot/rel"]["branch_copy_pct"], "100.0")
+        self.assertEqual(extra["depot/rel"]["integration_sources"], "//depot/main (5)")
+        self.assertEqual(extra["depot/main"]["branch_copy_pct"], "0.0")
+        self.assertEqual(extra["depot/main"]["vcs"], "p4")
+        self.assertEqual(extra["depot/main"]["total_commits"], "6")
+        self.assertEqual(extra["depot/main"]["median_lines_per_change"], "3.0")
+        self.assertGreater(float(extra["depot/main"]["binary_bytes_pct"]), 90)  # logo.bin dominates by size
         manifest = json.loads((run / "manifest.json").read_text())
         self.assertEqual(manifest["vcs"], "perforce")
         self.assertFalse((run / "clones").exists() and any((run / "clones").iterdir()))

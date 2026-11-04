@@ -582,6 +582,52 @@ def export_commits_jsonl(
     return count, integrations
 
 
+def branch_origin(
+    conn: P4Conn,
+    depot_path: str,
+    tree_files: int,
+    log: logging.Logger | None = None,
+    limit: int = 300000,
+) -> dict[str, Any]:
+    """How much of this path is a branch of somewhere else, from Perforce's own integration records.
+
+    A path created by ``p4 integ`` from another path is a copy: its LOC and history are not independent
+    work. ``branch_copy_pct`` is the share of the synced files that have an integration record from
+    *outside* this path (capped at 100: deleted files are in the records but not in the tree).
+    Integrations from inside the same path are ordinary merges and ignored. Reading stops after
+    ``limit`` records on a huge depot and says so.
+    """
+    prefix = path_prefix(depot_path)
+    scope = normalize_depot_path(depot_path)
+    into: set[str] = set()
+    sources: dict[str, int] = {}
+    n = 0
+    truncated = False
+    try:
+        for r in iter_marshal(conn, "integrated", scope, log=log, timeout=900):
+            n += 1
+            if n > limit:
+                truncated = True
+                break
+            to, frm = r.get("toFile", ""), r.get("fromFile", "")
+            # `p4 integrated` also lists the mirror record where this path is the *source* ("branch into",
+            # "merge into"); only inbound ones ("branch from", "merge from", …) say where this path came from.
+            if not r.get("how", "").endswith(" from") or not to.startswith(prefix) or not frm or frm.startswith(prefix):
+                continue
+            into.add(to)
+            root = "/".join(frm.split("/")[:4])  # //depot/<a>
+            sources[root] = sources.get(root, 0) + 1
+    except P4Error:
+        return {"integration_sources": [], "branch_copy_pct": None, "notes": "p4 integrated unreadable"}
+    top = sorted(sources.items(), key=lambda kv: -kv[1])[:5]
+    return {
+        "integrated_files": len(into),
+        "branch_copy_pct": round(min(100.0, 100 * len(into) / tree_files), 1) if tree_files else None,
+        "integration_sources": [f"{path} ({count})" for path, count in top],
+        "notes": f"integration records read up to {limit}" if truncated else "",
+    }
+
+
 # --------------------------------------------------------------------------- working tree
 
 
