@@ -35,3 +35,5 @@ analyze_loc_composition_llm.py
 # Mercurial repos (UI "Mercurial (local)" mode)
 hg-repos/**/*
 !hg-repos/.gitkeep
+p4-workspaces/**/*
+!p4-workspaces/.gitkeep

@@ -190,6 +190,10 @@ LOCAL_REPOS_DIR=/Users/me/customer-repos
 
 The UI uses the mounted folder automatically — no path entry needed. Optionally list specific repositories with **Load repositories** / **Repositories to include**.
 
+### Live logs
+
+While a run is going, **Download live log** (next to *Download support logs*) saves the whole log of the current run as it is at that moment; the run keeps appending, so download again for a newer copy. *Download support logs* still bundles the log with the UI log for sending to support.
+
 ### Extra metrics for Mercurial and Perforce (`vcs_extra_metrics.csv`)
 
 The summary columns are the same for every VCS so sheets stay comparable, but they hide things that matter
@@ -225,6 +229,7 @@ What the numbers mean for Perforce:
 - **Line counts.** `p4 describe` has no line counts for added or deleted files, so those come from `p4 print` for text files (binary files count 0/0). That is bounded by `P4_PRINT_LIMIT` files (default 50000) and `P4_PRINT_MAX_BYTES` per file (default 2 MiB); anything past the bound is reported in `commits_detail_meta.json`.
 - **LOC, languages, tests** are measured on a scratch sync of the head revision (through a throw-away client that is deleted afterwards).
 - **Duplicates.** Changelist numbers are server-local, so `duplicate_pct` is blank for Perforce.
+- **Download vs. local workspace.** By default the head revision is downloaded into a scratch folder (deleted afterwards), which is slow on a big depot; the log says how many files and bytes it is about to fetch and reports progress every 20 s. If the files are already on this computer, point the run at them instead: UI -> "Where are the files measured from?" -> "Use workspaces I already have" (put them in `./p4-workspaces`, or `LOCAL_P4_WORKSPACES_DIR`), or on the command line `--p4-local-root ROOT` (looks for `ROOT/<path under the depot>`, then `ROOT/<depot>/<path>`) and `--p4-local-dir //depot/project=/some/folder` per path. Nothing is downloaded and nothing in your folders is changed or deleted; a path with no folder fails rather than quietly downloading. Run `p4 sync` first: the run compares file count and size with the server head (`workspace_check` in `p4_stats.json`) and warns when they differ by more than 2%, because a stale folder or untracked build output skews LOC, language and test metrics. History (changelists, authors, churn) always comes from the server.
 - **Auth.** A password is exchanged for a ticket (`p4 login -p`); an `ssl:` server whose fingerprint is not yet trusted needs `P4_FINGERPRINT` (or `p4 trust` once) — it is never accepted automatically. The run is read-only.
 
 ### Mercurial (local)

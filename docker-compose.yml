@@ -7,6 +7,7 @@ services:
       EXTRACT_UI_DOCKER: "1"
       DEFAULT_LOCAL_REPOS_DIR: /data/repos
       DEFAULT_HG_REPOS_DIR: /data/hg-repos
+      DEFAULT_P4_WORKSPACES_DIR: /data/p4-workspaces
       DEFAULT_TOKENS_FILE: /app/secrets/tokens
       HOST_OUTPUT_HINT: ./outputs/raw-extracts
       PYTHONUNBUFFERED: "1"
@@ -19,4 +20,5 @@ services:
       - ./outputs:/app/outputs
       - ${LOCAL_REPOS_DIR:-./repos}:/data/repos:ro
       - ${LOCAL_HG_REPOS_DIR:-./hg-repos}:/data/hg-repos:ro
+      - ${LOCAL_P4_WORKSPACES_DIR:-./p4-workspaces}:/data/p4-workspaces:ro
     restart: unless-stopped
