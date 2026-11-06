@@ -278,6 +278,7 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
         "mode": fields.get("mode", ["offline"])[0],
         "p4_port": fields.get("p4_port", [""])[0].strip(),
         "p4_user": fields.get("p4_user", [""])[0].strip(),
+        "p4_tree_source": "local" if fields.get("p4_tree_source", [""])[0] == "local" else "download",
         "hosted_platform": fields.get("hosted_platform", ["github"])[0],
         "github_org": fields.get("github_org", [""])[0].strip(),
         "github_token_name": fields.get("github_token_name", ["data-lh2-github-token"])[0].strip()
@@ -729,6 +730,24 @@ def default_hg_repos_dir() -> str:
     )
 
 
+def default_p4_workspaces_dir() -> str:
+    """Folder of already-synced Perforce workspaces (mounted read-only in Docker), used instead of downloading."""
+    return os.environ.get(
+        "DEFAULT_P4_WORKSPACES_DIR",
+        "/data/p4-workspaces" if is_docker_mode() else str((ROOT / "p4-workspaces").resolve()),
+    )
+
+
+def live_log_path() -> Path | None:
+    """The running (or last) run's full ``logs/extract.log``, readable while the run is still going."""
+    with LOCK:
+        run_dir_value = STATE.get("run_dir")
+    if not run_dir_value:
+        return None
+    candidate = Path(str(run_dir_value)) / "logs" / "extract.log"
+    return candidate if candidate.is_file() and is_under_archive(candidate) else None
+
+
 def default_tokens_file() -> str:
     docker_mode = is_docker_mode()
     return os.environ.get(
@@ -893,6 +912,9 @@ __DOCKER_NOTICE__
     <label class="field">User<span class="req">*</span></label><input name="p4_user" id="p4-user" placeholder="your Perforce user" autocomplete="off" spellcheck="false">
     <label class="field">Password or ticket <span class="small">(held in memory for this run only)</span></label><input name="p4_password" type="password" autocomplete="off" spellcheck="false" placeholder="Password, or a ticket from p4 login -p">
     <label class="field">SSL fingerprint <span class="small">(only for a new ssl: server you have verified with your Perforce admin)</span></label><input name="p4_fingerprint" autocomplete="off" spellcheck="false" placeholder="AA:BB:CC:…">
+    <label class="field">Where are the files measured from?</label>
+    <select name="p4_tree_source" id="p4-tree-source"><option value="download">Download the head revision from the server</option><option value="local">Use workspaces I already have on this computer</option></select>
+    <p id="p4-local-note" class="notice hidden"><strong>Local workspaces:</strong> put the synced folders in the mounted workspaces folder (default <code>./p4-workspaces</code>, or the path set by <code>LOCAL_P4_WORKSPACES_DIR</code>). For <code>//depot/project</code> the folder is looked up as <code>p4-workspaces/project</code>, then <code>p4-workspaces/depot/project</code>. Nothing is downloaded, and nothing is ever deleted from your folders. A path with no folder fails instead of falling back to a download. Run <code>p4 sync</code> first so the folder is at head: the run compares file count and size with the server and warns if they differ.</p>
     <div class="inline-actions"><button type="button" id="load-p4-paths" class="secondary">Load depots</button></div>
     <p class="notice"><strong>Perforce:</strong> each depot path becomes one repository row. Load the depots to pick top-level folders, or paste paths such as <code>//depot/project</code> below. History is the submitted changelists touching the path; integration changelists count as merges. The password or ticket is never written to disk, logs or the output archive.</p>
   </div>
@@ -931,9 +953,10 @@ __DOCKER_NOTICE__
 <div class="actions" style="margin-top:12px">
   <a id="download-partial-summary" class="button-link secondary disabled" href="#">Download partial summary</a>
   <a id="download-partial-zip" class="button-link secondary disabled" href="#">Download partial archive zip</a>
+  <a id="download-live-log" class="button-link secondary disabled" href="#">Download live log</a>
   <a id="download-support-logs" class="button-link secondary disabled" href="#">Download support logs</a>
 </div>
-<p class="notice">Support logs are written under <code>outputs/raw-extracts/support-logs/</code> and each run’s <code>logs/</code> folder.</p>
+<p class="notice"><strong>Download live log</strong> saves the full log of the current run as it is right now, while it is still running. <strong>Download support logs</strong> bundles it with the UI log for sending to support. Support logs are written under <code>outputs/raw-extracts/support-logs/</code> and each run’s <code>logs/</code> folder.</p>
 </div>
 <div id="results" class="card hidden"><strong>Results</strong>
 <div class="actions">
@@ -984,7 +1007,8 @@ function updateRepoPickerCopy(){
     if (manualHelp) manualHelp.textContent='One owner/repo per line. Use this for repos granted by direct invite that do not appear in the organisation picker.';
   }
 }
-function choose(){ const mode=document.querySelector('input[name=mode]:checked').value; Object.entries(forms).forEach(([k,e])=>e.classList.toggle('hidden', k!==mode)); choosePlatform(); chooseLlm(); updateRepoPickerCopy(); }
+function chooseP4Source(){ const el=document.querySelector('#p4-tree-source'); const note=document.querySelector('#p4-local-note'); if (el && note) note.classList.toggle('hidden', el.value!=='local'); }
+function choose(){ chooseP4Source(); const mode=document.querySelector('input[name=mode]:checked').value; Object.entries(forms).forEach(([k,e])=>e.classList.toggle('hidden', k!==mode)); choosePlatform(); chooseLlm(); updateRepoPickerCopy(); }
 function choosePlatform(){
   const mode=document.querySelector('input[name=mode]:checked').value;
   const platform=document.querySelector('#hosted-platform').value;
@@ -1285,6 +1309,7 @@ function readFormSettings(){
     mode:data.get('mode')||'offline',
     p4_port:data.get('p4_port')||'',
     p4_user:data.get('p4_user')||'',
+    p4_tree_source:data.get('p4_tree_source')||'download',
     hosted_platform:data.get('hosted_platform')||'github',
     github_org:data.get('github_org')||'',
     github_token_name:data.get('github_token_name')||'data-lh2-github-token',
@@ -1310,6 +1335,7 @@ function restoreFormSettings(settings){
   const setValue=(name,value)=>{ const el=document.querySelector('[name="'+name+'"]'); if (el && value!=null) el.value=value; };
   setValue('p4_port', settings.p4_port||'');
   setValue('p4_user', settings.p4_user||'');
+  setValue('p4_tree_source', settings.p4_tree_source||'download');
   setValue('hosted_platform', settings.hosted_platform||'github');
   setValue('github_org', settings.github_org||'');
   setValue('github_token_name', settings.github_token_name||'data-lh2-github-token');
@@ -1422,6 +1448,7 @@ document.querySelector('#llm-enabled').addEventListener('change',chooseLlm);
 document.querySelector('#load-local-repos').addEventListener('click', loadLocalRepos);
 document.querySelector('#load-hg-repos').addEventListener('click', loadHgRepos);
 document.querySelector('#load-p4-paths').addEventListener('click', loadP4Paths);
+document.querySelector('#p4-tree-source').addEventListener('change', chooseP4Source);
 document.querySelector('#load-github-orgs').addEventListener('click', loadHostedOrgs);
 document.querySelector('#load-github-accessible').addEventListener('click', loadAccessibleGithubRepos);
 document.querySelector('#load-gitlab-groups').addEventListener('click', loadHostedOrgs);
@@ -1545,6 +1572,16 @@ async function refresh(){
     } else {
       supportLink.href='#';
       supportLink.classList.add('disabled');
+    }
+  }
+  const liveLink=document.querySelector('#download-live-log');
+  if (liveLink) {
+    if (data.run_dir) {
+      liveLink.href='/download/live-log?'+token;
+      liveLink.classList.remove('disabled');
+    } else {
+      liveLink.href='#';
+      liveLink.classList.add('disabled');
     }
   }
   const canDownloadPartial=!!(data.summary_path || data.run_dir);
@@ -1717,6 +1754,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond_file(summary_path, "summary.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             else:
                 self.respond_file(summary_path, "summary.csv", "text/csv; charset=utf-8")
+            return
+        if path == "/download/live-log":
+            if not secrets.compare_digest(query.get("csrf_token", [""])[0], CSRF_TOKEN):
+                self.respond(HTTPStatus.FORBIDDEN, "text/plain", "Invalid request token.")
+                return
+            log_file = live_log_path()
+            if log_file is None:
+                self.respond(HTTPStatus.NOT_FOUND, "text/plain", "No run log is available yet.")
+                return
+            # the whole file as it is right now (the run keeps appending); a snapshot, not a stream
+            self.respond_file(log_file, f"extract-live-{datetime.now(timezone.utc).strftime('%H%M%S')}.log",
+                              "text/plain; charset=utf-8")
             return
         if path == "/download/support-logs":
             if not secrets.compare_digest(query.get("csrf_token", [""])[0], CSRF_TOKEN):
@@ -2202,8 +2251,23 @@ class Handler(BaseHTTPRequestHandler):
                     HTTPStatus.BAD_REQUEST, "text/plain", "Depot paths must start with // (e.g. //depot/project)."
                 )
                 return
+            if fields.get("p4_tree_source", [""])[0] == "local":
+                p4_workspaces = default_p4_workspaces_dir()
+                if not resume_run_dir and (not p4_workspaces or not Path(p4_workspaces).is_dir()):
+                    self.respond(
+                        HTTPStatus.BAD_REQUEST,
+                        "text/plain",
+                        "Mounted workspaces folder not found. Put your synced Perforce workspaces in "
+                        "./p4-workspaces (or the LOCAL_P4_WORKSPACES_DIR path from .env), or choose "
+                        "to download from the server.",
+                    )
+                    return
+            else:
+                p4_workspaces = ""
             # A resumed run reads the server and paths from its repos.json; only the secret is needed again.
             command.extend(["--p4-port", p4_port or "resume"])
+            if p4_workspaces and not resume_run_dir:
+                command.extend(["--p4-local-root", p4_workspaces])
             if p4_user:
                 command.extend(["--p4-user", p4_user])
             if not resume_run_dir:

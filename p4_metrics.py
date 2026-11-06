@@ -32,6 +32,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -170,6 +171,18 @@ def iter_marshal(
         deadline = time.monotonic() + timeout
         assert proc.stdout is not None
         seen = 0
+        # The deadline below is only checked when a record arrives; `sync -q` and a hung connect produce none,
+        # so a watchdog kills the process at the deadline regardless.
+        timed_out = threading.Event()
+
+        def _expire() -> None:
+            timed_out.set()
+            if proc.poll() is None:
+                proc.kill()
+
+        watchdog = threading.Timer(timeout, _expire)
+        watchdog.daemon = True
+        watchdog.start()
         try:
             while True:
                 try:
@@ -188,16 +201,19 @@ def iter_marshal(
                     proc.kill()
                     raise subprocess.TimeoutExpired(cmd, timeout)
             proc.wait()
+            if timed_out.is_set():
+                raise subprocess.TimeoutExpired(cmd, timeout)
             if proc.returncode != 0 and seen == 0:
                 # Nothing marshalled at all: the connection itself failed (refused, SSL, DNS…).
                 err_f.seek(0)
                 raise P4Error(_scrub(conn, err_f.read().strip() or f"p4 exited {proc.returncode}")[:300])
         finally:
+            watchdog.cancel()
             if proc.poll() is None:
                 proc.kill()
             proc.stdout.close()
             proc.wait()
-            if proc.returncode not in (0, None) and seen and log is not None:
+            if proc.returncode not in (0, None) and seen and log is not None and not timed_out.is_set():
                 err_f.seek(0)
                 log.warning("p4 exited %s: %s", proc.returncode, _scrub(conn, err_f.read().strip())[:300])
 
@@ -468,6 +484,7 @@ def export_commits_jsonl(
     """
     users = user_directory(conn)
     prefix = path_prefix(depot_path)
+    scope_label = normalize_depot_path(depot_path)
     capped = bool(max_commits and len(changes) > max_commits)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     integrations: list[dict[str, str]] = []
@@ -510,6 +527,8 @@ def export_commits_jsonl(
             if time.monotonic() > deadline:
                 raise subprocess.TimeoutExpired("p4 describe", timeout)
             batch = changes[start : start + DESCRIBE_BATCH]
+            if log is not None and start and (start // DESCRIBE_BATCH) % 25 == 0:
+                log.info("p4 %s: described %s of %s changelists", scope_label, f"{start:,}", f"{len(changes):,}")
             detailed = not capped or start < max_commits
             flag = "-du" if detailed else "-s"
             text = run_p4_text(
@@ -641,12 +660,105 @@ def _force_rmtree(path: Path) -> None:
     shutil.rmtree(path, onerror=onerror)
 
 
+def head_size(conn: P4Conn, depot_path: str) -> tuple[int, int] | None:
+    """``(files, bytes)`` of the head revision of the path (deleted files excluded), or None if unreadable.
+
+    One cheap server-side summary: it is how a run learns, before downloading anything, how big the
+    download will be."""
+    try:
+        for r in iter_marshal(conn, "sizes", "-s", normalize_depot_path(depot_path), timeout=300):
+            return int(r.get("fileCount", 0)), int(r.get("fileSize", 0))
+    except (P4Error, subprocess.TimeoutExpired):
+        return None
+    return 0, 0
+
+
+def human_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n} B"
+
+
+def resolve_local_tree(
+    depot_path: str,
+    root: str | Path | None = None,
+    overrides: dict[str, str] | None = None,
+) -> Path:
+    """The folder that already holds this depot path on this machine (a synced workspace), so nothing is downloaded.
+
+    ``overrides`` maps a depot path to its folder exactly. Otherwise ``root`` is a workspace root and the folder
+    is looked up the usual ways: ``ROOT/<path under the depot>`` (workspace maps ``//depot/...`` to the root) or
+    ``ROOT/<depot>/<path under the depot>``. Raises P4Error, naming every place tried, when nothing is found —
+    a run that asked for a local tree must never silently fall back to a large download.
+    """
+    scope = normalize_depot_path(depot_path)
+    for key, folder in (overrides or {}).items():
+        if normalize_depot_path(key) == scope:
+            p = Path(folder).expanduser()
+            if not p.is_dir():
+                raise P4Error(f"local folder for {scope} not found: {p}")
+            return p
+    if not root:
+        raise P4Error(f"no local folder given for {scope}")
+    parts = path_prefix(scope)[2:].rstrip("/").split("/")
+    depot, rest = parts[0], parts[1:]
+    base = Path(root).expanduser()
+    tried: list[Path] = []
+    candidates = [base.joinpath(*rest), base.joinpath(depot, *rest)]  # a whole depot (no rest) tries ROOT, then ROOT/<depot>
+    for cand in candidates:
+        tried.append(cand)
+        if cand.is_dir() and any(cand.iterdir()):
+            return cand
+    raise P4Error(f"no local folder for {scope}; looked in: " + ", ".join(str(t) for t in tried))
+
+
+def tree_stats(tree: Path) -> tuple[int, int]:
+    """``(files, bytes)`` on disk, ignoring Perforce's own dotfiles (``.p4config``, ``.p4ignore``)."""
+    files = size = 0
+    for root, dirs, names in os.walk(tree):
+        dirs[:] = [d for d in dirs if not d.startswith(".p4")]
+        for name in names:
+            if name.startswith(".p4"):
+                continue
+            try:
+                size += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                continue
+            files += 1
+    return files, size
+
+
+def workspace_check(conn: P4Conn, depot_path: str, tree: Path, tolerance_pct: float = 2.0) -> dict[str, Any]:
+    """Compare a local folder with the depot head by file count and bytes (metadata only, no download).
+
+    A synced workspace can be behind head, or carry build output that was never submitted; either skews
+    every number measured on it, so the difference is reported (and logged) instead of assumed away."""
+    server = head_size(conn, depot_path)
+    files, size = tree_stats(tree)
+    out: dict[str, Any] = {"tree": str(tree), "files_local": files, "bytes_local": size}
+    if server is None:
+        return {**out, "checked": False, "note": "server size unavailable"}
+
+    def diff(a: int, b: int) -> float:
+        return round(100 * abs(a - b) / max(a, b, 1), 1)
+
+    out.update(
+        checked=True, files_server=server[0], bytes_server=server[1],
+        files_diff_pct=diff(files, server[0]), bytes_diff_pct=diff(size, server[1]),
+    )
+    out["within_tolerance"] = out["files_diff_pct"] <= tolerance_pct and out["bytes_diff_pct"] <= tolerance_pct
+    return out
+
+
 def sync_working_tree(
     conn: P4Conn,
     depot_path: str,
     dest: Path,
     log: logging.Logger | None = None,
     timeout: int = 3600,
+    progress_every: float = 20.0,
 ) -> int:
     """Sync the head revision of ``depot_path`` into ``dest`` through a throw-away client.
 
@@ -664,8 +776,27 @@ def sync_working_tree(
         "SubmitOptions: leaveunchanged\nLineEnd: local\n"
         f"View:\n\t\"{scope}\" \"//{client}/...\"\n"
     )
+    stop = threading.Event()
     try:
         run_p4_text(conn, "client", "-i", stdin=spec, timeout=60)
+        total = head_size(conn, scope)
+        if log is not None:
+            log.info(
+                "p4 %s: downloading the head revision%s into %s (this can take a long time on a large depot; "
+                "use a local workspace folder to skip it)", scope,
+                f" — {total[0]:,} files, {human_bytes(total[1])}" if total else "", dest,
+            )
+
+        def report() -> None:
+            started = time.monotonic()
+            while not stop.wait(progress_every):
+                done_files, done_bytes = tree_stats(dest)
+                if log is not None:
+                    of = f" of {total[0]:,} files / {human_bytes(total[1])}" if total else ""
+                    log.info("p4 %s: synced %s files / %s%s after %ds", scope, f"{done_files:,}",
+                             human_bytes(done_bytes), of, int(time.monotonic() - started))
+
+        threading.Thread(target=report, daemon=True).start()
         for _ in iter_marshal(conn, "sync", "-q", f"{scope}#head", client=client, timeout=timeout, log=log):
             pass
         files = sum(len(fs) for _, _, fs in os.walk(dest))
@@ -673,4 +804,5 @@ def sync_working_tree(
             log.info("synced %s files of %s into %s", files, scope, dest)
         return files
     finally:
+        stop.set()
         run_p4_text(conn, "client", "-d", "-f", client, check=False, timeout=60)
