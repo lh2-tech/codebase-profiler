@@ -2396,10 +2396,22 @@ def p4_connection(target: RepoTarget, log: logging.Logger | None = None) -> p4_m
     return conn
 
 
-def build_p4_targets(port: str, user: str, depot_paths: list[str]) -> list[RepoTarget]:
+def build_p4_targets(
+    port: str,
+    user: str,
+    depot_paths: list[str],
+    local_root: str = "",
+    local_dirs: list[str] | None = None,
+) -> list[RepoTarget]:
     """One target per depot path: ``//depot/project`` -> org ``depot``, full_name ``depot/project``."""
     targets: list[RepoTarget] = []
     seen: set[str] = set()
+    overrides: dict[str, str] = {}
+    for item in local_dirs or []:
+        key, sep, folder = item.partition("=")
+        if not sep or not key.strip() or not folder.strip():
+            raise SystemExit(f"--p4-local-dir expects DEPOTPATH=DIR, got {item!r}")
+        overrides[p4_metrics.normalize_depot_path(key)] = folder.strip()
     for raw in depot_paths:
         scope = p4_metrics.normalize_depot_path(raw)
         if scope in seen:
@@ -2413,7 +2425,11 @@ def build_p4_targets(port: str, user: str, depot_paths: list[str]) -> list[RepoT
                 platform="local",
                 org=name.split("/")[0],
                 full_name=name,
-                meta={"p4": {"port": port, "user": user, "depot_path": scope}},
+                meta={"p4": {
+                    "port": port, "user": user, "depot_path": scope,
+                    **({"local_root": local_root} if local_root else {}),
+                    **({"local_dirs": {scope: overrides[scope]}} if scope in overrides else {}),
+                }},
                 local_path=None,
                 vcs="p4",
             )
@@ -3019,10 +3035,29 @@ def process_repo(
 
         if is_p4:
             assert p4_conn is not None
+            log.info("p4 %s: reading changelist history", p4_scope)
             p4_changes = list(p4_metrics.iter_changes(p4_conn, p4_scope, timeout=GIT_LOG_TIMEOUT_SECONDS, log=log))
+            log.info("p4 %s: %s changelists; reading authors and server inventory", p4_scope, f"{len(p4_changes):,}")
             git_stats = p4_metrics.aggregate_p4_stats(p4_conn, p4_scope, is_bot_author, log, changes=p4_changes)
-            scratch_tree = clone_path
-            p4_metrics.sync_working_tree(p4_conn, p4_scope, clone_path, log)
+            p4_info = target.meta.get("p4") or {}
+            if p4_info.get("local_root") or p4_info.get("local_dirs"):
+                # the files are already on this machine: measure them in place, download nothing, delete nothing
+                clone_path = p4_metrics.resolve_local_tree(p4_scope, p4_info.get("local_root"), p4_info.get("local_dirs"))
+                check = p4_metrics.workspace_check(p4_conn, p4_scope, clone_path)
+                git_stats["tree_source"] = "local workspace"
+                git_stats["workspace_check"] = check
+                log.info("p4 %s: measuring the local workspace %s (%s files)", p4_scope, clone_path, f"{check['files_local']:,}")
+                if check.get("checked") and not check["within_tolerance"]:
+                    log.warning(
+                        "p4 %s: the local folder differs from the depot head (files %s vs %s, bytes %s vs %s): it may be "
+                        "behind head or hold untracked files, which skews LOC, language and test metrics",
+                        p4_scope, f"{check['files_local']:,}", f"{check['files_server']:,}",
+                        p4_metrics.human_bytes(check["bytes_local"]), p4_metrics.human_bytes(check["bytes_server"]),
+                    )
+            else:
+                git_stats["tree_source"] = "downloaded head revision"
+                scratch_tree = clone_path
+                p4_metrics.sync_working_tree(p4_conn, p4_scope, clone_path, log)
             write_json(git_dir / "p4_stats.json", git_stats)
         elif is_hg:
             git_stats = hg_metrics.aggregate_hg_stats(hg_repo, is_bot_author, log)
@@ -3845,6 +3880,20 @@ def main() -> int:
     )
     parser.add_argument("--p4-user", default="", help="Perforce user name (default: $P4USER)")
     parser.add_argument(
+        "--p4-local-root",
+        default="",
+        help="Folder holding already-synced Perforce workspaces: each --p4-path is measured in place "
+        "(ROOT/<path under the depot>, or ROOT/<depot>/<path>) instead of being downloaded. A run never "
+        "falls back to a download when the folder is missing.",
+    )
+    parser.add_argument(
+        "--p4-local-dir",
+        action="append",
+        default=[],
+        metavar="DEPOTPATH=DIR",
+        help="Measure this depot path from an existing folder (repeatable; overrides --p4-local-root for that path)",
+    )
+    parser.add_argument(
         "--p4-path",
         action="append",
         default=[],
@@ -4095,7 +4144,9 @@ def main() -> int:
 
     if all_targets is None:
         if args.p4_port:
-            all_targets = build_p4_targets(args.p4_port, args.p4_user, args.p4_path)
+            all_targets = build_p4_targets(
+                args.p4_port, args.p4_user, args.p4_path, args.p4_local_root, args.p4_local_dir
+            )
         elif args.offline:
             all_targets = find_local_repositories(
                 args.local_repos_dir.resolve(), "hg" if args.hg else "git"
@@ -4181,7 +4232,10 @@ def main() -> int:
     )
     log_runtime_diagnostics(log, args)
     if args.offline:
-        log.info("Mode: offline local-clone analysis; no network requests will be made")
+        if getattr(args, "p4_port", ""):
+            log.info("Mode: Perforce server (reads changelist history from the server; file contents are measured locally)")
+        else:
+            log.info("Mode: offline local-clone analysis; no network requests will be made")
     elif args.github_app:
         log.info(
             "GitHub auth: app installation_id=%s account=%s",

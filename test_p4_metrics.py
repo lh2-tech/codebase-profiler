@@ -165,6 +165,59 @@ class PathTests(unittest.TestCase):
         self.assertEqual(back[0].meta["p4"]["depot_path"], "//depot/a/...")
 
 
+class LocalTreeTests(unittest.TestCase):
+    def test_resolve_layouts_override_and_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "proj").mkdir()
+            (root / "proj" / "a.txt").write_text("x")
+            (root / "depot" / "other").mkdir(parents=True)
+            (root / "depot" / "other" / "b.txt").write_text("x")
+            (root / "empty").mkdir()
+            self.assertEqual(p4.resolve_local_tree("//depot/proj", root), root / "proj")  # root maps //depot/...
+            self.assertEqual(p4.resolve_local_tree("//depot/other/...", root), root / "depot" / "other")  # root/<depot>/...
+            self.assertEqual(p4.resolve_local_tree("//depot", root), root)  # a whole depot is the root itself
+            elsewhere = root / "elsewhere"
+            elsewhere.mkdir()
+            self.assertEqual(p4.resolve_local_tree("//depot/proj", root, {"//depot/proj/...": str(elsewhere)}), elsewhere)
+            with self.assertRaises(p4.P4Error) as ctx:  # never a silent fallback to a download: say where it looked
+                p4.resolve_local_tree("//depot/missing", root)
+            self.assertIn(str(root / "missing"), str(ctx.exception))
+            self.assertIn(str(root / "depot" / "missing"), str(ctx.exception))
+            with self.assertRaises(p4.P4Error):  # an empty folder is not a workspace
+                p4.resolve_local_tree("//depot/empty", root)
+            with self.assertRaises(p4.P4Error):
+                p4.resolve_local_tree("//depot/proj", None, {"//depot/proj": str(root / "nope")})
+
+    def test_tree_stats_skip_perforce_dotfiles(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "a.txt").write_text("12345")
+            (root / ".p4config").write_text("P4PORT=x")
+            (root / ".p4").mkdir()
+            (root / ".p4" / "x").write_text("ignored")
+            self.assertEqual(p4.tree_stats(root), (1, 5))
+
+    def test_a_call_that_never_answers_is_killed_at_its_timeout(self) -> None:
+        # `sync -q` and a hung connection emit no record, so the per-record deadline never fired: a watchdog must
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "p4"
+            fake.write_text("#!/bin/sh\nexec sleep 30\n")  # one process, like the real p4
+            fake.chmod(0o755)
+            old = os.environ["PATH"]
+            os.environ["PATH"] = f"{d}:{old}"
+            try:
+                started = time.monotonic()
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    p4.run_marshal(p4.P4Conn("127.0.0.1:1", "u"), "info", timeout=1)
+                self.assertLess(time.monotonic() - started, 10)
+            finally:
+                os.environ["PATH"] = old
+
+    def test_human_bytes(self) -> None:
+        self.assertEqual([p4.human_bytes(n) for n in (0, 1023, 1024, 5 * 1024**3)], ["0 B", "1023 B", "1.0 KB", "5.0 GB"])
+
+
 class DescribeParseTests(unittest.TestCase):
     TEXT = (
         "Change 3 by bob@ws on 2026/01/01 10:00:00\n\n\tnote\n\nAffected files ...\n\n"
@@ -277,6 +330,19 @@ class P4ServerTests(unittest.TestCase):
         main = p4.branch_origin(self.conn, "//depot/main", tree_files=4)
         self.assertEqual((main["branch_copy_pct"], main["integration_sources"]), (0.0, []))
 
+    def test_head_size_and_workspace_check(self) -> None:
+        self.assertEqual(p4.head_size(self.conn, "//depot/main"), (4, 2135))  # deleted file excluded, no download
+        with tempfile.TemporaryDirectory() as d:
+            tree = Path(d) / "main"
+            p4.sync_working_tree(self.conn, "//depot/main", tree)
+            ok = p4.workspace_check(self.conn, "//depot/main", tree)
+            self.assertTrue(ok["checked"] and ok["within_tolerance"], ok)
+            self.assertEqual((ok["files_local"], ok["files_server"]), (4, 4))
+            (tree / "build.log").write_text("untracked build output\n" * 50)  # a stale / dirty workspace is reported
+            bad = p4.workspace_check(self.conn, "//depot/main", tree)
+            self.assertFalse(bad["within_tolerance"])
+            self.assertEqual(bad["files_local"], 5)
+
     def test_discovery(self) -> None:
         self.assertEqual([d["name"] for d in p4.list_depots(self.conn)], ["depot"])
         self.assertEqual(p4.list_top_dirs(self.conn, "depot"), ["//depot/main", "//depot/other", "//depot/rel"])
@@ -311,6 +377,54 @@ class P4AuthAndEndToEndTests(unittest.TestCase):
         self.assertNotIn(PASSWORD, repr(conn))
         self.assertNotIn(conn.ticket, repr(conn))
         self.assertEqual(len(list(p4.iter_changes(conn, "//depot/main"))), 6)
+
+    def _cli(self, out: Path, *extra: str):
+        env = {**os.environ, "P4_PASSWORD": PASSWORD}
+        for k in ("P4PASSWD", "P4_TICKET"):
+            env.pop(k, None)
+        return subprocess.run(
+            [sys.executable, str(Path(ex.__file__)), "--p4-port", self.srv.port, "--p4-user", "alice",
+             "--p4-path", "//depot/main", "--output-dir", str(out), "--no-for-check", *extra],
+            capture_output=True, text=True, env=env, timeout=300,
+        )
+
+    def test_local_workspace_is_measured_in_place_without_a_download(self) -> None:
+        conn = self.srv.conn(password=PASSWORD)
+        p4.connect(conn)
+        ws = self.root / "workspaces"
+        p4.sync_working_tree(conn, "//depot/main", ws / "main")  # what the user would already have on disk
+        rows = {}
+        for label, extra in (("local", ["--p4-local-root", str(ws)]), ("download", [])):
+            proc = self._cli(self.root / f"out-{label}", *extra)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            run = next(p for p in (self.root / f"out-{label}").iterdir() if p.is_dir())
+            with (run / "summary.csv").open() as fh:
+                rows[label] = next(csv.DictReader(fh))
+            log = (run / "logs" / "extract.log").read_text()
+            stats = json.loads((run / "git/depot__main/p4_stats.json").read_text())
+            if label == "local":
+                self.assertIn("measuring the local workspace", log)
+                self.assertNotIn("downloading the head revision", log)
+                self.assertEqual(stats["tree_source"], "local workspace")
+                self.assertTrue(stats["workspace_check"]["within_tolerance"], stats["workspace_check"])
+            else:
+                self.assertIn("downloading the head revision", log)  # the phase is announced, with its size
+                self.assertIn("4 files", log)
+                self.assertEqual(stats["tree_source"], "downloaded head revision")
+        for col in ("loc", "total_files", "primary_language", "total_commits", "has_tests"):
+            self.assertEqual(rows["local"][col], rows["download"][col], col)
+        self.assertEqual(sorted(p.name for p in (ws / "main").rglob("*") if p.is_file()),
+                         ["README.md", "app.py", "logo.bin", "util.py"])  # the user's folder was left untouched
+
+    def test_missing_local_workspace_fails_instead_of_downloading(self) -> None:
+        empty = self.root / "no-workspaces"
+        empty.mkdir()
+        proc = self._cli(self.root / "out-missing", "--p4-local-root", str(empty))
+        run = next(p for p in (self.root / "out-missing").iterdir() if p.is_dir())
+        with (run / "summary.csv").open() as fh:
+            row = next(csv.DictReader(fh))
+        self.assertIn("no local folder", row["error"])
+        self.assertNotIn("downloading the head revision", (run / "logs" / "extract.log").read_text())
 
     def test_cli_end_to_end(self) -> None:
         out = self.root / "out"

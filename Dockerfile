@@ -54,11 +54,12 @@ RUN python -c "import code_metrics as m, tree_sitter_language_pack as t; \
 names = sorted(set(m.EXT_LANG.values())); t.download(names); \
 [t.get_parser(n) for n in names]; print('preloaded', len(names), 'grammars')"
 
-RUN mkdir -p /app/outputs/raw-extracts /data/repos /data/hg-repos
+RUN mkdir -p /app/outputs/raw-extracts /data/repos /data/hg-repos /data/p4-workspaces
 
 ENV EXTRACT_UI_DOCKER=1 \
     DEFAULT_LOCAL_REPOS_DIR=/data/repos \
     DEFAULT_HG_REPOS_DIR=/data/hg-repos \
+    DEFAULT_P4_WORKSPACES_DIR=/data/p4-workspaces \
     DEFAULT_TOKENS_FILE=/app/secrets/tokens \
     HOST_OUTPUT_HINT=./outputs/raw-extracts \
     PYTHONUNBUFFERED=1 \
