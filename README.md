@@ -1,6 +1,6 @@
 # Codebase Profiler
 
-Privacy-safe repository evidence extractor with a local browser UI. Analyses GitHub/GitLab organisations, Bitbucket Cloud workspaces or folders of local clones and produces a metadata-only archive (no source code in the output zip).
+Privacy-safe repository evidence extractor with a local browser UI. Analyses GitHub/GitLab organisations, Bitbucket Cloud workspaces, folders of local git or Mercurial clones, or depot paths on a Perforce server, and produces a metadata-only archive (no source code in the output zip).
 
 ## Quick start (Docker)
 
@@ -18,7 +18,15 @@ Do this **before** the first `docker compose up`. Docker mounts the whole `secre
 cp .env.example .env
 ```
 
-Edit `.env` to point `LOCAL_REPOS_DIR` at a folder on your computer that contains full local git clones.
+Edit `.env` to point `LOCAL_REPOS_DIR` at a folder on your computer that contains full local git clones. The other two folders are optional and only matter for those tabs:
+
+| `.env` variable | Default folder | Used by |
+|-----------------|----------------|---------|
+| `LOCAL_REPOS_DIR` | `./repos` | "Already cloned here" (git) |
+| `LOCAL_HG_REPOS_DIR` | `./hg-repos` | "Mercurial (local)" |
+| `LOCAL_P4_WORKSPACES_DIR` | `./p4-workspaces` | "Perforce (server)" -> "Use workspaces I already have" (skips the download) |
+
+All three are mounted read-only into the container; nothing in them is ever changed.
 
 3. Start the app:
 
@@ -392,7 +400,10 @@ python extract_org_raw_data.py --ui
 | `extract_ui.py` | Browser UI |
 | `commit_dedup.py` | Commit-hash comparison between repos: hash files, duplicate % columns, `duplicates.csv` |
 | `hg_metrics.py` | Mercurial history stats, per-changeset churn, working-tree export |
-| `p4_metrics.py` | Perforce history stats, per-changelist churn, head-revision sync |
+| `p4_metrics.py` | Perforce history stats, per-changelist churn, head-revision sync, local-workspace lookup and check |
+| `vcs_extra.py` | Extra Mercurial/Perforce metrics (`vcs_extra_metrics.csv`): change size, binary share, activity, authorship, message quality |
+| `test_*.py` | Unit tests (`python -m unittest discover -p "test_*.py"`); the Mercurial and Perforce ones start a throw-away `hg` repo or local `p4d` and skip when the tool is missing |
+| `p4-workspaces/`, `hg-repos/`, `repos/` | Default mount points for your own workspaces and clones (contents are git-ignored) |
 | `count_merged_prs.py` | GitHub/GitLab API helpers |
 | `for_check.py` | for-check.csv: platform-side counts/refs + summary.xlsx writer |
 | `github_app_auth.py` | GitHub App authentication |
