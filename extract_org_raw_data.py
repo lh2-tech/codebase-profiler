@@ -219,7 +219,11 @@ SUMMARY_FIELDS = [
     "subgroup",
     "project_name",
     "repo",
+    # merged_prs: the hosting platform's count of merged PRs/MRs (blank when the platform was not asked: an offline/local run).
+    # local_merges: merge and squash commits found in the git history; filled only when that is how PRs were counted (an
+    # offline/local run, or the platform reported none). The two are never the same thing: a merge commit is not a PR.
     "merged_prs",
+    "local_merges",
     "languages_breakdown",
     "repo_created_at",
     "last_commit_date",
@@ -3002,7 +3006,7 @@ def process_repo(
                  run_git(clone_path, "symbolic-ref", "--short", "HEAD").strip())
                 or "not_collected_offline"
             )
-            row["merged_prs"] = 0
+            row["merged_prs"] = ""  # the platform is not asked offline: its PR count is unknown, never a merge-commit count
             row["contributor_count"] = 0
 
         if target.platform != "local":
@@ -3168,7 +3172,7 @@ def process_repo(
             row["primary_language"] = primary_language
             row["languages_breakdown"] = language_breakdown
             row["size_kb"] = working_tree_size_kb(clone_path)
-            row["merged_prs"] = len(detected_prs)
+            row["local_merges"] = len(detected_prs)
             row["contributor_count"] = (
                 git_stats["human_authors"] + git_stats["bot_authors"]
             )
@@ -3179,11 +3183,11 @@ def process_repo(
             )
 
         if target.platform != "local" and not row["merged_prs"]:
-            # The platform API reported no merged PRs/MRs; fall back to merge
-            # and squash markers recovered from git history.
+            # The platform API reported no merged PRs/MRs: merged_prs keeps the platform's 0, and the merge and squash
+            # markers recovered from git history are reported apart, as local_merges.
             detected_prs = detect_merged_prs_from_git(clone_path)
             write_json(git_dir / "merged_prs_detected_from_git.json", detected_prs)
-            row["merged_prs"] = len(detected_prs)
+            row["local_merges"] = len(detected_prs)
             merged_source = "git"
 
         row["project_name"] = org
@@ -3264,9 +3268,10 @@ def process_repo(
         if scratch_tree is not None:
             shutil.rmtree(scratch_tree, ignore_errors=True)
         log.info(
-            "OK %s: merged_prs=%s loc=%s span_days=%s",
+            "OK %s: merged_prs=%s local_merges=%s loc=%s span_days=%s",
             target.full_name,
             row["merged_prs"],
+            row["local_merges"],
             row["loc"],
             row["span_days"],
         )
@@ -3329,6 +3334,7 @@ def process_repo(
                 "measured_branch": row.get("measured_branch", ""),
                 "commits_default_branch": commits_default_branch,
                 "merged_prs": row.get("merged_prs", ""),
+                "local_merges": row.get("local_merges", ""),
                 "merged_prs_source": merged_source,
                 "contributors": row.get("contributor_count", ""),
                 "default_branch": row.get("default_branch", ""),
@@ -4438,9 +4444,10 @@ def main() -> int:
         )
     if args.offline:
         manifest["offline_field_sources"] = {
-            "merged_prs": (
-                "Detected from merge and squash markers in Git commit messages. "
-                "Rebase merges and rewritten messages cannot be recovered."
+            "merged_prs": "Blank: an offline run cannot ask the hosting platform for its pull requests.",
+            "local_merges": (
+                "Merge and squash commits detected from markers in Git commit messages (not pull requests: a local "
+                "`git merge` counts too). Rebase merges and rewritten messages cannot be recovered."
             ),
             "contributor_count": "Unique Git author identities, including detected bots.",
             "repo_created_at": (
