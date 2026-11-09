@@ -11,7 +11,7 @@ Scope. A target is one depot path (``//depot/project/...``). "Commits" are the s
 changelists that touch it, and a changelist's files are restricted to that path (a changelist
 that also touches another project counts only for the part inside this one). Perforce has no
 pull requests: an *integration* changelist (any file with action ``integrate`` or ``branch``) is
-the equivalent of a Git merge commit, so such changelists are what ``merged_prs`` counts and, as
+the equivalent of a Git merge commit, so such changelists are what ``local_merges`` counts and, as
 with a Git merge, they are written without a file list so a branch copy does not look like
 thousands of authored lines.
 

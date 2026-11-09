@@ -233,7 +233,7 @@ python extract_org_raw_data.py --p4-port ssl:perforce.example.com:1666 --p4-user
 
 What the numbers mean for Perforce:
 
-- **Commits** are the submitted changelists that touch the depot path; files outside the path are ignored. `merged_prs` counts *integration* changelists (action `integrate` or `branch`) — Perforce has no pull requests — and, like a Git merge commit, they carry no file list so a branch copy does not look like thousands of authored lines.
+- **Commits** are the submitted changelists that touch the depot path; files outside the path are ignored. `local_merges` counts *integration* changelists (action `integrate` or `branch`) — Perforce has no pull requests, so `merged_prs` is blank — and, like a Git merge commit, they carry no file list so a branch copy does not look like thousands of authored lines.
 - **Line counts.** `p4 describe` has no line counts for added or deleted files, so those come from `p4 print` for text files (binary files count 0/0). That is bounded by `P4_PRINT_LIMIT` files (default 50000) and `P4_PRINT_MAX_BYTES` per file (default 2 MiB); anything past the bound is reported in `commits_detail_meta.json`.
 - **LOC, languages, tests** are measured on a scratch sync of the head revision (through a throw-away client that is deleted afterwards).
 - **Duplicates.** Changelist numbers are server-local, so `duplicate_pct` is blank for Perforce.
@@ -345,8 +345,19 @@ Reading the numbers (what is and is not comparable):
   (the most recently committed one), so compare `counts_*.commits` with `captured.commits_default_branch`; the two
   `captured` commit numbers only match when `measured_branch` equals `default_branch`.
 - **Merged PRs.** `counts_*.prs` is every PR/MR; `counts_*.merged_prs` is merged only and is the one to compare with
-  `captured.merged_prs`. When `merged_prs_source` is `git`, the figure came from merge/squash markers in history
-  (platform API returned zero, or local run) and will undercount squash/rebase workflows.
+  `captured.merged_prs`. When `merged_prs_source` is `git`, the platform was not asked (local run: `merged_prs` blank) or
+  reported zero (`merged_prs` 0), and the merge/squash markers found in history are in `captured.local_merges` instead;
+  they are merge commits, not pull requests, and undercount squash/rebase workflows.
+
+#### `merged_prs` and `local_merges` in `summary.csv`
+
+| How the PRs were counted | `merged_prs` | `local_merges` |
+|---|---|---|
+| The hosting platform's API (GitHub, GitLab, Bitbucket) | its count of merged PRs/MRs | blank |
+| The platform reported none, so the history was read | `0` (the platform's answer) | merge and squash commits found in the history |
+| An offline / local run (`--offline`, `--local-repos-dir`, Mercurial, Perforce) | blank: the platform was not asked | merge and squash commits (Perforce: integration changelists) |
+
+A merge commit is not a pull request (a local `git merge` or `git pull` makes one too), so the two never share a column.
 - **People.** `collaborators` (platform members, needs admin) and `contributors` (authors recorded by the tool) are
   different populations: do not expect them to be equal.
 - **Before snapshot.** To halve the API budget, `counts_before` is a light snapshot (`counts_before_scope=light`):
@@ -365,6 +376,8 @@ archive cannot execute. `--github-host` / `--gitlab-host` must be a bare host (`
 ### Compatibility with Squirrel
 
 Squirrel (`stages.py`) reads `summary.csv` by header name (`loc`, `commits`, `merged_prs`) and passes `--no-for-check`.
+`local_merges` sits right after `merged_prs`; an offline run leaves `merged_prs` blank (unknown) instead of putting the merge-commit
+count there, so a reader that compares it with a delivery's PR metadata no longer counts merge commits as missing PRs.
 `summary.csv` gains a `subgroup` column right after `org` (GitLab: the path between group and repo, e.g. `mobile-apps` or `a/b`; Bitbucket: the project name; GitHub: blank), so same-named repos in different subgroups keep separate rows. Squirrel reads by header name, so this does not affect it. Existing columns are otherwise untouched (the three duplicate columns are only appended at the end) and `--no-for-check` skips both `for-check.csv` and the xlsx sheet.
 `--no-for-check` and `--for-check-refs` exist only in profilers that include for-check; an older profiler rejects the
 flag (argparse "unrecognized arguments"), so pin Squirrel to a profiler version that has it.

@@ -27,7 +27,7 @@ LEGEND_COLUMN = 26  # Z
 COMPILED_FILE_NAME = "project_compiled.xlsx"
 COMPILED_SHEET = "project compiled"
 COMPILED_COLUMNS = [
-    "project_name", "subgroup", "repo", "primary_language", "loc", "merged_prs", "total_commits",
+    "project_name", "subgroup", "repo", "primary_language", "loc", "merged_prs", "local_merges", "total_commits",
     "contributor_count", "duplicate_pct", "duplicate_of", "duplicate_loc", "duplicate_prs",
     "open_source_loc_pct", "vibe_code_signals",
 ]
