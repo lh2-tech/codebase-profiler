@@ -3397,7 +3397,7 @@ def process_repo(
                 collect_commit_hashes(clone_path, hashes_path, log)
                 collect_commit_loc(clone_path, loc_path, log)
 
-        if not (is_p4 or is_hg):
+        if not (is_p4 or is_hg or is_plastic or is_svn):
             # Tamper evidence read from the repository while it still exists: see integrity.py.
             integrity.write_repo_integrity(clone_path, git_dir, row.get("measured_branch", ""), log)
 
