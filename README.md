@@ -240,6 +240,23 @@ What the numbers mean for Perforce:
 - **Download vs. local workspace.** By default the head revision is downloaded into a scratch folder (deleted afterwards), which is slow on a big depot; the log says how many files and bytes it is about to fetch and reports progress every 20 s. If the files are already on this computer, point the run at them instead: UI -> "Where are the files measured from?" -> "Use workspaces I already have" (put them in `./p4-workspaces`, or `LOCAL_P4_WORKSPACES_DIR`), or on the command line `--p4-local-root ROOT` (looks for `ROOT/<path under the depot>`, then `ROOT/<depot>/<path>`) and `--p4-local-dir //depot/project=/some/folder` per path. Nothing is downloaded and nothing in your folders is changed or deleted; a path with no folder fails rather than quietly downloading. Run `p4 sync` first: the run compares file count and size with the server head (`workspace_check` in `p4_stats.json`) and warns when they differ by more than 2%, because a stale folder or untracked build output skews LOC, language and test metrics. History (changelists, authors, churn) always comes from the server.
 - **Auth.** A password is exchanged for a ticket (`p4 login -p`); an `ssl:` server whose fingerprint is not yet trusted needs `P4_FINGERPRINT` (or `p4 trust` once) — it is never accepted automatically. The run is read-only.
 
+### Plastic SCM (server)
+
+The **Plastic SCM (server)** tab reads repositories from a Plastic SCM / Unity Version Control server with the `cm` CLI, producing the same summary columns, `git_stats.json` and `commits.jsonl`. `cm` must be on `PATH` on the host; it is **not** in the Docker image. Each repository is one row. `PLASTIC_PASSWORD` carries the password (never argv, repos.json or logs); without it your own configured `cm` client is used.
+
+```bash
+PLASTIC_PASSWORD=... python extract_org_raw_data.py --plastic-server plastic.example.com:8087 \
+  --plastic-user alice --plastic-repo game --plastic-repo libs --output-dir outputs/raw-extracts
+# already-updated workspaces, one folder per repo: add --plastic-local-root ./plastic-workspaces
+```
+
+- **Commits** are every changeset on every branch. `merged_prs` counts changesets that are the destination of a merge link; like a Git merge they carry no file list.
+- **Line counts** come from `cm diffmetrics` (modified files: changed+added / changed+deleted) and `cm cat` (added/removed text files), bounded by `PLASTIC_LINES_LIMIT` / `PLASTIC_CAT_MAX_BYTES`; see `commits_detail_meta.json`.
+- **Download vs. local workspace.** Default downloads the main-branch head into a scratch workspace that is removed afterwards; `--plastic-local-root` / `--plastic-local-dir REPO=DIR` measure existing folders in place (never deleted, not compared with the server, never a silent fallback to download).
+- **Duplicates.** Changeset ids are repository-local, so `duplicate_pct` is blank.
+- **Auth caveat.** `cm configure` takes the password as an argument, so it is visible in the local process list for an instant; it is written only to a private temp `HOME` removed at the end.
+- **Unverified.** Built from the CLI reference and tested against a stub `cm`, not a live server (see the test file header). Dates are read as UTC.
+
 ### Mercurial (local)
 
 The **Mercurial (local)** tab analyses full Mercurial clones (folders containing `.hg`) with the same summary columns, `git_stats.json` and `commits.jsonl` as Git runs. Put them in `./hg-repos` (or set `LOCAL_HG_REPOS_DIR` in `.env`); the image installs `hg`. Runs are offline.

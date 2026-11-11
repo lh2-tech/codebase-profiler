@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-SKIP_DIRS = {".hg", ".git", ".svn", ".p4config"}
+SKIP_DIRS = {".hg", ".git", ".svn", ".p4config", ".plastic"}
 MEGA_CHANGE_LINES = 1000
 LARGE_FILE_BYTES = 10 * 1024 * 1024
 TOP_N = 10

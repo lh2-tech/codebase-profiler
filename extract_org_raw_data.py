@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import csv
 import json
@@ -53,6 +54,7 @@ from typing import Any, Callable
 
 import hg_metrics
 import p4_metrics
+import plastic_metrics
 import vcs_extra
 from code_metrics import PR_FIELDS, STRUCTURE_FIELDS, pr_tier_metrics, structure_metrics
 import commit_dedup
@@ -516,7 +518,7 @@ class RepoTarget:
     full_name: str
     meta: dict[str, Any]
     local_path: Path | None = None
-    vcs: str = "git"  # git | hg | p4 (local targets only; p4 reads a Perforce server, see meta["p4"])
+    vcs: str = "git"  # git | hg | p4 | plastic (local targets only; p4/plastic read a server, see meta["p4"] / meta["plastic"])
 
 
 def parse_tokens_file(path: Path) -> dict[str, str]:
@@ -2451,6 +2453,76 @@ def build_p4_targets(
     return sorted(targets, key=lambda t: t.full_name.lower())
 
 
+_PLASTIC_CONNS: dict[tuple[str, str], plastic_metrics.PlasticConn] = {}
+
+
+def plastic_connection(target: RepoTarget, log: logging.Logger | None = None) -> plastic_metrics.PlasticConn:
+    """One connection per (server, user), shared by every Plastic target of the run.
+
+    The password comes from ``PLASTIC_PASSWORD`` only (never a CLI argument, never repos.json), so a
+    resumed run needs the variable set again. Empty means: use the user's own configured ``cm`` client.
+    """
+    info = target.meta.get("plastic") or {}
+    key = (str(info.get("server") or ""), str(info.get("user") or ""))
+    conn = _PLASTIC_CONNS.get(key)
+    if conn is None:
+        conn = plastic_metrics.PlasticConn(
+            server=key[0], user=key[1], password=os.environ.get("PLASTIC_PASSWORD", ""),
+            workingmode=os.environ.get("PLASTIC_WORKINGMODE", "UPWorkingMode"),
+        )
+        plastic_metrics.connect(conn, log)
+        _PLASTIC_CONNS[key] = conn
+        atexit.register(close_plastic_connections)  # removes the private cm client config
+    return conn
+
+
+def close_plastic_connections() -> None:
+    for conn in _PLASTIC_CONNS.values():
+        plastic_metrics.close(conn)
+    _PLASTIC_CONNS.clear()
+
+
+def build_plastic_targets(
+    server: str,
+    user: str,
+    repos: list[str],
+    local_root: str = "",
+    local_dirs: list[str] | None = None,
+) -> list[RepoTarget]:
+    """One target per repository: org is the server host, full_name ``<host>/<repo>``."""
+    overrides: dict[str, str] = {}
+    for item in local_dirs or []:
+        name, sep, folder = item.partition("=")
+        if not sep or not name.strip() or not folder.strip():
+            raise SystemExit(f"--plastic-local-dir expects REPO=DIR, got {item!r}")
+        overrides[name.strip()] = folder.strip()
+    org = plastic_metrics.slug_for(server.split("@")[-1].split(":")[0])
+    targets: list[RepoTarget] = []
+    seen: set[str] = set()
+    for raw in repos:
+        repo = raw.strip().split("@")[0]
+        if not repo or repo in seen:
+            continue
+        seen.add(repo)
+        targets.append(
+            RepoTarget(
+                platform="local",
+                org=org,
+                full_name=f"{org}/{plastic_metrics.slug_for(repo)}",
+                meta={"plastic": {
+                    "server": server, "user": user, "repo": repo,
+                    **({"local_root": local_root} if local_root else {}),
+                    **({"local_dirs": {repo: overrides[repo]}} if repo in overrides else {}),
+                }},
+                local_path=None,
+                vcs="plastic",
+            )
+        )
+    if not targets:
+        raise SystemExit("--plastic-server needs at least one --plastic-repo")
+    return sorted(targets, key=lambda t: t.full_name.lower())
+
+
 def discover_local_repositories(root: Path, vcs: str = "git") -> list[RepoTarget]:
     """Like ``find_local_repositories`` but returns an empty list when nothing is found."""
     if not root.is_dir():
@@ -2893,7 +2965,14 @@ def process_repo(
     is_p4 = target.vcs == "p4"
     # A Perforce target has no local folder: its head revision is synced into a scratch tree.
     clone_path = clones_dir / f"{slug}-p4-sync" if is_p4 else target.local_path or clones_dir / slug
+    is_plastic = target.vcs == "plastic"
+    if is_plastic:
+        clone_path = clones_dir / f"{slug}-plastic-sync"
     is_hg = target.vcs == "hg"
+    plastic_conn: plastic_metrics.PlasticConn | None = None
+    plastic_repo = ""
+    plastic_changes: list[dict[str, Any]] = []
+    plastic_merges: list[dict[str, str]] = []
     p4_conn: p4_metrics.P4Conn | None = None
     p4_scope = ""
     p4_changes: list[dict[str, Any]] = []
@@ -2993,9 +3072,12 @@ def process_repo(
             if is_p4:
                 p4_scope = str((target.meta.get("p4") or {}).get("depot_path") or "")
                 p4_conn = p4_connection(target, log)
+            elif is_plastic:
+                plastic_repo = str((target.meta.get("plastic") or {}).get("repo") or "")
+                plastic_conn = plastic_connection(target, log)
             elif target.local_path is None:
                 raise RuntimeError("Local repository path is missing")
-            if is_p4:
+            if is_p4 or is_plastic:
                 pass  # connected above; history is read from the server
             elif is_hg:
                 if not hg_metrics.probe_local_hg(clone_path, log):
@@ -3010,8 +3092,9 @@ def process_repo(
             row["size_kb"] = ""
             row["default_branch"] = (
                 p4_scope if is_p4 else
+                (plastic_metrics.main_branch(plastic_conn, plastic_repo) if is_plastic else
                 (hg_metrics.current_branch(clone_path) if is_hg else
-                 run_git(clone_path, "symbolic-ref", "--short", "HEAD").strip())
+                 run_git(clone_path, "symbolic-ref", "--short", "HEAD").strip()))
                 or "not_collected_offline"
             )
             row["merged_prs"] = ""  # the platform is not asked offline: its PR count is unknown, never a merge-commit count
@@ -3036,6 +3119,8 @@ def process_repo(
             )
         elif is_p4:
             row["measured_branch"] = p4_scope  # a depot path has one head; there is no branch to pick
+        elif is_plastic:
+            row["measured_branch"] = row["default_branch"]  # the main branch head
         else:
             wanted = client_branch_for(clone_path)
             client_pick = checkout_client_branch(clone_path, wanted, log) if wanted else ""
@@ -3071,6 +3156,29 @@ def process_repo(
                 scratch_tree = clone_path
                 p4_metrics.sync_working_tree(p4_conn, p4_scope, clone_path, log)
             write_json(git_dir / "p4_stats.json", git_stats)
+        elif is_plastic:
+            assert plastic_conn is not None
+            log.info("plastic %s: reading changesets", plastic_repo)
+            plastic_changes = list(plastic_metrics.iter_changesets(plastic_conn, plastic_repo, timeout=GIT_LOG_TIMEOUT_SECONDS))
+            log.info("plastic %s: %s changesets; reading authors and merges", plastic_repo, f"{len(plastic_changes):,}")
+            git_stats = plastic_metrics.aggregate_plastic_stats(
+                plastic_conn, plastic_repo, is_bot_author, log, changes=plastic_changes
+            )
+            pl_info = target.meta.get("plastic") or {}
+            if pl_info.get("local_root") or pl_info.get("local_dirs"):
+                # the files are already on this machine: measure them in place, download nothing, delete nothing
+                clone_path = plastic_metrics.resolve_local_tree(plastic_repo, pl_info.get("local_root"), pl_info.get("local_dirs"))
+                files_local, bytes_local = plastic_metrics.tree_stats(clone_path)
+                git_stats["tree_source"] = "local workspace"
+                git_stats["workspace_check"] = {"tree": str(clone_path), "files_local": files_local, "bytes_local": bytes_local, "checked": False,
+                                                "note": "not compared with the server; update the workspace to the latest changeset first"}
+                log.info("plastic %s: measuring the local workspace %s (%s files); it is not compared with the server head",
+                         plastic_repo, clone_path, f"{files_local:,}")
+            else:
+                git_stats["tree_source"] = "downloaded main branch head"
+                scratch_tree = clone_path
+                plastic_metrics.sync_working_tree(plastic_conn, plastic_repo, clone_path, log)
+            write_json(git_dir / "plastic_stats.json", git_stats)
         elif is_hg:
             git_stats = hg_metrics.aggregate_hg_stats(hg_repo, is_bot_author, log)
             clone_path, tree_branch, is_scratch = hg_metrics.prepare_working_tree(
@@ -3129,6 +3237,19 @@ def process_repo(
                 log=log,
                 write_json=write_json,
             )
+        elif is_plastic:
+            _, plastic_merges = plastic_metrics.export_commits_jsonl(
+                plastic_conn,
+                plastic_repo,
+                git_dir / "commits.jsonl",
+                changes=plastic_changes,
+                merges=plastic_metrics.merge_destinations(plastic_conn, plastic_repo),
+                is_bot=is_bot_author,
+                max_commits=COMMIT_DETAIL_LIMIT,
+                timeout=GIT_LOG_TIMEOUT_SECONDS,
+                log=log,
+                write_json=write_json,
+            )
         elif is_hg:
             hg_metrics.export_commits_jsonl(
                 hg_repo,
@@ -3150,7 +3271,9 @@ def process_repo(
 
         if commit_hashes_enabled:
             # Complete (not capped like commits.jsonl) and taken while the clone still exists.
-            if is_p4:
+            if is_plastic:
+                pass  # changeset ids are repository-local, so no hash file; duplicate_pct stays blank
+            elif is_p4:
                 # Changelist numbers are server-local, so they are never comparable between depots:
                 # no hash file, and duplicate_pct stays blank (unknown) for Perforce targets.
                 pass
@@ -3175,6 +3298,8 @@ def process_repo(
             detected_prs = (
                 p4_integrations
                 if is_p4
+                else plastic_merges
+                if is_plastic
                 else detect_merged_prs_from_hg(hg_repo)
                 if is_hg
                 else detect_merged_prs_from_git(clone_path)
@@ -3204,7 +3329,7 @@ def process_repo(
 
         row["project_name"] = org
         row["total_files"] = count_total_files(clone_path)
-        if is_hg or is_p4:
+        if is_hg or is_p4 or is_plastic:
             # Metrics the Git-shaped summary hides (change size, binary share, activity, authorship, branch copies).
             extra: dict[str, Any] = {}
             if is_p4:
@@ -3212,6 +3337,9 @@ def process_repo(
                 git_stats["integration_changelists"] = len(p4_integrations)
                 write_json(git_dir / "p4_stats.json", git_stats)
                 extra.update(p4_metrics.branch_origin(p4_conn, p4_scope, row["total_files"], log))
+            elif is_plastic:
+                git_stats["merge_changesets"] = len(plastic_merges)
+                write_json(git_dir / "plastic_stats.json", git_stats)
             else:
                 extra["has_largefiles"] = (clone_path / ".hglf").is_dir()
                 extra["has_subrepos"] = bool(git_stats.get("has_subrepos"))
@@ -3253,7 +3381,7 @@ def process_repo(
 
         # Open source / vibe-coded: append "<PRs affected>[,>50%:<PRs mostly affected>]" to the repo-level value.
         # Git history only: a Mercurial repo keeps the repo-level value without PR counts.
-        pr_counts = None if is_hg or is_p4 else collect_pr_signals(clone_path, pr_signals_path, log)
+        pr_counts = None if is_hg or is_p4 or is_plastic else collect_pr_signals(clone_path, pr_signals_path, log)
         if pr_counts is not None:
             row["open_source_loc_pct"] = pr_signals.with_pr_counts(
                 row["open_source_loc_pct"], pr_signals.tally(pr_counts, "oss")
@@ -3918,6 +4046,33 @@ def main() -> int:
         help="Depot path to profile, e.g. //depot/project (repeatable). Each becomes one repo row.",
     )
     parser.add_argument(
+        "--plastic-server",
+        default="",
+        help="Plastic SCM / Unity Version Control server (host:8087 or org@cloud). Profiles each --plastic-repo; "
+        "implies --offline. The password is read from the PLASTIC_PASSWORD env var; without one the user's own "
+        "configured `cm` client is used.",
+    )
+    parser.add_argument("--plastic-user", default="", help="Plastic user name (only with PLASTIC_PASSWORD)")
+    parser.add_argument(
+        "--plastic-repo",
+        action="append",
+        default=[],
+        help="Plastic repository to profile (repeatable). Each becomes one repo row.",
+    )
+    parser.add_argument(
+        "--plastic-local-root",
+        default="",
+        help="Folder holding already-updated Plastic workspaces named after the repositories: each repo is "
+        "measured in place (ROOT/<repo>) instead of being downloaded. Never falls back to a download.",
+    )
+    parser.add_argument(
+        "--plastic-local-dir",
+        action="append",
+        default=[],
+        metavar="REPO=DIR",
+        help="Measure this repository from an existing workspace folder (repeatable)",
+    )
+    parser.add_argument(
         "--local-repo",
         action="append",
         default=[],
@@ -4051,6 +4206,17 @@ def main() -> int:
                 args.hg = True
             if all(t.vcs == "p4" for t in resumed_targets):
                 args.p4_port = "resume"  # real server is stored per target in repos.json
+            if all(t.vcs == "plastic" for t in resumed_targets):
+                args.plastic_server = "resume"
+    if args.plastic_server:
+        args.offline = True
+        if args.hg or args.p4_port:
+            raise SystemExit("--plastic-server, --p4-port and --hg are different version-control systems; pick one")
+        if not plastic_metrics.cm_available():
+            raise SystemExit(
+                "--plastic-server needs the `cm` command on PATH "
+                "(https://docs.unity.com/en-us/unity-version-control/uvcs-cli/version-control-cli)."
+            )
     if args.p4_port:
         args.offline = True
         if args.hg:
@@ -4071,7 +4237,7 @@ def main() -> int:
                 "brew install mercurial, or pip install mercurial)."
             )
 
-    if args.offline and not args.local_repos_dir and not args.p4_port and resumed_targets is None:
+    if args.offline and not args.local_repos_dir and not args.p4_port and not args.plastic_server and resumed_targets is None:
         raise SystemExit("--offline requires --local-repos-dir")
     if args.offline and (
         args.github_org
@@ -4168,7 +4334,11 @@ def main() -> int:
     all_targets: list[RepoTarget] | None = resumed_targets
 
     if all_targets is None:
-        if args.p4_port:
+        if args.plastic_server:
+            all_targets = build_plastic_targets(
+                args.plastic_server, args.plastic_user, args.plastic_repo, args.plastic_local_root, args.plastic_local_dir
+            )
+        elif args.p4_port:
             all_targets = build_p4_targets(
                 args.p4_port, args.p4_user, args.p4_path, args.p4_local_root, args.p4_local_dir
             )
@@ -4193,7 +4363,9 @@ def main() -> int:
         # Prefer the original stamp from the folder name when present.
         stamp = run_dir.name.rsplit("-", 1)[-1] if "-" in run_dir.name else stamp
     else:
-        if args.p4_port:
+        if args.plastic_server:
+            label = re.sub(r"[^A-Za-z0-9._-]+", "-", args.plastic_server.split("@")[-1].split(":")[0]) or "plastic"
+        elif args.p4_port:
             label = re.sub(r"[^A-Za-z0-9._-]+", "-", args.p4_port.split(":")[-2] if args.p4_port.count(":") >= 1 else args.p4_port) or "perforce"
         elif args.offline:
             label = args.local_repos_dir.name
@@ -4257,7 +4429,9 @@ def main() -> int:
     )
     log_runtime_diagnostics(log, args)
     if args.offline:
-        if getattr(args, "p4_port", ""):
+        if getattr(args, "plastic_server", ""):
+            log.info("Mode: Plastic SCM server (reads changeset history from the server; file contents are measured locally)")
+        elif getattr(args, "p4_port", ""):
             log.info("Mode: Perforce server (reads changelist history from the server; file contents are measured locally)")
         else:
             log.info("Mode: offline local-clone analysis; no network requests will be made")
@@ -4330,7 +4504,7 @@ def main() -> int:
     checkpoint.replace_rows(rows)
 
     summary_path = checkpoint.summary_path
-    if any(t.vcs in ("hg", "p4") for t in all_targets):
+    if any(t.vcs in ("hg", "p4", "plastic") for t in all_targets):
         vcs_extra.write_run_csv(run_dir, vcs_extra.load_run_records(run_dir))
     if not args.no_for_check and for_check.write_run_csv(run_dir) is None:
         log.warning("for-check.csv could not be written")
@@ -4438,7 +4612,19 @@ def main() -> int:
         manifest["vcs_extra_metrics_csv"] = str(run_dir / "vcs_extra_metrics.csv")
     if (run_dir / commit_dedup.DUPLICATES_FILE_NAME).is_file():
         manifest["duplicates_csv"] = str(run_dir / commit_dedup.DUPLICATES_FILE_NAME)
-    if args.p4_port:
+    if args.plastic_server:
+        manifest["vcs"] = "plastic"
+        manifest["plastic_notes"] = (
+            "Read from a Plastic SCM / Unity Version Control server with the cm CLI; the password is never "
+            "stored. Each target is one repository: commits are all changesets on every branch, merged_prs counts "
+            "changesets that are the destination of a merge link (no file list, like a Git merge). Line counts come "
+            "from `cm diffmetrics` (changed files) and `cm cat` (added/removed text files), bounded by "
+            "PLASTIC_LINES_LIMIT; see commits_detail_meta.json. LOC/files/tests are measured on a scratch download of "
+            "the main branch head, or on a local workspace when one was given. Changeset ids are repository-local, so "
+            "duplicate_pct is blank. Dates are read as UTC. Not yet verified against a live server. Details in "
+            "git/<repo>/plastic_stats.json."
+        )
+    elif args.p4_port:
         manifest["vcs"] = "perforce"
         manifest["p4_notes"] = (
             "Read from a Perforce server with the p4 CLI; the password/ticket is never stored. Each "
