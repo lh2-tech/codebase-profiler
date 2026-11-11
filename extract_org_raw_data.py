@@ -58,6 +58,7 @@ from code_metrics import PR_FIELDS, STRUCTURE_FIELDS, pr_tier_metrics, structure
 import commit_dedup
 import for_check
 import highlight
+import integrity
 import pr_signals
 from count_merged_prs import (
     GITHUB_RATE_LIMIT_WAIT_SECONDS,
@@ -3154,6 +3155,10 @@ def process_repo(
                 collect_commit_hashes(clone_path, hashes_path, log)
                 collect_commit_loc(clone_path, loc_path, log)
 
+        if not (is_p4 or is_hg):
+            # Tamper evidence read from the repository while it still exists: see integrity.py.
+            integrity.write_repo_integrity(clone_path, git_dir, row.get("measured_branch", ""), log)
+
         scc = run_scc(clone_path)
         write_json(git_dir / "scc.json", scc)
         row["loc"] = scc["loc"]
@@ -3924,6 +3929,13 @@ def main() -> int:
         "digest), 'names' (verbatim; may expose client names or ticket ids) or 'none' (no ref rows)",
     )
     parser.add_argument(
+        "--integrity-challenge",
+        default="",
+        help="Text issued by the receiver and written into INTEGRITY.json, so a run cannot be passed off as an "
+        "earlier one. Tamper evidence is always written; set PROFILER_INTEGRITY_KEY to also sign it, and check "
+        "with `python integrity.py verify <run folder or zip>`",
+    )
+    parser.add_argument(
         "--no-dedup",
         action="store_true",
         help="Skip the commit-hash comparison between repos (duplicate_pct / duplicate_commits / duplicates_with "
@@ -4496,6 +4508,11 @@ def main() -> int:
             ),
         }
     write_json(run_dir / "manifest.json", manifest)
+
+    try:
+        integrity.write_run_integrity(run_dir, challenge=args.integrity_challenge, log=log)
+    except Exception:  # noqa: BLE001 - tamper evidence must not stop the zip
+        log.exception("INTEGRITY.json could not be written")
 
     zip_path = zip_run_dir(run_dir)
     log.info("Done. summary=%s", summary_path)

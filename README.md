@@ -382,6 +382,21 @@ count there, so a reader that compares it with a delivery's PR metadata no longe
 `--no-for-check` and `--for-check-refs` exist only in profilers that include for-check; an older profiler rejects the
 flag (argparse "unrecognized arguments"), so pin Squirrel to a profiler version that has it.
 
+### Tamper evidence (always on)
+
+Every run writes two kinds of tamper evidence; there is no switch to turn them off.
+
+- `git/<repo>/integrity.json` — read from the repository while it still exists: the measured branch's HEAD commit and tree id, root commits, a digest of the ref tips, the `git fsck` result, merge / empty-commit / author-date counts and the PR-merge numbering. Anyone holding the repository can recompute these.
+- `INTEGRITY.json` (run root) — SHA-256 of every output file, one chain digest over them, the SHA-256 of the profiler's own `*.py` files, the optional `--integrity-challenge` text, and an HMAC-SHA256 when `PROFILER_INTEGRITY_KEY` is set.
+
+Check a run folder or zip with:
+
+```bash
+python integrity.py verify raw-extract-ORG-STAMP.zip --challenge TEXT --key KEY
+```
+
+It reports *problems* (edited, added or missing files, wrong key or challenge, summary rows that disagree with the per-repo files, a failed `git fsck`) and *flags* (history that looks generated: gapless PR numbers, many empty commits, one shared timestamp). A run proves consistency, not honesty: whoever holds the key can regenerate everything, so compare `head_commit` / `head_tree` with a repository you hold yourself.
+
 ## Local development (without Docker)
 
 ```bash

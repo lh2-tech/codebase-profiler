@@ -45,7 +45,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY extract_org_raw_data.py hg_metrics.py p4_metrics.py vcs_extra.py commit_dedup.py code_metrics.py extract_ui.py for_check.py highlight.py pr_signals.py count_merged_prs.py github_app_auth.py clone_all_repos.py LH2-DataLabs.svg ./
+COPY extract_org_raw_data.py hg_metrics.py p4_metrics.py vcs_extra.py commit_dedup.py integrity.py code_metrics.py extract_ui.py for_check.py highlight.py pr_signals.py count_merged_prs.py github_app_auth.py clone_all_repos.py LH2-DataLabs.svg ./
 COPY tokens.example .
 
 # Bake every tree-sitter grammar the profiler uses into the image. The language pack otherwise
