@@ -252,7 +252,7 @@ SVN_PASSWORD=... python extract_org_raw_data.py --svn-url https://svn.example.co
 ```
 
 - **Commits** are the revisions touching the URL; paths outside it are ignored. Authors are svn user names, with no email.
-- **`merged_prs`** counts revisions that copy a directory into the path (branch/tag creation) or change `svn:mergeinfo`; like a Git merge they carry no file list. Beyond the commit-detail cap only directory copies are recognised (a mergeinfo-only merge needs the revision's diff).
+- **`local_merges`** (not `merged_prs`, which stays blank) counts revisions that copy a directory into the path (branch/tag creation) or change `svn:mergeinfo`; like a Git merge they carry no file list. Beyond the commit-detail cap only directory copies are recognised (a mergeinfo-only merge needs the revision's diff).
 - **Line counts** come from `svn diff -c N`, which includes added and deleted files.
 - **Export vs. working copy.** Default exports the head revision to a scratch folder (no `.svn`) that is deleted afterwards; `--svn-local-root` / `--svn-local-dir URL=DIR` measure an existing working copy in place (never changed, never a silent fallback to an export). The run compares it with the URL by revision and warns when it is behind or has local modifications; on a read-only mount `svn status` may be unable to run, and the check is then reported as not done.
 - **Auth.** The password is given to `svn` on stdin with `--no-auth-cache`: not in argv, the process list, svn's cache, logs or the archive. URLs with `user:pass@` are refused. An untrusted HTTPS certificate fails with a message; set `SVN_TRUST_SERVER_CERT=1` only after verifying the server.
@@ -269,7 +269,7 @@ PLASTIC_PASSWORD=... python extract_org_raw_data.py --plastic-server plastic.exa
 # already-updated workspaces, one folder per repo: add --plastic-local-root ./plastic-workspaces
 ```
 
-- **Commits** are every changeset on every branch. `merged_prs` counts changesets that are the destination of a merge link; like a Git merge they carry no file list.
+- **Commits** are every changeset on every branch. `local_merges` counts changesets that are the destination of a merge link (`merged_prs` stays blank: there is no PR platform); like a Git merge they carry no file list.
 - **Line counts** come from `cm diffmetrics` (modified files: changed+added / changed+deleted) and `cm cat` (added/removed text files), bounded by `PLASTIC_LINES_LIMIT` / `PLASTIC_CAT_MAX_BYTES`; see `commits_detail_meta.json`.
 - **Download vs. local workspace.** Default downloads the main-branch head into a scratch workspace that is removed afterwards; `--plastic-local-root` / `--plastic-local-dir REPO=DIR` measure existing folders in place (never deleted, not compared with the server, never a silent fallback to download).
 - **Duplicates.** Changeset ids are repository-local, so `duplicate_pct` is blank.

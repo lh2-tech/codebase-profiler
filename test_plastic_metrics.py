@@ -245,7 +245,7 @@ class TestCliEndToEnd(PlasticStubCase):
         self.assertEqual(len(rows), 1)
         r = rows[0]
         self.assertEqual(r["error"], "")
-        self.assertEqual((r["total_commits"], r["merged_prs"]), ("5", "1"))
+        self.assertEqual((r["total_commits"], r["merged_prs"], r["local_merges"]), ("5", "", "1"))
         self.assertEqual(r["measured_branch"], "/main")
         self.assertEqual(r["duplicate_pct"], "")
         self.assertEqual(json.loads((run / "manifest.json").read_text())["vcs"], "plastic")

@@ -4769,7 +4769,7 @@ def main() -> int:
         manifest["vcs"] = "subversion"
         manifest["svn_notes"] = (
             "Read with the svn CLI; the password is given to svn on stdin and never stored. Each target is one "
-            "repository URL: commits are the revisions touching it (paths outside it are ignored), merged_prs counts "
+            "repository URL: commits are the revisions touching it (paths outside it are ignored), local_merges counts "
             "revisions that copy a directory (branch/tag creation) or change svn:mergeinfo, which carry no file list "
             "like a Git merge. Line counts come from `svn diff -c N`. LOC/files/tests are measured on an export of the "
             "head revision, or on a local working copy when one was given (checked against the URL's revision). "
@@ -4780,7 +4780,7 @@ def main() -> int:
         manifest["vcs"] = "plastic"
         manifest["plastic_notes"] = (
             "Read from a Plastic SCM / Unity Version Control server with the cm CLI; the password is never "
-            "stored. Each target is one repository: commits are all changesets on every branch, merged_prs counts "
+            "stored. Each target is one repository: commits are all changesets on every branch, local_merges counts "
             "changesets that are the destination of a merge link (no file list, like a Git merge). Line counts come "
             "from `cm diffmetrics` (changed files) and `cm cat` (added/removed text files), bounded by "
             "PLASTIC_LINES_LIMIT; see commits_detail_meta.json. LOC/files/tests are measured on a scratch download of "

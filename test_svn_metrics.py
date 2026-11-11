@@ -181,7 +181,7 @@ class TestCliEndToEnd(SvnRepoCase):
         r = rows[0]
         self.assertEqual(r["error"], "")
         self.assertEqual(r["total_commits"], "5")  # r1, r2, r3, r6, r7
-        self.assertEqual(r["merged_prs"], "1")
+        self.assertEqual((r["merged_prs"], r["local_merges"]), ("", "1"))  # merges are not platform PRs
         self.assertEqual(r["measured_branch"], "^/trunk")
         self.assertEqual(r["duplicate_pct"], "")
         self.assertEqual(json.loads((run / "manifest.json").read_text())["vcs"], "subversion")
@@ -213,7 +213,7 @@ class TestCliEndToEnd(SvnRepoCase):
         with (run / "summary.csv").open() as fh:
             r = next(csv.DictReader(fh))
         self.assertEqual(r["error"], "")
-        self.assertEqual(r["merged_prs"], "1")  # r4, the branch creation copy
+        self.assertEqual(r["local_merges"], "1")  # r4, the branch creation copy
 
     def test_rejects_credentials_in_url(self) -> None:
         proc = subprocess.run(
