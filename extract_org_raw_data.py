@@ -55,6 +55,7 @@ from typing import Any, Callable
 import hg_metrics
 import p4_metrics
 import plastic_metrics
+import svn_metrics
 import vcs_extra
 from code_metrics import PR_FIELDS, STRUCTURE_FIELDS, pr_tier_metrics, structure_metrics
 import commit_dedup
@@ -304,6 +305,7 @@ TEST_DIR_HINTS = ("test", "tests", "spec", "specs", "__tests__")
 SKIP_WALK_DIRS = {
     ".git",
     ".hg",
+    ".svn",
     "node_modules",
     "vendor",
     "dist",
@@ -518,7 +520,7 @@ class RepoTarget:
     full_name: str
     meta: dict[str, Any]
     local_path: Path | None = None
-    vcs: str = "git"  # git | hg | p4 | plastic (local targets only; p4/plastic read a server, see meta["p4"] / meta["plastic"])
+    vcs: str = "git"  # git | hg | p4 | plastic | svn (local targets only; p4/plastic/svn read a server, see meta["p4"] / meta["plastic"] / meta["svn"])
 
 
 def parse_tokens_file(path: Path) -> dict[str, str]:
@@ -2018,7 +2020,7 @@ def _collect_lockfile_backed_dep_roots(repo: Path) -> list[str]:
         dirs[:] = [
             d
             for d in dirs
-            if d not in (".git", ".hg") and d.lower() not in {"node_modules", "vendor", "pods", ".venv", "venv"}
+            if d not in (".git", ".hg", ".svn") and d.lower() not in {"node_modules", "vendor", "pods", ".venv", "venv"}
         ]
         files_lower = {name.lower() for name in files}
         rel = Path(root).relative_to(repo)
@@ -2049,6 +2051,7 @@ def _collect_oss_license_roots(repo: Path) -> list[str]:
     skip_dir_names = {
         ".git",
         ".hg",
+        ".svn",
         "node_modules",
         ".venv",
         "venv",
@@ -2114,7 +2117,7 @@ def path_bucket_loc_pcts(repo: Path) -> dict[str, float | str]:
     open_source = 0
     library_modules = 0
     for root, dirs, files in os.walk(repo):
-        dirs[:] = [directory for directory in dirs if directory not in (".git", ".hg")]
+        dirs[:] = [directory for directory in dirs if directory not in (".git", ".hg", ".svn")]
         rel_root = Path(root).relative_to(repo).as_posix().replace("\\", "/")
         if rel_root == ".":
             rel_root = ""
@@ -2520,6 +2523,63 @@ def build_plastic_targets(
         )
     if not targets:
         raise SystemExit("--plastic-server needs at least one --plastic-repo")
+    return sorted(targets, key=lambda t: t.full_name.lower())
+
+
+def svn_connection(target: RepoTarget) -> svn_metrics.SvnConn:
+    """Credentials for one Subversion target. The password comes from ``SVN_PASSWORD`` only (never argv or
+    repos.json), so a resumed run needs it set again. Empty means anonymous / the user's own svn config."""
+    info = target.meta.get("svn") or {}
+    return svn_metrics.SvnConn(
+        user=str(info.get("user") or ""),
+        password=os.environ.get("SVN_PASSWORD", ""),
+        trust_cert=os.environ.get("SVN_TRUST_SERVER_CERT", "") == "1",
+    )
+
+
+def build_svn_targets(
+    urls: list[str],
+    user: str,
+    local_root: str = "",
+    local_dirs: list[str] | None = None,
+) -> list[RepoTarget]:
+    """One target per repository URL: org is the host, full_name ``<host>/<path slug>``."""
+    overrides: dict[str, str] = {}
+    for item in local_dirs or []:
+        key, sep, folder = item.rpartition("=")
+        if not sep or not key.strip() or not folder.strip():
+            raise SystemExit(f"--svn-local-dir expects URL=DIR, got {item!r}")
+        try:
+            overrides[svn_metrics.normalize_url(key)] = folder.strip()
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+    targets: list[RepoTarget] = []
+    seen: set[str] = set()
+    for raw in urls:
+        try:
+            url = svn_metrics.normalize_url(raw)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        if url in seen:
+            continue
+        seen.add(url)
+        org = re.sub(r"[^A-Za-z0-9._-]+", "-", svn_metrics.host_of(url)) or "svn"
+        targets.append(
+            RepoTarget(
+                platform="local",
+                org=org,
+                full_name=f"{org}/{svn_metrics.slug_for(url)}",
+                meta={"svn": {
+                    "url": url, "user": user,
+                    **({"local_root": local_root} if local_root else {}),
+                    **({"local_dirs": {url: overrides[url]}} if url in overrides else {}),
+                }},
+                local_path=None,
+                vcs="svn",
+            )
+        )
+    if not targets:
+        raise SystemExit("--svn-url needs at least one repository URL")
     return sorted(targets, key=lambda t: t.full_name.lower())
 
 
@@ -2968,6 +3028,14 @@ def process_repo(
     is_plastic = target.vcs == "plastic"
     if is_plastic:
         clone_path = clones_dir / f"{slug}-plastic-sync"
+    is_svn = target.vcs == "svn"
+    if is_svn:
+        clone_path = clones_dir / f"{slug}-svn-export"
+    svn_conn: svn_metrics.SvnConn | None = None
+    svn_url = ""
+    svn_info: dict[str, str] = {}
+    svn_changes: list[dict[str, Any]] = []
+    svn_merges: list[dict[str, str]] = []
     is_hg = target.vcs == "hg"
     plastic_conn: plastic_metrics.PlasticConn | None = None
     plastic_repo = ""
@@ -3075,9 +3143,13 @@ def process_repo(
             elif is_plastic:
                 plastic_repo = str((target.meta.get("plastic") or {}).get("repo") or "")
                 plastic_conn = plastic_connection(target, log)
+            elif is_svn:
+                svn_url = str((target.meta.get("svn") or {}).get("url") or "")
+                svn_conn = svn_connection(target)
+                svn_info = svn_metrics.connect(svn_conn, svn_url)
             elif target.local_path is None:
                 raise RuntimeError("Local repository path is missing")
-            if is_p4 or is_plastic:
+            if is_p4 or is_plastic or is_svn:
                 pass  # connected above; history is read from the server
             elif is_hg:
                 if not hg_metrics.probe_local_hg(clone_path, log):
@@ -3093,8 +3165,9 @@ def process_repo(
             row["default_branch"] = (
                 p4_scope if is_p4 else
                 (plastic_metrics.main_branch(plastic_conn, plastic_repo) if is_plastic else
+                (svn_info["relative"] if is_svn else
                 (hg_metrics.current_branch(clone_path) if is_hg else
-                 run_git(clone_path, "symbolic-ref", "--short", "HEAD").strip()))
+                 run_git(clone_path, "symbolic-ref", "--short", "HEAD").strip())))
                 or "not_collected_offline"
             )
             row["merged_prs"] = ""  # the platform is not asked offline: its PR count is unknown, never a merge-commit count
@@ -3119,8 +3192,8 @@ def process_repo(
             )
         elif is_p4:
             row["measured_branch"] = p4_scope  # a depot path has one head; there is no branch to pick
-        elif is_plastic:
-            row["measured_branch"] = row["default_branch"]  # the main branch head
+        elif is_plastic or is_svn:
+            row["measured_branch"] = row["default_branch"]  # the main branch head / the URL's path
         else:
             wanted = client_branch_for(clone_path)
             client_pick = checkout_client_branch(clone_path, wanted, log) if wanted else ""
@@ -3179,6 +3252,33 @@ def process_repo(
                 scratch_tree = clone_path
                 plastic_metrics.sync_working_tree(plastic_conn, plastic_repo, clone_path, log)
             write_json(git_dir / "plastic_stats.json", git_stats)
+        elif is_svn:
+            assert svn_conn is not None
+            log.info("svn %s: reading revision history", svn_url)
+            svn_changes = list(svn_metrics.iter_revisions(svn_conn, svn_url, svn_info, timeout=GIT_LOG_TIMEOUT_SECONDS))
+            log.info("svn %s: %s revisions; reading authors", svn_url, f"{len(svn_changes):,}")
+            git_stats = svn_metrics.aggregate_svn_stats(svn_conn, svn_url, svn_info, is_bot_author, log, changes=svn_changes)
+            sv_info = target.meta.get("svn") or {}
+            if sv_info.get("local_root") or sv_info.get("local_dirs"):
+                # the files are already on this machine: measure them in place, download nothing, delete nothing
+                clone_path = svn_metrics.resolve_local_tree(svn_url, sv_info.get("local_root"), sv_info.get("local_dirs"))
+                check = svn_metrics.workspace_check(svn_conn, svn_url, clone_path)
+                git_stats["tree_source"] = "local working copy"
+                git_stats["workspace_check"] = check
+                log.info("svn %s: measuring the local working copy %s (%s files)", svn_url, clone_path, f"{check['files_local']:,}")
+                if not check.get("checked"):
+                    log.warning("svn %s: the local folder could not be compared with the repository (%s)", svn_url, check.get("note"))
+                elif not check["within_tolerance"]:
+                    log.warning(
+                        "svn %s: the local working copy is at revision %s but the URL is at %s, with %s modified items: "
+                        "it is behind or edited, which skews LOC, language and test metrics",
+                        svn_url, check["working_copy_revision"], check["head_revision"], check["modified_items"],
+                    )
+            else:
+                git_stats["tree_source"] = "exported head revision"
+                scratch_tree = clone_path
+                svn_metrics.export_head(svn_conn, svn_url, clone_path, log)
+            write_json(git_dir / "svn_stats.json", git_stats)
         elif is_hg:
             git_stats = hg_metrics.aggregate_hg_stats(hg_repo, is_bot_author, log)
             clone_path, tree_branch, is_scratch = hg_metrics.prepare_working_tree(
@@ -3250,6 +3350,18 @@ def process_repo(
                 log=log,
                 write_json=write_json,
             )
+        elif is_svn:
+            _, svn_merges = svn_metrics.export_commits_jsonl(
+                svn_conn,
+                svn_url,
+                git_dir / "commits.jsonl",
+                changes=svn_changes,
+                is_bot=is_bot_author,
+                max_commits=COMMIT_DETAIL_LIMIT,
+                timeout=GIT_LOG_TIMEOUT_SECONDS,
+                log=log,
+                write_json=write_json,
+            )
         elif is_hg:
             hg_metrics.export_commits_jsonl(
                 hg_repo,
@@ -3271,8 +3383,8 @@ def process_repo(
 
         if commit_hashes_enabled:
             # Complete (not capped like commits.jsonl) and taken while the clone still exists.
-            if is_plastic:
-                pass  # changeset ids are repository-local, so no hash file; duplicate_pct stays blank
+            if is_plastic or is_svn:
+                pass  # changeset / revision ids are repository-local, so no hash file; duplicate_pct stays blank
             elif is_p4:
                 # Changelist numbers are server-local, so they are never comparable between depots:
                 # no hash file, and duplicate_pct stays blank (unknown) for Perforce targets.
@@ -3300,6 +3412,8 @@ def process_repo(
                 if is_p4
                 else plastic_merges
                 if is_plastic
+                else svn_merges
+                if is_svn
                 else detect_merged_prs_from_hg(hg_repo)
                 if is_hg
                 else detect_merged_prs_from_git(clone_path)
@@ -3329,7 +3443,7 @@ def process_repo(
 
         row["project_name"] = org
         row["total_files"] = count_total_files(clone_path)
-        if is_hg or is_p4 or is_plastic:
+        if is_hg or is_p4 or is_plastic or is_svn:
             # Metrics the Git-shaped summary hides (change size, binary share, activity, authorship, branch copies).
             extra: dict[str, Any] = {}
             if is_p4:
@@ -3340,6 +3454,9 @@ def process_repo(
             elif is_plastic:
                 git_stats["merge_changesets"] = len(plastic_merges)
                 write_json(git_dir / "plastic_stats.json", git_stats)
+            elif is_svn:
+                git_stats["merge_revisions"] = len(svn_merges)
+                write_json(git_dir / "svn_stats.json", git_stats)
             else:
                 extra["has_largefiles"] = (clone_path / ".hglf").is_dir()
                 extra["has_subrepos"] = bool(git_stats.get("has_subrepos"))
@@ -3381,7 +3498,7 @@ def process_repo(
 
         # Open source / vibe-coded: append "<PRs affected>[,>50%:<PRs mostly affected>]" to the repo-level value.
         # Git history only: a Mercurial repo keeps the repo-level value without PR counts.
-        pr_counts = None if is_hg or is_p4 or is_plastic else collect_pr_signals(clone_path, pr_signals_path, log)
+        pr_counts = None if is_hg or is_p4 or is_plastic or is_svn else collect_pr_signals(clone_path, pr_signals_path, log)
         if pr_counts is not None:
             row["open_source_loc_pct"] = pr_signals.with_pr_counts(
                 row["open_source_loc_pct"], pr_signals.tally(pr_counts, "oss")
@@ -4073,6 +4190,28 @@ def main() -> int:
         help="Measure this repository from an existing workspace folder (repeatable)",
     )
     parser.add_argument(
+        "--svn-url",
+        action="append",
+        default=[],
+        help="Subversion repository URL to profile, e.g. https://host/svn/repo/trunk (repeatable; http, https, svn, "
+        "svn+ssh, file). Implies --offline. The password is read from SVN_PASSWORD (given to svn on stdin); "
+        "SVN_TRUST_SERVER_CERT=1 accepts a server certificate you have verified.",
+    )
+    parser.add_argument("--svn-user", default="", help="Subversion user name (only with SVN_PASSWORD)")
+    parser.add_argument(
+        "--svn-local-root",
+        default="",
+        help="Folder holding already-updated working copies named after each URL's path (slug 'svn-repo-trunk'): "
+        "measured in place instead of exported. Never falls back to an export.",
+    )
+    parser.add_argument(
+        "--svn-local-dir",
+        action="append",
+        default=[],
+        metavar="URL=DIR",
+        help="Measure this URL from an existing working copy folder (repeatable)",
+    )
+    parser.add_argument(
         "--local-repo",
         action="append",
         default=[],
@@ -4208,6 +4347,14 @@ def main() -> int:
                 args.p4_port = "resume"  # real server is stored per target in repos.json
             if all(t.vcs == "plastic" for t in resumed_targets):
                 args.plastic_server = "resume"
+            if all(t.vcs == "svn" for t in resumed_targets):
+                args.svn_url = ["resume"]
+    if args.svn_url:
+        args.offline = True
+        if args.hg or args.p4_port or args.plastic_server:
+            raise SystemExit("--svn-url, --plastic-server, --p4-port and --hg are different version-control systems; pick one")
+        if not svn_metrics.svn_available():
+            raise SystemExit("--svn-url needs the `svn` command on PATH (brew install subversion, or apt install subversion).")
     if args.plastic_server:
         args.offline = True
         if args.hg or args.p4_port:
@@ -4237,7 +4384,7 @@ def main() -> int:
                 "brew install mercurial, or pip install mercurial)."
             )
 
-    if args.offline and not args.local_repos_dir and not args.p4_port and not args.plastic_server and resumed_targets is None:
+    if args.offline and not args.local_repos_dir and not args.p4_port and not args.plastic_server and not args.svn_url and resumed_targets is None:
         raise SystemExit("--offline requires --local-repos-dir")
     if args.offline and (
         args.github_org
@@ -4334,7 +4481,9 @@ def main() -> int:
     all_targets: list[RepoTarget] | None = resumed_targets
 
     if all_targets is None:
-        if args.plastic_server:
+        if args.svn_url:
+            all_targets = build_svn_targets(args.svn_url, args.svn_user, args.svn_local_root, args.svn_local_dir)
+        elif args.plastic_server:
             all_targets = build_plastic_targets(
                 args.plastic_server, args.plastic_user, args.plastic_repo, args.plastic_local_root, args.plastic_local_dir
             )
@@ -4363,7 +4512,9 @@ def main() -> int:
         # Prefer the original stamp from the folder name when present.
         stamp = run_dir.name.rsplit("-", 1)[-1] if "-" in run_dir.name else stamp
     else:
-        if args.plastic_server:
+        if args.svn_url:
+            label = re.sub(r"[^A-Za-z0-9._-]+", "-", svn_metrics.host_of(args.svn_url[0])) or "svn"
+        elif args.plastic_server:
             label = re.sub(r"[^A-Za-z0-9._-]+", "-", args.plastic_server.split("@")[-1].split(":")[0]) or "plastic"
         elif args.p4_port:
             label = re.sub(r"[^A-Za-z0-9._-]+", "-", args.p4_port.split(":")[-2] if args.p4_port.count(":") >= 1 else args.p4_port) or "perforce"
@@ -4429,7 +4580,9 @@ def main() -> int:
     )
     log_runtime_diagnostics(log, args)
     if args.offline:
-        if getattr(args, "plastic_server", ""):
+        if getattr(args, "svn_url", None):
+            log.info("Mode: Subversion (reads revision history from the repository; file contents are measured locally)")
+        elif getattr(args, "plastic_server", ""):
             log.info("Mode: Plastic SCM server (reads changeset history from the server; file contents are measured locally)")
         elif getattr(args, "p4_port", ""):
             log.info("Mode: Perforce server (reads changelist history from the server; file contents are measured locally)")
@@ -4504,7 +4657,7 @@ def main() -> int:
     checkpoint.replace_rows(rows)
 
     summary_path = checkpoint.summary_path
-    if any(t.vcs in ("hg", "p4", "plastic") for t in all_targets):
+    if any(t.vcs in ("hg", "p4", "plastic", "svn") for t in all_targets):
         vcs_extra.write_run_csv(run_dir, vcs_extra.load_run_records(run_dir))
     if not args.no_for_check and for_check.write_run_csv(run_dir) is None:
         log.warning("for-check.csv could not be written")
@@ -4612,7 +4765,18 @@ def main() -> int:
         manifest["vcs_extra_metrics_csv"] = str(run_dir / "vcs_extra_metrics.csv")
     if (run_dir / commit_dedup.DUPLICATES_FILE_NAME).is_file():
         manifest["duplicates_csv"] = str(run_dir / commit_dedup.DUPLICATES_FILE_NAME)
-    if args.plastic_server:
+    if args.svn_url:
+        manifest["vcs"] = "subversion"
+        manifest["svn_notes"] = (
+            "Read with the svn CLI; the password is given to svn on stdin and never stored. Each target is one "
+            "repository URL: commits are the revisions touching it (paths outside it are ignored), merged_prs counts "
+            "revisions that copy a directory (branch/tag creation) or change svn:mergeinfo, which carry no file list "
+            "like a Git merge. Line counts come from `svn diff -c N`. LOC/files/tests are measured on an export of the "
+            "head revision, or on a local working copy when one was given (checked against the URL's revision). "
+            "Revision numbers are repository-local, so duplicate_pct is blank. Authors are svn user names with no "
+            "email. Details in git/<repo>/svn_stats.json."
+        )
+    elif args.plastic_server:
         manifest["vcs"] = "plastic"
         manifest["plastic_notes"] = (
             "Read from a Plastic SCM / Unity Version Control server with the cm CLI; the password is never "

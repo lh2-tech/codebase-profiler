@@ -25,6 +25,7 @@ Edit `.env` to point `LOCAL_REPOS_DIR` at a folder on your computer that contain
 | `LOCAL_REPOS_DIR` | `./repos` | "Already cloned here" (git) |
 | `LOCAL_HG_REPOS_DIR` | `./hg-repos` | "Mercurial (local)" |
 | `LOCAL_P4_WORKSPACES_DIR` | `./p4-workspaces` | "Perforce (server)" -> "Use workspaces I already have" (skips the download) |
+| `LOCAL_SVN_WORKINGCOPIES_DIR` | `./svn-workingcopies` | "Subversion (URL)" -> "Use working copies I already have" (skips the export) |
 
 All three are mounted read-only into the container; nothing in them is ever changed.
 
@@ -239,6 +240,24 @@ What the numbers mean for Perforce:
 - **Duplicates.** Changelist numbers are server-local, so `duplicate_pct` is blank for Perforce.
 - **Download vs. local workspace.** By default the head revision is downloaded into a scratch folder (deleted afterwards), which is slow on a big depot; the log says how many files and bytes it is about to fetch and reports progress every 20 s. If the files are already on this computer, point the run at them instead: UI -> "Where are the files measured from?" -> "Use workspaces I already have" (put them in `./p4-workspaces`, or `LOCAL_P4_WORKSPACES_DIR`), or on the command line `--p4-local-root ROOT` (looks for `ROOT/<path under the depot>`, then `ROOT/<depot>/<path>`) and `--p4-local-dir //depot/project=/some/folder` per path. Nothing is downloaded and nothing in your folders is changed or deleted; a path with no folder fails rather than quietly downloading. Run `p4 sync` first: the run compares file count and size with the server head (`workspace_check` in `p4_stats.json`) and warns when they differ by more than 2%, because a stale folder or untracked build output skews LOC, language and test metrics. History (changelists, authors, churn) always comes from the server.
 - **Auth.** A password is exchanged for a ticket (`p4 login -p`); an `ssl:` server whose fingerprint is not yet trusted needs `P4_FINGERPRINT` (or `p4 trust` once) — it is never accepted automatically. The run is read-only.
+
+### Subversion (URL)
+
+The **Subversion (URL)** tab reads repository URLs (`http`, `https`, `svn`, `svn+ssh`, `file`) with the `svn` CLI and produces the same summary columns, `git_stats.json` and `commits.jsonl` as Git runs. The image installs `svn`; on the host you need it on `PATH`. **Load folders** lists the sub-folders of the URL (trunk, branches, one per project) to pick from; each URL is one repository row, and with none picked the URL itself is profiled.
+
+```bash
+SVN_PASSWORD=... python extract_org_raw_data.py --svn-url https://svn.example.com/repos/proj/trunk \
+  --svn-user alice --output-dir outputs/raw-extracts
+# already-updated working copies: add --svn-local-root ./svn-workingcopies  (folder = URL path with / as -, e.g. repos-proj-trunk)
+```
+
+- **Commits** are the revisions touching the URL; paths outside it are ignored. Authors are svn user names, with no email.
+- **`merged_prs`** counts revisions that copy a directory into the path (branch/tag creation) or change `svn:mergeinfo`; like a Git merge they carry no file list. Beyond the commit-detail cap only directory copies are recognised (a mergeinfo-only merge needs the revision's diff).
+- **Line counts** come from `svn diff -c N`, which includes added and deleted files.
+- **Export vs. working copy.** Default exports the head revision to a scratch folder (no `.svn`) that is deleted afterwards; `--svn-local-root` / `--svn-local-dir URL=DIR` measure an existing working copy in place (never changed, never a silent fallback to an export). The run compares it with the URL by revision and warns when it is behind or has local modifications; on a read-only mount `svn status` may be unable to run, and the check is then reported as not done.
+- **Auth.** The password is given to `svn` on stdin with `--no-auth-cache`: not in argv, the process list, svn's cache, logs or the archive. URLs with `user:pass@` are refused. An untrusted HTTPS certificate fails with a message; set `SVN_TRUST_SERVER_CERT=1` only after verifying the server.
+- **Duplicates.** Revision numbers are repository-local, so `duplicate_pct` is blank.
+- **Verified** against real local `file://` repositories only; `http(s)`, `svn://` servers, authentication and certificate handling are untested.
 
 ### Plastic SCM (server)
 

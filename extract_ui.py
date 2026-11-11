@@ -42,6 +42,7 @@ ZIP_LOCK = threading.Lock()
 import for_check  # noqa: E402
 import p4_metrics  # noqa: E402
 import plastic_metrics  # noqa: E402
+import svn_metrics  # noqa: E402
 import highlight  # noqa: E402
 from extract_org_raw_data import (  # noqa: E402
     discover_local_repositories,
@@ -279,6 +280,9 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
         "mode": fields.get("mode", ["offline"])[0],
         "p4_port": fields.get("p4_port", [""])[0].strip(),
         "p4_user": fields.get("p4_user", [""])[0].strip(),
+        "svn_url": fields.get("svn_url", [""])[0].strip(),
+        "svn_user": fields.get("svn_user", [""])[0].strip(),
+        "svn_tree_source": "local" if fields.get("svn_tree_source", [""])[0] == "local" else "export",
         "plastic_server": fields.get("plastic_server", [""])[0].strip(),
         "plastic_user": fields.get("plastic_user", [""])[0].strip(),
         "plastic_tree_source": "local" if fields.get("plastic_tree_source", [""])[0] == "local" else "download",
@@ -750,6 +754,14 @@ def default_plastic_workspaces_dir() -> str:
     )
 
 
+def default_svn_workingcopies_dir() -> str:
+    """Folder of already-updated Subversion working copies (mounted read-only in Docker), used instead of exporting."""
+    return os.environ.get(
+        "DEFAULT_SVN_WORKINGCOPIES_DIR",
+        "/data/svn-workingcopies" if is_docker_mode() else str((ROOT / "svn-workingcopies").resolve()),
+    )
+
+
 def live_log_path() -> Path | None:
     """The running (or last) run's full ``logs/extract.log``, readable while the run is still going."""
     with LOCK:
@@ -909,6 +921,7 @@ __DOCKER_NOTICE__
   <label class="choice"><input type="radio" name="mode" value="hg"> <strong>Mercurial (local)</strong><span class="small">Local Mercurial (<code>.hg</code>) repositories. Runs entirely offline; needs <code>hg</code>.</span></label>
   <label class="choice"><input type="radio" name="mode" value="p4"> <strong>Perforce (server)</strong><span class="small">Depot paths on a Perforce (Helix Core) server. Read-only; needs <code>p4</code>.</span></label>
   <label class="choice"><input type="radio" name="mode" value="plastic"> <strong>Plastic SCM (server)</strong><span class="small">Repositories on a Plastic SCM / Unity Version Control server. Read-only; needs <code>cm</code> on this computer (not in the Docker image).</span></label>
+  <label class="choice"><input type="radio" name="mode" value="svn"> <strong>Subversion (URL)</strong><span class="small">Repository URLs (http, https, svn, svn+ssh, file). Read-only; needs <code>svn</code> on the machine running this UI.</span></label>
   <label class="choice"><input type="radio" name="mode" value="hosted"> <strong>Hosted platform</strong><span class="small">Connect to a GitHub organisation, GitLab group or Bitbucket workspace with a token file.</span></label>
 </div></div>
 <div class="card">
@@ -919,6 +932,16 @@ __DOCKER_NOTICE__
   <div id="hg-fields" class="hidden">
     <div class="inline-actions"><button type="button" id="load-hg-repos" class="secondary">Load repositories</button></div>
     <p class="notice"><strong>Mercurial repositories:</strong> place full Mercurial clones (folders containing <code>.hg</code>) in the mounted hg folder on your computer (default <code>./hg-repos</code>, or the path set by <code>LOCAL_HG_REPOS_DIR</code>). History totals cover every named branch; LOC and file metrics use the checked-out working tree (or the newest open head when the clone has none). Subrepos are not followed.</p>
+  </div>
+  <div id="svn-fields" class="hidden">
+    <label class="field">Repository URL<span class="req">*</span></label><input name="svn_url" id="svn-url" placeholder="https://svn.example.com/repos/project" autocomplete="off" spellcheck="false">
+    <label class="field">User <span class="small">(leave empty for anonymous, or when your own svn config holds the login)</span></label><input name="svn_user" id="svn-user" autocomplete="off" spellcheck="false">
+    <label class="field">Password <span class="small">(held in memory for this run only; given to svn on stdin)</span></label><input name="svn_password" type="password" autocomplete="off" spellcheck="false">
+    <label class="field">Where do the files come from?</label>
+    <select name="svn_tree_source" id="svn-tree-source"><option value="export">Export the head revision from the repository</option><option value="local">Use working copies I already have on this computer</option></select>
+    <p id="svn-local-note" class="notice hidden"><strong>Working copies:</strong> put updated working copies in the folder (default <code>./svn-workingcopies</code>, or <code>DEFAULT_SVN_WORKINGCOPIES_DIR</code>), one per URL named after its path with <code>/</code> as <code>-</code> (<code>https://host/svn/repo/trunk</code> is <code>svn-repo-trunk</code>). Nothing is exported or deleted; a URL with no folder fails. The run warns when the copy is behind the URL or has local modifications.</p>
+    <div class="inline-actions"><button type="button" id="load-svn-paths" class="secondary">Load folders</button></div>
+    <p class="notice"><strong>Subversion:</strong> each URL becomes one row. Load folders lists the sub-folders of the URL (trunk, branches, projects) to pick from; with none picked the URL itself is profiled. History is the revisions touching the URL; a directory copy (branch/tag) or an <code>svn:mergeinfo</code> change counts as a merge. For an untrusted HTTPS certificate verify the server, then start the UI with <code>SVN_TRUST_SERVER_CERT=1</code>.</p>
   </div>
   <div id="plastic-fields" class="hidden">
     <label class="field">Server<span class="req">*</span></label><input name="plastic_server" id="plastic-server" placeholder="plastic.example.com:8087  or  myorg@cloud" autocomplete="off" spellcheck="false">
@@ -992,7 +1015,7 @@ __DOCKER_NOTICE__
 const FORM_STORAGE_KEY='extract-ui-form-v8';
 const DEFAULT_LOCAL_REPOS_DIR='__DEFAULT_LOCAL_REPOS_DIR__';
 const DEFAULT_TOKENS_FILE='__DEFAULT_TOKENS_FILE__';
-const forms = {offline:document.querySelector('#offline-fields'), hg:document.querySelector('#hg-fields'), p4:document.querySelector('#p4-fields'), plastic:document.querySelector('#plastic-fields'), hosted:document.querySelector('#hosted-fields')};
+const forms = {offline:document.querySelector('#offline-fields'), hg:document.querySelector('#hg-fields'), p4:document.querySelector('#p4-fields'), plastic:document.querySelector('#plastic-fields'), svn:document.querySelector('#svn-fields'), hosted:document.querySelector('#hosted-fields')};
 let savedRepoChecks=new Set();
 function updateRepoPickerCopy(){
   const platform=document.querySelector('#hosted-platform').value;
@@ -1002,7 +1025,7 @@ function updateRepoPickerCopy(){
   const manualLabel=document.querySelector('#manual-repos-label');
   const manualHelp=document.querySelector('#manual-repos-help');
   const manualBox=document.querySelector('#manual-repos');
-  if (manualBox) { if (manualBox.dataset.ph===undefined) manualBox.dataset.ph=manualBox.placeholder; manualBox.placeholder = mode==='p4' ? '//depot/project-one\\n//depot/project-two' : mode==='plastic' ? 'repository-one\\nrepository-two' : manualBox.dataset.ph; }
+  if (manualBox) { if (manualBox.dataset.ph===undefined) manualBox.dataset.ph=manualBox.placeholder; manualBox.placeholder = mode==='p4' ? '//depot/project-one\\n//depot/project-two' : mode==='plastic' ? 'repository-one\\nrepository-two' : mode==='svn' ? 'https://host/svn/project/trunk\\nhttps://host/svn/project/branches/x' : manualBox.dataset.ph; }
   if (mode==='hosted' && platform==='gitlab') {
     label.textContent='Projects to include';
     help.textContent='Group mode: leave all unchecked to include every project in the selected group. All-projects mode: select the projects you want, or use Select all.';
@@ -1018,6 +1041,11 @@ function updateRepoPickerCopy(){
     help.textContent='Select the folders to profile, or paste depot paths below. Nothing is profiled until at least one path is chosen.';
     if (manualLabel) manualLabel.textContent='Depot paths';
     if (manualHelp) manualHelp.textContent='One depot path per line, e.g. //depot/project (a trailing /... is optional).';
+  } else if (mode==='svn') {
+    label.textContent='Folders to include';
+    help.textContent='Select folders to profile, or type full URLs below. With nothing selected the repository URL itself is profiled.';
+    if (manualLabel) manualLabel.textContent='Repository URLs';
+    if (manualHelp) manualHelp.textContent='One full URL per line, e.g. https://host/svn/project/trunk.';
   } else if (mode==='plastic') {
     label.textContent='Repositories to include';
     help.textContent='Select the repositories to profile, or type their names below. Nothing is profiled until at least one is chosen.';
@@ -1037,15 +1065,16 @@ function updateRepoPickerCopy(){
 }
 function chooseP4Source(){ const el=document.querySelector('#p4-tree-source'); const note=document.querySelector('#p4-local-note'); if (el && note) note.classList.toggle('hidden', el.value!=='local'); }
 function choosePlasticSource(){ const el=document.querySelector('#plastic-tree-source'); const note=document.querySelector('#plastic-local-note'); if (el && note) note.classList.toggle('hidden', el.value!=='local'); }
-function choose(){ chooseP4Source(); choosePlasticSource(); const mode=document.querySelector('input[name=mode]:checked').value; Object.entries(forms).forEach(([k,e])=>e.classList.toggle('hidden', k!==mode)); choosePlatform(); chooseLlm(); updateRepoPickerCopy(); }
+function chooseSvnSource(){ const el=document.querySelector('#svn-tree-source'); const note=document.querySelector('#svn-local-note'); if (el && note) note.classList.toggle('hidden', el.value!=='local'); }
+function choose(){ chooseP4Source(); choosePlasticSource(); chooseSvnSource(); const mode=document.querySelector('input[name=mode]:checked').value; Object.entries(forms).forEach(([k,e])=>e.classList.toggle('hidden', k!==mode)); choosePlatform(); chooseLlm(); updateRepoPickerCopy(); }
 function choosePlatform(){
   const mode=document.querySelector('input[name=mode]:checked').value;
   const platform=document.querySelector('#hosted-platform').value;
   document.querySelector('#github-fields').classList.toggle('hidden', platform!=='github');
   document.querySelector('#gitlab-fields').classList.toggle('hidden', platform!=='gitlab');
   document.querySelector('#bitbucket-fields').classList.toggle('hidden', platform!=='bitbucket');
-  document.querySelector('#manual-repos-wrap').classList.toggle('hidden', mode!=='hosted' && mode!=='p4' && mode!=='plastic');
-  if (mode!=='hosted' && mode!=='p4' && mode!=='plastic') document.querySelector('#repo-picker-wrap').classList.add('hidden');
+  document.querySelector('#manual-repos-wrap').classList.toggle('hidden', mode!=='hosted' && mode!=='p4' && mode!=='plastic' && mode!=='svn');
+  if (mode!=='hosted' && mode!=='p4' && mode!=='plastic' && mode!=='svn') document.querySelector('#repo-picker-wrap').classList.add('hidden');
   updateRepoPickerCopy();
 }
 function chooseLlm(){ const enabled=document.querySelector('#llm-enabled').checked; const offline=document.querySelector('input[name=mode]:checked').value!=='hosted'; document.querySelector('#llm-fields').classList.toggle('hidden', !enabled); document.querySelector('#offline-llm-warning').classList.toggle('hidden', !(enabled && offline)); }
@@ -1153,6 +1182,23 @@ async function loadP4Paths(){
     const payload=await postDiscover('/discover/p4', {p4_port:val('p4_port'), p4_user:val('p4_user'), p4_password:val('p4_password'), p4_fingerprint:val('p4_fingerprint')});
     rememberRepoChecks();
     renderRepoPicker(payload.items, 'No depots visible to this user.');
+  } catch (error) {
+    document.querySelector('#repo-picker-wrap').classList.add('hidden');
+    showFormError(error.message);
+  } finally {
+    setButtonLoading(button, false);
+  }
+}
+async function loadSvnPaths(){
+  showFormError('');
+  const button=document.querySelector('#load-svn-paths');
+  setButtonLoading(button, true, 'Load folders');
+  showRepoPickerLoading('Reading folders from the repository…');
+  try {
+    const val=n=>(document.querySelector('[name='+n+']')?.value||'').trim();
+    const payload=await postDiscover('/discover/svn', {svn_url:val('svn_url'), svn_user:val('svn_user'), svn_password:val('svn_password')});
+    rememberRepoChecks();
+    renderRepoPicker(payload.items, 'No sub-folders under this URL; it will be profiled as it is.');
   } catch (error) {
     document.querySelector('#repo-picker-wrap').classList.add('hidden');
     showFormError(error.message);
@@ -1301,6 +1347,9 @@ function validateForm(){
   const data=readFormSettings();
   const errors=[];
   const isResume=!!(data.resume_run_dir||'').trim();
+  if (data.mode==='svn' && !isResume) {
+    if (!data.svn_url.trim() && !getManualRepos().length) errors.push(['svn-url','Enter the repository URL.']);
+  }
   if (data.mode==='plastic' && !isResume) {
     if (!data.plastic_server.trim()) errors.push(['plastic-server','Enter the Plastic server (host:port or org@cloud).']);
     if (!getSelectedRepos().length && !getManualRepos().length) errors.push(['manual-repos','Load repositories and select some, or type repository names.']);
@@ -1357,6 +1406,9 @@ function readFormSettings(){
   const data=new FormData(form);
   return {
     mode:data.get('mode')||'offline',
+    svn_url:data.get('svn_url')||'',
+    svn_user:data.get('svn_user')||'',
+    svn_tree_source:data.get('svn_tree_source')||'export',
     plastic_server:data.get('plastic_server')||'',
     plastic_user:data.get('plastic_user')||'',
     plastic_tree_source:data.get('plastic_tree_source')||'download',
@@ -1386,6 +1438,9 @@ function restoreFormSettings(settings){
   const modeInput=document.querySelector('input[name=mode][value="'+(settings.mode||'offline')+'"]');
   if (modeInput) modeInput.checked=true;
   const setValue=(name,value)=>{ const el=document.querySelector('[name="'+name+'"]'); if (el && value!=null) el.value=value; };
+  setValue('svn_url', settings.svn_url||'');
+  setValue('svn_user', settings.svn_user||'');
+  setValue('svn_tree_source', settings.svn_tree_source||'export');
   setValue('plastic_server', settings.plastic_server||'');
   setValue('plastic_user', settings.plastic_user||'');
   setValue('plastic_tree_source', settings.plastic_tree_source||'download');
@@ -1505,6 +1560,8 @@ document.querySelector('#load-local-repos').addEventListener('click', loadLocalR
 document.querySelector('#load-hg-repos').addEventListener('click', loadHgRepos);
 document.querySelector('#load-p4-paths').addEventListener('click', loadP4Paths);
 document.querySelector('#load-plastic-repos').addEventListener('click', loadPlasticRepos);
+document.querySelector('#load-svn-paths').addEventListener('click', loadSvnPaths);
+document.querySelector('#svn-tree-source').addEventListener('change', chooseSvnSource);
 document.querySelector('#plastic-tree-source').addEventListener('change', choosePlasticSource);
 document.querySelector('#p4-tree-source').addEventListener('change', chooseP4Source);
 document.querySelector('#load-github-orgs').addEventListener('click', loadHostedOrgs);
@@ -1940,6 +1997,7 @@ class Handler(BaseHTTPRequestHandler):
             "/discover/accessible-repos",
             "/discover/p4",
             "/discover/plastic",
+            "/discover/svn",
         }:
             self.respond(HTTPStatus.NOT_FOUND, "text/plain", "Not found")
             return
@@ -2011,6 +2069,27 @@ class Handler(BaseHTTPRequestHandler):
                     "application/json",
                     json.dumps({"error": str(exc)[:500]}),
                 )
+                return
+            self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": items}))
+            return
+        if path == "/discover/svn":
+            try:
+                base = svn_metrics.normalize_url(fields.get("svn_url", [""])[0])
+            except ValueError as exc:
+                self.respond(HTTPStatus.BAD_REQUEST, "application/json", json.dumps({"error": str(exc)}))
+                return
+            try:
+                conn = svn_metrics.SvnConn(
+                    user=fields.get("svn_user", [""])[0].strip(),
+                    password=fields.get("svn_password", [""])[0],
+                    trust_cert=os.environ.get("SVN_TRUST_SERVER_CERT", "") == "1",
+                )
+                svn_metrics.connect(conn, base)
+                items = [{"id": f"{base}/{d}", "name": d} for d in svn_metrics.list_children(conn, base)]
+                ui_log(f"Discover svn ok url={base!r} count={len(items)}")
+            except Exception as exc:  # noqa: BLE001 - svn errors are already credential-free
+                ui_log(f"Discover svn failed url={base!r}", exc=exc)
+                self.respond(HTTPStatus.BAD_REQUEST, "application/json", json.dumps({"error": str(exc)[:500]}))
                 return
             self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": items}))
             return
@@ -2326,6 +2405,42 @@ class Handler(BaseHTTPRequestHandler):
             if not resume_run_dir:
                 for repo_name in selected_repos:
                     command.extend(["--local-repo", repo_name])
+        elif mode == "svn":
+            sv_base = fields.get("svn_url", [""])[0].strip()
+            sv_user = fields.get("svn_user", [""])[0].strip()
+            sv_urls = merge_repo_selectors(selected_repos, manual_repos) or ([sv_base] if sv_base else [])
+            if not resume_run_dir and not sv_urls:
+                self.respond(HTTPStatus.BAD_REQUEST, "text/plain", "Enter the repository URL.")
+                return
+            if not resume_run_dir:
+                try:
+                    sv_urls = [svn_metrics.normalize_url(u) for u in sv_urls]
+                except ValueError as exc:
+                    self.respond(HTTPStatus.BAD_REQUEST, "text/plain", str(exc))
+                    return
+            sv_copies = ""
+            if fields.get("svn_tree_source", [""])[0] == "local":
+                sv_copies = default_svn_workingcopies_dir()
+                if not resume_run_dir and not Path(sv_copies).is_dir():
+                    self.respond(
+                        HTTPStatus.BAD_REQUEST,
+                        "text/plain",
+                        "Working copies folder not found. Put your updated working copies in ./svn-workingcopies "
+                        "(or set DEFAULT_SVN_WORKINGCOPIES_DIR), or choose to export from the repository.",
+                    )
+                    return
+            if resume_run_dir:
+                command.extend(["--svn-url", "resume"])
+            else:
+                for u in sv_urls:
+                    command.extend(["--svn-url", u])
+            if sv_copies and not resume_run_dir:
+                command.extend(["--svn-local-root", sv_copies])
+            if sv_user:
+                command.extend(["--svn-user", sv_user])
+            secret = fields.get("svn_password", [""])[0].strip()
+            if secret:
+                env_overrides["SVN_PASSWORD"] = secret
         elif mode == "plastic":
             pl_server = fields.get("plastic_server", [""])[0].strip()
             pl_user = fields.get("plastic_user", [""])[0].strip()
