@@ -88,6 +88,26 @@ class AzureDevOpsMergeTests(unittest.TestCase):
         for subject in ("Merged PR: nothing", "Merged PRs 12: x", "Revert \"Merged PR 42: Add login page\""):
             self.assertIsNone(ex.AZURE_DEVOPS_MERGE_RE.match(subject), subject)
 
+    def test_detection_follows_the_measured_branch_not_the_default(self):
+        """The run checks out the most recently committed branch (select_latest_branch); detection reads that
+        checkout's history, so a PR merged only there is found and one merged only on main is not."""
+        git(self.repo, "checkout", "-q", "-b", "dev", "main~3")      # dev forks before PRs 7, 9 and 43
+        git(self.repo, "checkout", "-q", "-b", "feature/dev-only")
+        commit(self.repo, "dev.txt", "dev work")
+        git(self.repo, "checkout", "-q", "dev")
+        later = {**ENV, "GIT_COMMITTER_DATE": "2099-01-01T00:00:00Z", "GIT_AUTHOR_DATE": "2099-01-01T00:00:00Z"}
+        subprocess.run(["git", "merge", "-q", "--no-ff", "feature/dev-only", "-m", "Merged PR 50: Dev-only change"],
+                       cwd=self.repo, env=later, check=True, capture_output=True)
+        git(self.repo, "checkout", "-q", "main")                      # the clone starts on the default branch
+        before = {b.strip() for b in git(self.repo, "branch", "--format=%(refname:short)").splitlines()}
+        latest = ex.select_latest_branch(self.repo, "main", None, local=True)
+        self.assertEqual(latest, "dev")
+        numbers = {r["pr_number"] for r in ex.detect_merged_prs_from_git(self.repo) if r["pr_number"]}
+        self.assertIn("50", numbers)
+        self.assertNotIn("9", numbers)
+        self.assertEqual(git(self.repo, "rev-parse", "--abbrev-ref", "HEAD").strip(), "dev")
+        self.assertEqual(before, {b.strip() for b in git(self.repo, "branch", "--format=%(refname:short)").splitlines()})
+
     def test_integrity_counts_azure_pr_numbers(self):
         facts = integrity.repo_facts(self.repo, "main")
         self.assertEqual(facts["pr_merge_numbers"], 4)
