@@ -43,7 +43,8 @@ SCHEMA = 1
 REPO_FILE = "integrity.json"
 RUN_FILE = "INTEGRITY.json"
 KEY_ENV = "PROFILER_INTEGRITY_KEY"
-PR_MERGE_RE = re.compile(r"^Merge pull request #(\d+)")
+# GitHub "Merge pull request #N", Azure DevOps "Merged PR N:", TFS/VSTS "Merge pull request N from"
+PR_MERGE_RE = re.compile(r"^(?:Merge pull request #?(\d+)|Merged PR (\d+):)")
 
 
 def _git(repo: Path, *args: str, timeout: int = 600) -> tuple[int, str]:
@@ -123,7 +124,7 @@ def repo_facts(repo: Path, branch: str = "") -> dict:
         facts["same_timestamp_max_pct"] = (
             round(100 * stamps.most_common(1)[0][1] / len(rows), 1) if rows else 0.0
         )
-        prs = sorted({int(m.group(1)) for r in rows if (m := PR_MERGE_RE.match(r[5]))})
+        prs = sorted({int(m.group(1) or m.group(2)) for r in rows if (m := PR_MERGE_RE.match(r[5]))})
         facts["pr_merge_numbers"] = len(prs)
         facts["pr_number_max"] = prs[-1] if prs else 0
         facts["pr_number_gaps"] = (prs[-1] - len(prs)) if prs else 0
