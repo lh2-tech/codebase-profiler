@@ -153,6 +153,39 @@ GITHUB_MERGE_RE = re.compile(r"^Merge pull request #(\d+) from (\S+)")
 GITHUB_SQUASH_RE = re.compile(r"\(#(\d+)\)$")
 GITLAB_MR_RE = re.compile(r"See merge request (?:\S+)?!(\d+)")
 BITBUCKET_MERGE_RE = re.compile(r"^Merged in (.+) \(pull request #(\d+)\)$")
+# Azure DevOps completes a PR with "Merged PR <id>: <title>" (merge commit, squash and semi-linear merge alike);
+# TFS/VSTS wrote "Merge pull request <id> from <source> into <target>" (no "#": GitHub's always has one).
+AZURE_DEVOPS_MERGE_RE = re.compile(r"^Merged PR (\d+): ?(.*)$")
+AZURE_DEVOPS_LEGACY_MERGE_RE = re.compile(r"^Merge pull request (\d+) from (\S+) into (\S+)")
+
+
+def match_pr_marker(subject: str, body: str, is_merge: bool) -> dict[str, str] | None:
+    """The PR/MR a commit message says it merged: number, method, source branch, title and platform; None if no
+    numbered marker. One place for every platform's wording, used for git and Mercurial history alike."""
+    if match := GITHUB_MERGE_RE.match(subject):
+        number, branch = match.groups()
+        title = body.strip().splitlines()[0] if body.strip() else subject
+        return {"number": number, "method": "merge-commit", "source_branch": branch, "title": title,
+                "platform": "github"}
+    if match := BITBUCKET_MERGE_RE.match(subject):
+        branch, number = match.groups()
+        return {"number": number, "method": "merge-commit", "source_branch": branch, "title": subject,
+                "platform": "bitbucket"}
+    if match := AZURE_DEVOPS_MERGE_RE.match(subject):
+        number, title = match.groups()
+        return {"number": number, "method": "merge-commit" if is_merge else "squash", "source_branch": "",
+                "title": title.strip() or subject, "platform": "azure-devops"}
+    if match := AZURE_DEVOPS_LEGACY_MERGE_RE.match(subject):
+        number, branch, _target = match.groups()
+        return {"number": number, "method": "merge-commit" if is_merge else "squash", "source_branch": branch,
+                "title": subject, "platform": "azure-devops"}
+    if match := GITLAB_MR_RE.search(body):
+        return {"number": match.group(1), "method": "merge-commit", "source_branch": "", "title": subject,
+                "platform": "gitlab"}
+    if match := GITHUB_SQUASH_RE.search(subject):
+        return {"number": match.group(1), "method": "squash", "source_branch": "",
+                "title": GITHUB_SQUASH_RE.sub("", subject).strip(), "platform": "github"}
+    return None
 
 GITHUB_MERGED_PRS_QUERY = """
 query MergedPRs($owner: String!, $name: String!, $cursor: String, $pageSize: Int!) {
@@ -1677,46 +1710,32 @@ def detect_merged_prs_from_git(repo: Path) -> list[dict[str, str]]:
     text = run_git(
         repo,
         "log",
-        "--pretty=format:%H%x1f%aI%x1f%an%x1f%ae%x1f%s%x1f%b%x1e",
+        "--pretty=format:%H%x1f%aI%x1f%an%x1f%ae%x1f%P%x1f%s%x1f%b%x1e",
         timeout=GIT_LOG_TIMEOUT_SECONDS,
     )
     records: dict[str, dict[str, str]] = {}
     for raw_record in text.split("\x1e"):
         fields = raw_record.strip("\n").split("\x1f")
-        if len(fields) < 5:
+        if len(fields) < 6:
             continue
-        sha, date, author_name, author_email, subject = fields[:5]
-        body = fields[5] if len(fields) > 5 else ""
-        number = method = source_branch = ""
-        title = subject
-        match = GITHUB_MERGE_RE.match(subject)
-        if match:
-            number, source_branch = match.groups()
-            method = "merge-commit"
-            title = body.strip().splitlines()[0] if body.strip() else subject
-        elif match := BITBUCKET_MERGE_RE.match(subject):
-            source_branch, number = match.groups()
-            method = "merge-commit"
-        elif match := GITLAB_MR_RE.search(body):
-            number = match.group(1)
-            method = "merge-commit"
-        elif match := GITHUB_SQUASH_RE.search(subject):
-            number = match.group(1)
-            method = "squash"
-            title = GITHUB_SQUASH_RE.sub("", subject).strip()
-        if not number:
+        sha, date, author_name, author_email, parents, subject = fields[:6]
+        body = fields[6] if len(fields) > 6 else ""
+        marker = match_pr_marker(subject, body, is_merge=len(parents.split()) > 1)
+        if not marker:
             continue
+        number = marker["number"]
         if number in records and records[number]["method"] == "merge-commit":
             continue
         records[number] = {
             "pr_number": number,
-            "method": method,
-            "source_branch": source_branch,
-            "title": title,
+            "method": marker["method"],
+            "source_branch": marker["source_branch"],
+            "title": marker["title"],
             "merged_at": date,
             "merged_by_name": author_name,
             "merged_by_email": author_email,
             "merge_commit": sha,
+            "platform": marker["platform"],
         }
     # Numbered markers alone undercount: merge commits without a PR/MR number in
     # the message (plain ``git merge``, Bitbucket UI merges with edited subjects)
@@ -1743,31 +1762,18 @@ def detect_merged_prs_from_hg(repo: Path) -> list[dict[str, str]]:
     merges: list[dict[str, str]] = []
     for c in hg_metrics.iter_commits(repo, with_body=True, timeout=GIT_LOG_TIMEOUT_SECONDS):
         subject, body = c["subject"], c["body"]
-        number = method = source_branch = ""
-        title = subject
-        if match := GITHUB_MERGE_RE.match(subject):
-            number, source_branch = match.groups()
-            method = "merge-commit"
-            title = body.strip().splitlines()[0] if body.strip() else subject
-        elif match := BITBUCKET_MERGE_RE.match(subject):
-            source_branch, number = match.groups()
-            method = "merge-commit"
-        elif match := GITLAB_MR_RE.search(body):
-            number = match.group(1)
-            method = "merge-commit"
-        elif match := GITHUB_SQUASH_RE.search(subject):
-            number = match.group(1)
-            method = "squash"
-            title = GITHUB_SQUASH_RE.sub("", subject).strip()
+        marker = match_pr_marker(subject, body, is_merge=bool(c["is_merge"])) or {}
+        number = marker.get("number", "")
         record = {
             "pr_number": number,
-            "method": method or "merge-commit-unnumbered",
-            "source_branch": source_branch,
-            "title": title,
+            "method": marker.get("method") or "merge-commit-unnumbered",
+            "source_branch": marker.get("source_branch", ""),
+            "title": marker.get("title", subject),
             "merged_at": c["date"],
             "merged_by_name": c["name"],
             "merged_by_email": c["email"],
             "merge_commit": c["sha"],
+            "platform": marker.get("platform", ""),
         }
         if number:
             if number in records and records[number]["method"] == "merge-commit":
@@ -1809,6 +1815,7 @@ def unnumbered_merge_commits(repo: Path) -> list[dict[str, str]]:
                 "merged_by_name": author_name,
                 "merged_by_email": author_email,
                 "merge_commit": sha,
+                "platform": "",
             }
         )
     return sorted(records, key=lambda record: record["merged_at"])
