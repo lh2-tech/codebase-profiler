@@ -12,6 +12,11 @@ services:
       HOST_OUTPUT_HINT: ./outputs/raw-extracts
       PYTHONUNBUFFERED: "1"
       DUPLICATE_THRESHOLD_PCT: ${DUPLICATE_THRESHOLD_PCT:-25}
+      # Large / binary-heavy repos (e.g. Unity) time out on the per-commit
+      # `git log --numstat` over a bind mount. Longer limit + cap per-file
+      # detail to the most recent N commits (totals/authors/dates stay exact).
+      EXTRACT_GIT_LOG_TIMEOUT: ${EXTRACT_GIT_LOG_TIMEOUT:-3600}
+      EXTRACT_COMMIT_DETAIL_LIMIT: ${EXTRACT_COMMIT_DETAIL_LIMIT:-5000}
     volumes:
       # Mount the directory, not the file: a single-file bind mount pins one
       # inode, so if the host tokens file is created or replaced after the
