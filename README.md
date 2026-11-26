@@ -381,16 +381,16 @@ Reading the numbers (what is and is not comparable):
   (the most recently committed one), so compare `counts_*.commits` with `captured.commits_default_branch`; the two
   `captured` commit numbers only match when `measured_branch` equals `default_branch`.
 - **Merged PRs.** `counts_*.prs` is every PR/MR; `counts_*.merged_prs` is merged only and is the one to compare with
-  `captured.merged_prs`. When `merged_prs_source` is `git`, the platform was not asked (local run: `merged_prs` blank) or
-  reported zero (`merged_prs` 0), and the merge/squash markers found in history are in `captured.local_merges` instead;
-  they are merge commits, not pull requests, and undercount squash/rebase workflows.
+  `captured.merged_prs`. When `merged_prs_source` is `git`, the platform was not asked (local run: `merged_prs` blank)
+  and the merge/squash markers found in history are in `captured.local_merges` instead; they are merge commits, not
+  pull requests, and undercount squash/rebase workflows. On GitHub, GitLab and Bitbucket `merged_prs` is always the
+  platform's count (0 stays 0) and `local_merges` is blank.
 
 #### `merged_prs` and `local_merges` in `summary.csv`
 
 | How the PRs were counted | `merged_prs` | `local_merges` |
 |---|---|---|
-| The hosting platform's API (GitHub, GitLab, Bitbucket) | its count of merged PRs/MRs | blank |
-| The platform reported none, so the history was read | `0` (the platform's answer) | merge and squash commits found in the history |
+| The hosting platform's API (GitHub, GitLab, Bitbucket) | its count of merged PRs/MRs (`0` stays `0`) | column omitted |
 | An offline / local run (`--offline`, `--local-repos-dir`, Mercurial, Perforce) | blank: the platform was not asked | merge and squash commits (Perforce: integration changelists) |
 
 A merge commit is not a pull request (a local `git merge` or `git pull` makes one too), so the two never share a column.
@@ -412,7 +412,7 @@ archive cannot execute. `--github-host` / `--gitlab-host` must be a bare host (`
 ### Compatibility with Squirrel
 
 Squirrel (`stages.py`) reads `summary.csv` by header name (`loc`, `commits`, `merged_prs`) and passes `--no-for-check`.
-`local_merges` sits right after `merged_prs`; an offline run leaves `merged_prs` blank (unknown) instead of putting the merge-commit
+`local_merges` sits right after `merged_prs` but only appears in runs with no hosting platform (it is omitted from the CSV/XLSX on GitHub, GitLab and Bitbucket runs); an offline run leaves `merged_prs` blank (unknown) instead of putting the merge-commit
 count there, so a reader that compares it with a delivery's PR metadata no longer counts merge commits as missing PRs.
 `summary.csv` gains a `subgroup` column right after `org` (GitLab: the path between group and repo, e.g. `mobile-apps` or `a/b`; Bitbucket: the project name; GitHub: blank), so same-named repos in different subgroups keep separate rows. Squirrel reads by header name, so this does not affect it. Existing columns are otherwise untouched (the three duplicate columns are only appended at the end) and `--no-for-check` skips both `for-check.csv` and the xlsx sheet.
 `--no-for-check` and `--for-check-refs` exist only in profilers that include for-check; an older profiler rejects the

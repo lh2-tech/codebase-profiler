@@ -277,7 +277,7 @@ def extract_form_settings(fields: dict[str, list[str]]) -> dict[str, Any]:
     selected = extract_selected_repos(fields)
     manual = parse_repo_selectors(fields.get("manual_repos", [""])[0])
     return {
-        "mode": fields.get("mode", ["offline"])[0],
+        "mode": fields.get("mode", ["hosted"])[0],
         "p4_port": fields.get("p4_port", [""])[0].strip(),
         "p4_user": fields.get("p4_user", [""])[0].strip(),
         "svn_url": fields.get("svn_url", [""])[0].strip(),
@@ -782,16 +782,13 @@ def default_tokens_file() -> str:
 
 def page() -> str:
     docker_mode = is_docker_mode()
-    default_local = default_local_repos_dir()
     default_hg = default_hg_repos_dir()
     default_tokens = default_tokens_file()
-    host_repos_hint = os.environ.get("HOST_REPOS_HINT", "./repos")
     docker_notice = ""
     if docker_mode:
         docker_notice = (
             '<p class="notice"><strong>Docker mode:</strong> put credentials in the mounted '
-            '<code>tokens</code> file on your computer, and put offline clones in the folder '
-            f"mapped by <code>LOCAL_REPOS_DIR</code> (default <code>{escape(host_repos_hint)}</code>). "
+            '<code>tokens</code> file on your computer. '
             "Results are written to <code>./outputs/raw-extracts</code>."
             "</p>"
         )
@@ -917,18 +914,13 @@ __DOCKER_NOTICE__
 <input type="hidden" name="csrf_token" value="__CSRF_TOKEN__">
 <div class="card"><strong>Where are the repositories?</strong>
 <div class="choices">
-  <label class="choice"><input type="radio" name="mode" value="offline" checked> <strong>Already cloned here</strong><span class="small">Runs entirely offline. No internet connection is needed.</span></label>
   <label class="choice"><input type="radio" name="mode" value="hg"> <strong>Mercurial (local)</strong><span class="small">Local Mercurial (<code>.hg</code>) repositories. Runs entirely offline; needs <code>hg</code>.</span></label>
   <label class="choice"><input type="radio" name="mode" value="p4"> <strong>Perforce (server)</strong><span class="small">Depot paths on a Perforce (Helix Core) server. Read-only; needs <code>p4</code>.</span></label>
   <label class="choice"><input type="radio" name="mode" value="plastic"> <strong>Plastic SCM (server)</strong><span class="small">Repositories on a Plastic SCM / Unity Version Control server. Read-only; needs <code>cm</code> on this computer (not in the Docker image).</span></label>
   <label class="choice"><input type="radio" name="mode" value="svn"> <strong>Subversion (URL)</strong><span class="small">Repository URLs (http, https, svn, svn+ssh, file). Read-only; needs <code>svn</code> on the machine running this UI.</span></label>
-  <label class="choice"><input type="radio" name="mode" value="hosted"> <strong>Hosted platform</strong><span class="small">Connect to a GitHub organisation, GitLab group or Bitbucket workspace with a token file.</span></label>
+  <label class="choice"><input type="radio" name="mode" value="hosted" checked> <strong>Hosted platform</strong><span class="small">Connect to a GitHub organisation, GitLab group or Bitbucket workspace with a token file.</span></label>
 </div></div>
 <div class="card">
-  <div id="offline-fields">
-    <div class="inline-actions"><button type="button" id="load-local-repos" class="secondary">Load repositories</button></div>
-    <p class="notice"><strong>Offline clones:</strong> place full git clones in the mounted repos folder on your computer (default <code>./repos</code>, or the path set by <code>LOCAL_REPOS_DIR</code>). Use a normal <code>git clone</code> without <code>--depth</code>.</p>
-  </div>
   <div id="hg-fields" class="hidden">
     <div class="inline-actions"><button type="button" id="load-hg-repos" class="secondary">Load repositories</button></div>
     <p class="notice"><strong>Mercurial repositories:</strong> place full Mercurial clones (folders containing <code>.hg</code>) in the mounted hg folder on your computer (default <code>./hg-repos</code>, or the path set by <code>LOCAL_HG_REPOS_DIR</code>). History totals cover every named branch; LOC and file metrics use the checked-out working tree (or the newest open head when the clone has none). Subrepos are not followed.</p>
@@ -1013,9 +1005,8 @@ __DOCKER_NOTICE__
 <div class="csv-scroll"><div id="csv-preview" class="notice">Loading summary…</div></div></div>
 <script>
 const FORM_STORAGE_KEY='extract-ui-form-v8';
-const DEFAULT_LOCAL_REPOS_DIR='__DEFAULT_LOCAL_REPOS_DIR__';
 const DEFAULT_TOKENS_FILE='__DEFAULT_TOKENS_FILE__';
-const forms = {offline:document.querySelector('#offline-fields'), hg:document.querySelector('#hg-fields'), p4:document.querySelector('#p4-fields'), plastic:document.querySelector('#plastic-fields'), svn:document.querySelector('#svn-fields'), hosted:document.querySelector('#hosted-fields')};
+const forms = {hg:document.querySelector('#hg-fields'), p4:document.querySelector('#p4-fields'), plastic:document.querySelector('#plastic-fields'), svn:document.querySelector('#svn-fields'), hosted:document.querySelector('#hosted-fields')};
 let savedRepoChecks=new Set();
 function updateRepoPickerCopy(){
   const platform=document.querySelector('#hosted-platform').value;
@@ -1139,22 +1130,6 @@ function fillSelect(select, items, placeholder){
   const blank=document.createElement('option');
   blank.value=''; blank.textContent=placeholder; select.appendChild(blank);
   items.forEach(item=>{ const opt=document.createElement('option'); opt.value=item.id; opt.textContent=item.name; select.appendChild(opt); });
-}
-async function loadLocalRepos(){
-  showFormError('');
-  const button=document.querySelector('#load-local-repos');
-  setButtonLoading(button, true, 'Load repositories');
-  showRepoPickerLoading('Searching local folders…');
-  try {
-    const payload=await postDiscover('/discover/local', {local_repos_dir:DEFAULT_LOCAL_REPOS_DIR});
-    rememberRepoChecks();
-    renderRepoPicker(payload.items, 'No Git repositories found in the mounted repos folder.');
-  } catch (error) {
-    document.querySelector('#repo-picker-wrap').classList.add('hidden');
-    showFormError(error.message);
-  } finally {
-    setButtonLoading(button, false);
-  }
 }
 async function loadHgRepos(){
   showFormError('');
@@ -1405,7 +1380,7 @@ function readFormSettings(){
   const form=document.querySelector('#extract-form');
   const data=new FormData(form);
   return {
-    mode:data.get('mode')||'offline',
+    mode:data.get('mode')||'hosted',
     svn_url:data.get('svn_url')||'',
     svn_user:data.get('svn_user')||'',
     svn_tree_source:data.get('svn_tree_source')||'export',
@@ -1435,7 +1410,7 @@ function readFormSettings(){
 }
 function restoreFormSettings(settings){
   if (!settings) return;
-  const modeInput=document.querySelector('input[name=mode][value="'+(settings.mode||'offline')+'"]');
+  const modeInput=document.querySelector('input[name=mode][value="'+(settings.mode!=='offline'&&settings.mode||'hosted')+'"]');
   if (modeInput) modeInput.checked=true;
   const setValue=(name,value)=>{ const el=document.querySelector('[name="'+name+'"]'); if (el && value!=null) el.value=value; };
   setValue('svn_url', settings.svn_url||'');
@@ -1556,7 +1531,6 @@ function noteFileSource(platform){
 document.querySelectorAll('input[name=mode]').forEach(e=>e.addEventListener('change',choose));
 document.querySelector('#hosted-platform').addEventListener('change',choosePlatform);
 document.querySelector('#llm-enabled').addEventListener('change',chooseLlm);
-document.querySelector('#load-local-repos').addEventListener('click', loadLocalRepos);
 document.querySelector('#load-hg-repos').addEventListener('click', loadHgRepos);
 document.querySelector('#load-p4-paths').addEventListener('click', loadP4Paths);
 document.querySelector('#load-plastic-repos').addEventListener('click', loadPlasticRepos);
@@ -1773,7 +1747,7 @@ loadResumableRuns();
 setInterval(refresh,1200); refresh();
 </script></main></body></html>""".replace("__CSRF_TOKEN__", CSRF_TOKEN).replace(
         "__DOCKER_NOTICE__", docker_notice
-    ).replace("__DEFAULT_LOCAL_REPOS_DIR__", escape(default_local)).replace("__DEFAULT_HG_REPOS_DIR__", escape(default_hg)).replace(
+    ).replace("__DEFAULT_HG_REPOS_DIR__", escape(default_hg)).replace(
         "__DEFAULT_TOKENS_FILE__", escape(default_tokens)
     )
 
@@ -2334,7 +2308,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": items}))
             return
-        mode = fields.get("mode", ["offline"])[0]
+        mode = fields.get("mode", ["hosted"])[0]
         form_settings = extract_form_settings(fields)
         selected_repos = extract_selected_repos(fields)
         manual_repos = parse_repo_selectors(fields.get("manual_repos", [""])[0])
@@ -2373,23 +2347,7 @@ class Handler(BaseHTTPRequestHandler):
         # environment only — never argv — so they stay out of logs and archives.
         env_overrides: dict[str, str] = {}
 
-        if mode == "offline":
-            local_dir = default_local_repos_dir()
-            if not resume_run_dir and (not local_dir or not Path(local_dir).is_dir()):
-                self.respond(
-                    HTTPStatus.BAD_REQUEST,
-                    "text/plain",
-                    "Mounted repos folder not found. Put full clones in ./repos "
-                    "(or the LOCAL_REPOS_DIR path from .env).",
-                )
-                return
-            command.append("--offline")
-            if local_dir:
-                command.extend(["--local-repos-dir", local_dir])
-            if not resume_run_dir:
-                for repo_name in selected_repos:
-                    command.extend(["--local-repo", repo_name])
-        elif mode == "hg":
+        if mode == "hg":
             hg_dir = default_hg_repos_dir()
             if not resume_run_dir and (not hg_dir or not Path(hg_dir).is_dir()):
                 self.respond(

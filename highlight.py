@@ -171,14 +171,17 @@ def write_project_compiled(summary_csv: Path) -> Path | None:
     workbook = openpyxl.Workbook()
     sheet = workbook.active
     sheet.title = COMPILED_SHEET
-    sheet.append(COMPILED_COLUMNS)
+    columns = COMPILED_COLUMNS
+    if not any(r.get("local_merges") for r in rows):  # git-platform runs: the column does not exist
+        columns = [c for c in COMPILED_COLUMNS if c != "local_merges"]
+    sheet.append(columns)
     for cell in sheet[1]:
         cell.font = Font(bold=True)
         cell.comment = header_comment(cell.value)
-    column = {name: i + 1 for i, name in enumerate(COMPILED_COLUMNS)}
+    column = {name: i + 1 for i, name in enumerate(columns)}
 
     for r, row in enumerate(rows, start=2):
-        for name in COMPILED_COLUMNS:
+        for name in columns:
             raw = ILLEGAL_CHARACTERS_RE.sub("", row.get(name) or "")
             cell = sheet.cell(row=r, column=column[name], value=_value(name, raw))
             if isinstance(cell.value, str) and cell.value.startswith(("=", "+", "-", "@")):

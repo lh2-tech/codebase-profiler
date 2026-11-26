@@ -257,8 +257,8 @@ SUMMARY_FIELDS = [
     "project_name",
     "repo",
     # merged_prs: the hosting platform's count of merged PRs/MRs (blank when the platform was not asked: an offline/local run).
-    # local_merges: merge and squash commits found in the git history; filled only when that is how PRs were counted (an
-    # offline/local run, or the platform reported none). The two are never the same thing: a merge commit is not a PR.
+    # local_merges: merge and squash commits found in the history; filled only for runs with no hosting platform (an
+    # offline/local run, Mercurial, Perforce, SVN, Plastic). Never filled for GitHub/GitLab/Bitbucket: a merge commit is not a PR.
     "merged_prs",
     "local_merges",
     "languages_breakdown",
@@ -889,8 +889,13 @@ class JobCheckpoint:
     def _write_summary_unlocked(self) -> None:
         rows = list(self.rows_by_key.values())
         rows.sort(key=_row_sort_key)
+        # local_merges only exists for runs with no hosting platform (Mercurial, Perforce, SVN, Plastic, --offline git):
+        # on GitHub/GitLab/Bitbucket it is always blank, so the column is left out.
+        fields = SUMMARY_FIELDS
+        if not any(str(r.get("local_merges", "")) != "" for r in rows):
+            fields = [f for f in SUMMARY_FIELDS if f != "local_merges"]
         with self.summary_path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
+            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
 
@@ -3432,14 +3437,6 @@ def process_repo(
             row["contributor_count"] = (
                 git_stats["human_authors"] + git_stats["bot_authors"]
             )
-
-        if target.platform != "local" and not row["merged_prs"]:
-            # The platform API reported no merged PRs/MRs: merged_prs keeps the platform's 0, and the merge and squash
-            # markers recovered from git history are reported apart, as local_merges.
-            detected_prs = detect_merged_prs_from_git(clone_path)
-            write_json(git_dir / "merged_prs_detected_from_git.json", detected_prs)
-            row["local_merges"] = len(detected_prs)
-            merged_source = "git"
 
         row["project_name"] = org
         row["total_files"] = count_total_files(clone_path)
